@@ -6,7 +6,8 @@ its markdown as notes, and commits and pushes only when you say so. The server
 keeps nothing about users: a stateless Cloudflare Worker serves the app and
 relays git traffic the browser cannot send directly.
 
-Status: early development. Nothing works end to end yet.
+Status: early development. You can connect an account and clone a repo; the
+notes UI is next.
 
 ## Layout
 
@@ -32,7 +33,7 @@ Run from the repo root:
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, plus the git engine on LightningFS through the relay on port 8789 |
+| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in and repo pages with the providers' APIs stood in for and real git behind the relay |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 
@@ -171,9 +172,42 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   it resolves, so a commit survives the tab closing right after.
 - **Credentials** never go in the repo. `clone` and `repoIdForUrl` refuse a URL
   with a username or token, which would otherwise be stored in plain text.
+- **Which branch.** `clone` takes the branch to check out as `ref`, or uses the
+  remote's default without it. Later pulls and pushes stay on that branch.
 
 Failures are `GitEngineError`s with a stable `code` and a readable message
 (`errors.js`).
+
+## Accounts
+
+`/connect` signs in or takes a pasted token, `/repos` picks a repo and branch and
+clones it, and `app/src/lib/auth/` holds the logic. Registering the GitHub App and
+the gitlab.com application, and where their IDs go, is in
+[docs/sign-in-apps.md](docs/sign-in-apps.md).
+
+- **GitHub** uses a GitHub App: its code exchange and refresh need a client secret,
+  so they go through the relay. **GitLab** uses PKCE with no secret, on the device.
+  Both redirect with a one-use `state` that must match a sign-in this device
+  started, and the code is cleared from the address bar at once.
+- **Pasted tokens** are checked with `GET /user` and stored only if accepted. They
+  cannot refresh. A pasted GitHub token lists repos through `/user/repos`, as it
+  cannot call the installation endpoints.
+- **Storage.** `token-store.js` encrypts each sign-in in IndexedDB with an AES-GCM
+  key the browser will not export. This protects a copied database, not a script
+  already running in the page; the CSP and sanitized rendering cover that. In the
+  app's localStorage are only the list of local copies and, during a sign-in, its
+  `state` and PKCE verifier.
+- **Refresh.** Tokens refresh 5 minutes before expiry and on a 401. Both providers
+  rotate refresh tokens, so every refresh holds a per-provider Web Lock and rereads
+  the store inside it, and the new pair is stored in one write. A refresh that
+  cannot reach the provider keeps the sign-in, and a token still in date stays in
+  use. A refused one flags the sign-in as ended and never touches local clones.
+- **Where tokens go.** Only to the provider's API and, through the relay, its git
+  host: `gitCredentials` refuses any other host, and clone URLs are built from the
+  repo's path rather than taken from the API. The git username is `x-access-token`
+  on GitHub and `oauth2` on GitLab.
+- **Sign-out** removes the token, and deletes the provider's local copies only if
+  asked, after showing each copy's unpushed commits and uncommitted files.
 
 ## Tooling notes
 
