@@ -19,7 +19,8 @@
     "build": "npm run build --workspaces",
     "e2e": "npm run e2e -w app",
     "deploy": "npm run build -w app && npm run deploy -w relay",
-    "android:sync": "npm run build:native -w app && cap sync android"
+    "android:sync": "npm run build:native -w app && cap sync android",
+    "e2e:live": "npm run e2e:live -w app"
   },
   "devDependencies": {
     "@capacitor/cli": "^8.6.0",
