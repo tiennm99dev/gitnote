@@ -17,6 +17,8 @@ playwright-report/
 .env.*
 .dev.vars
 .dev.vars.*
+*.jks
+*.keystore
 
 # Editors and OS
 .claude/settings.local.json

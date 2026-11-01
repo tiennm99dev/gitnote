@@ -37,11 +37,6 @@ runs:
         log-accepted-android-sdk-licenses: false
         packages: platform-tools platforms;android-36 build-tools;36.0.0
 
-    # `cap build` calls apksigner by name, and the SDK setup does not add build-tools.
-    - name: Put build-tools on the PATH
-      shell: bash
-      run: echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
-
     - name: Install dependencies
       shell: bash
       run: npm ci

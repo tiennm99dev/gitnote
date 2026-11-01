@@ -1,5 +1,11 @@
 {
   "appId": "com.miti99.gitnote",
   "appName": "gitnote",
-  "webDir": "app/build"
+  "webDir": "app/build",
+  "server": {
+    "errorPath": "webview-outdated.html"
+  },
+  "android": {
+    "minWebViewVersion": 120
+  }
 }

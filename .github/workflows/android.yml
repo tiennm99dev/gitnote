@@ -1,8 +1,14 @@
 name: Android
 
-# A tag builds the signed APK and attaches it to its release. A push that touches
-# the Android project builds an unsigned one, with no secrets, so a broken Gradle
-# project shows up before the next tag.
+# A tag builds an APK and attaches it, signed, to its release. A push that touches
+# the Android project builds an unsigned one, so a broken Gradle project shows up
+# before the next tag.
+#
+# A tag runs two jobs, because an APK signed with a new key cannot update an installed
+# app, so a stolen signing key could never be replaced. npm packages, Gradle plugins
+# and setup actions all run in `build-release`, which has no secrets and a read-only
+# token. `sign-release` runs on a fresh machine with none of that code: it only
+# signs, checks and publishes the file it is handed.
 on:
   push:
     tags: ['v*']
@@ -26,6 +32,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up the Android build
         uses: ./.github/actions/android-setup
@@ -34,28 +42,11 @@ jobs:
         working-directory: android
         run: ./gradlew assembleDebug --no-daemon
 
-  release:
+  build-release:
     if: github.repository == 'tiennm99dev/gitnote' && github.ref_type == 'tag'
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: write
-    env:
-      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
-      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
-      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
-      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
-      TAG: ${{ github.ref_name }}
     steps:
-      - name: Require the signing secrets
-        run: |
-          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
-            if [ -z "${!name}" ]; then
-              echo "::error::The secret ANDROID_$name is not set. See docs/android.md."
-              exit 1
-            fi
-          done
-
       - name: Warn about missing sign-in IDs
         env:
           CLIENT_ID_GITHUB: ${{ vars.VITE_GITHUB_CLIENT_ID }}
@@ -66,6 +57,8 @@ jobs:
 
       - name: Checkout
         uses: actions/checkout@v7
+        with:
+          persist-credentials: false
 
       - name: Set up the Android build
         uses: ./.github/actions/android-setup
@@ -74,34 +67,85 @@ jobs:
           github-app-slug: ${{ vars.VITE_GITHUB_APP_SLUG }}
           gitlab-client-id: ${{ vars.VITE_GITLAB_CLIENT_ID }}
 
-      - name: Decode the keystore
-        run: |
-          umask 077
-          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
-
-      - name: Build and sign the APK
+      - name: Build the unsigned APK
+        working-directory: android
         env:
           GITNOTE_VERSION_CODE: ${{ github.run_number }}
+          TAG: ${{ github.ref_name }}
+        run: GITNOTE_VERSION_NAME="${TAG#v}" ./gradlew assembleRelease --no-daemon
+
+      - name: Hand it to the signing job
+        uses: actions/upload-artifact@v7
+        with:
+          name: unsigned-apk
+          path: android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if-no-files-found: error
+          retention-days: 1
+
+  sign-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: android-release
+    permissions:
+      contents: write
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Require the signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          export GITNOTE_VERSION_NAME="${TAG#v}"
-          npx cap build android \
-            --androidreleasetype APK \
-            --signing-type apksigner \
-            --keystorepath "$RUNNER_TEMP/release.jks" \
-            --keystorepass "$KEYSTORE_PASSWORD" \
-            --keystorealias "$KEY_ALIAS" \
-            --keystorealiaspass "$KEY_PASSWORD"
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The secret ANDROID_$name is not set. See docs/android.md."
+              exit 1
+            fi
+          done
+
+      - name: Take the unsigned APK
+        uses: actions/download-artifact@v8
+        with:
+          name: unsigned-apk
+          path: ${{ runner.temp }}/unsigned
+
+      # The runner image's own SDK, so no setup action shares this job with the key.
+      - name: Put build-tools on the PATH
+        run: find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 | sort -V | tail -n 1 >> "$GITHUB_PATH"
+
+      - name: Sign the APK
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          umask 077
+          keystore="$RUNNER_TEMP/release.jks"
+          trap 'rm -f "$keystore"' EXIT
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$keystore"
+          apksigner sign \
+            --ks "$keystore" \
+            --ks-pass env:KEYSTORE_PASSWORD \
+            --ks-key-alias "$KEY_ALIAS" \
+            --key-pass env:KEY_PASSWORD \
+            --in "$RUNNER_TEMP/unsigned/app-release-unsigned.apk" \
+            --out "$RUNNER_TEMP/gitnote-$TAG.apk"
 
       - name: Verify the signature
         run: |
-          apk="$(find android/app -name app-release-signed.apk -print -quit)"
+          apk="$RUNNER_TEMP/gitnote-$TAG.apk"
+          zipalign -c -p 4 "$apk"
           apksigner verify --print-certs --verbose "$apk" | tee "$RUNNER_TEMP/verify.txt"
           grep -Eq 'Verified using v[23] scheme .*: true' "$RUNNER_TEMP/verify.txt"
-          cp "$apk" "$RUNNER_TEMP/gitnote-$TAG.apk"
 
       - name: Attach the APK to the release
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           file="$RUNNER_TEMP/gitnote-$TAG.apk"
           if gh release view "$TAG" > /dev/null 2>&1; then

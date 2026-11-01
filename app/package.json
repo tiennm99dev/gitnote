@@ -34,7 +34,8 @@
     "typescript": "^6.0.3",
     "vite": "^8.3.5",
     "vitest": "^5.0.5",
-    "wrangler": "^4.155.0"
+    "wrangler": "^4.155.0",
+    "yaml": "^2.9.1"
   },
   "dependencies": {
     "@aparajita/capacitor-secure-storage": "^8.0.1",
