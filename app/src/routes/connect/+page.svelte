@@ -1,0 +1,204 @@
+<script>
+	import { onMount } from 'svelte';
+	import { resolve } from '$app/paths';
+	import { authSession } from '#lib/auth/index.js';
+	import { PROVIDER_IDS, PROVIDERS } from '#lib/auth/providers.js';
+	import { deleteDeviceRepo, openDeviceRepo } from '#lib/git/device-repos.js';
+	import { describeLocalWork, listLocalRepos } from '#lib/git/local-repos.js';
+
+	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
+
+	/** @type {import('#lib/auth/session.js').Account[]} */
+	let accounts = $state([]);
+	let loaded = $state(false);
+	/** @type {Partial<Record<ProviderId, string>>} */
+	let tokens = $state({});
+	/** @type {Partial<Record<ProviderId, string>>} */
+	let errors = $state({});
+	/** @type {ProviderId | null} */
+	let busy = $state(null);
+	/**
+	 * The sign-out being confirmed.
+	 * @type {{ provider: ProviderId, work: import('#lib/git/local-repos.js').LocalWork[], wipe: boolean } | null}
+	 */
+	let leaving = $state(null);
+
+	/**
+	 * @param {unknown} error
+	 * @returns {string}
+	 */
+	const messageOf = (error) => (error instanceof Error ? error.message : 'Something went wrong.');
+
+	const reload = async () => {
+		accounts = await authSession.listAccounts();
+	};
+
+	onMount(() => {
+		reload()
+			.catch((error) => {
+				errors = { github: messageOf(error) };
+			})
+			.finally(() => {
+				loaded = true;
+			});
+	});
+
+	/**
+	 * @param {ProviderId} provider
+	 * @param {() => Promise<void>} action
+	 */
+	const run = async (provider, action) => {
+		busy = provider;
+		errors = { ...errors, [provider]: undefined };
+		try {
+			await action();
+		} catch (error) {
+			errors = { ...errors, [provider]: messageOf(error) };
+		} finally {
+			busy = null;
+		}
+	};
+
+	/**
+	 * @param {ProviderId} provider
+	 * @returns {Promise<void>}
+	 */
+	const signIn = (provider) =>
+		run(provider, async () => {
+			location.assign(await authSession.beginSignIn(provider));
+		});
+
+	/**
+	 * @param {SubmitEvent} event
+	 * @param {ProviderId} provider
+	 * @returns {Promise<void>}
+	 */
+	const saveToken = (event, provider) => {
+		event.preventDefault();
+		return run(provider, async () => {
+			await authSession.connectWithToken(provider, tokens[provider] ?? '');
+			tokens = { ...tokens, [provider]: '' };
+			await reload();
+		});
+	};
+
+	/**
+	 * @param {ProviderId} provider
+	 * @returns {Promise<void>}
+	 */
+	const startSignOut = (provider) =>
+		run(provider, async () => {
+			const repos = listLocalRepos().filter((repo) => repo.provider === provider);
+			leaving = { provider, work: await describeLocalWork(repos, openDeviceRepo), wipe: false };
+		});
+
+	const finishSignOut = () => {
+		if (!leaving) return;
+		const { provider, work, wipe } = leaving;
+		return run(provider, async () => {
+			await authSession.signOut(provider);
+			leaving = null;
+			await reload();
+			if (wipe) for (const { repo } of work) await deleteDeviceRepo(repo.id);
+		});
+	};
+
+	/**
+	 * @param {import('#lib/git/local-repos.js').LocalWork} item
+	 * @returns {string}
+	 */
+	const describeWork = ({ unpushed, drafts }) => {
+		if (unpushed === null || drafts === null) return 'could not be read, so it may hold unpushed work';
+		return `${unpushed} unpushed ${unpushed === 1 ? 'commit' : 'commits'}, ${drafts} uncommitted ${drafts === 1 ? 'file' : 'files'}`;
+	};
+</script>
+
+<svelte:head>
+	<title>Accounts - gitnote</title>
+</svelte:head>
+
+<main class="mx-auto flex min-h-screen max-w-2xl flex-col gap-6 p-6">
+	<header class="flex items-baseline justify-between gap-4">
+		<h1 class="text-3xl font-bold">Accounts</h1>
+		<a class="underline" href={resolve('/repos')}>Repositories</a>
+	</header>
+	<p class="text-gray-600">Your sign-ins stay on this device. They go only to the git host, directly or through the gitnote relay, which stores nothing.</p>
+
+	{#if loaded}
+		{#each PROVIDER_IDS as id (id)}
+			{@const provider = PROVIDERS[id]}
+			{@const account = accounts.find((item) => item.provider === id)}
+			<section class="flex flex-col gap-3 rounded border border-gray-300 p-4" data-testid={`account-${id}`}>
+				<h2 class="text-xl font-semibold">{provider.label}</h2>
+
+				{#if account}
+					<p data-testid={`account-${id}-status`}>
+						Connected as <strong>{account.user.login}</strong>
+						({account.kind === 'token' ? 'pasted token' : 'signed in'}).
+					</p>
+					{#if account.needsSignIn}
+						<p role="alert" class="text-red-700">This sign-in has ended. Sign in again or paste a new token; your notes on this device are safe.</p>
+					{/if}
+				{/if}
+
+				{#if errors[id]}
+					<p role="alert" class="text-red-700" data-testid={`account-${id}-error`}>{errors[id]}</p>
+				{/if}
+
+				{#if !account || account.needsSignIn}
+					{#if authSession.signInAvailable(id)}
+						<button type="button" class="self-start rounded bg-gray-900 px-3 py-2 text-white disabled:opacity-50" disabled={busy !== null} onclick={() => signIn(id)}>Sign in with {provider.label}</button>
+					{:else}
+						<p class="text-sm text-gray-600">{provider.label} sign-in is not set up in this build. You can paste a token.</p>
+					{/if}
+
+					<form class="flex flex-col gap-2" onsubmit={(event) => saveToken(event, id)}>
+						<label class="flex flex-col gap-1">
+							<span>Or paste a token</span>
+							<input class="rounded border border-gray-400 p-2" type="password" autocomplete="off" spellcheck="false" required bind:value={tokens[id]} />
+						</label>
+						<p class="text-sm text-gray-600">
+							{provider.tokenHint}
+							<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- the provider's site, not an app route -->
+							<a class="underline" href={provider.tokenUrl} target="_blank" rel="noreferrer">Create one</a>
+						</p>
+						<button type="submit" class="self-start rounded border border-gray-900 px-3 py-2 disabled:opacity-50" disabled={busy !== null}>Check and save</button>
+					</form>
+				{/if}
+
+				{#if account}
+					{#if leaving?.provider === id}
+						<div class="flex flex-col gap-2 rounded bg-gray-100 p-3" data-testid={`sign-out-${id}`}>
+							<p>Signing out removes the {provider.label} sign-in from this device.</p>
+							{#if leaving.work.length > 0}
+								<ul class="list-disc pl-5">
+									{#each leaving.work as item (item.repo.id)}
+										<li data-testid="sign-out-work">{item.repo.fullName}: {describeWork(item)}</li>
+									{/each}
+								</ul>
+								<label class="flex items-center gap-2">
+									<input type="checkbox" bind:checked={leaving.wipe} />
+									<span>Also delete these local copies, including anything not pushed</span>
+								</label>
+							{/if}
+							<div class="flex gap-2">
+								<button type="button" class="rounded bg-red-700 px-3 py-2 text-white disabled:opacity-50" disabled={busy !== null} onclick={finishSignOut}>
+									{leaving.wipe ? 'Sign out and delete' : 'Sign out'}
+								</button>
+								<button
+									type="button"
+									class="rounded border border-gray-900 px-3 py-2"
+									onclick={() => {
+										leaving = null;
+									}}>Keep signed in</button
+								>
+							</div>
+						</div>
+					{:else}
+						<button type="button" class="self-start rounded border border-gray-900 px-3 py-2 disabled:opacity-50" disabled={busy !== null} onclick={() => startSignOut(id)}>Sign out</button>
+					{/if}
+				{/if}
+			</section>
+		{/each}
+	{/if}
+</main>
