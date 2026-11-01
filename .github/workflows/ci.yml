@@ -50,6 +50,9 @@ jobs:
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
 
+      # Traces hold full request headers and this repo is public. Upload them
+      # only from credential-free jobs; a job that sets GITNOTE_E2E_TOKEN
+      # records no traces and must not add this step.
       - name: Upload Playwright traces
         if: failure()
         uses: actions/upload-artifact@v7

@@ -28,6 +28,10 @@ tooling notes: [README.md](README.md).
   `prerender = false` in the root layout.
 - The Worker stores nothing about users: no KV, D1, R2, or logging of request
   headers or bodies. Never log a token.
+- Never publish a token through CI artifacts. Playwright traces store full
+  request headers and this repo is public, so an e2e run that sends a token
+  sets `GITNOTE_E2E_TOKEN` (which turns traces and screenshots off, see
+  `app/e2e/artifact-policy.js`) and its job uploads no Playwright artifacts.
 - Never commit secrets, `.dev.vars`, `.env` files or local machine paths.
 - Conventional Commits, with no AI attribution. Push verified work straight to
   `main` (no PRs).

@@ -1,4 +1,5 @@
 import { defineConfig, devices } from '@playwright/test';
+import { artifactPolicy } from './e2e/artifact-policy.js';
 
 const PORT = 4173;
 
@@ -11,8 +12,8 @@ export default defineConfig({
 	use: {
 		...devices['Desktop Chrome'],
 		baseURL: `http://localhost:${PORT}`,
-		trace: 'retain-on-failure',
-		screenshot: 'only-on-failure',
+		// A run with a token records no trace or screenshot; see artifact-policy.js.
+		...artifactPolicy(process.env),
 		launchOptions: {
 			// CHROMIUM_PATH runs a system Chromium instead of Playwright's download,
 			// for hosts where `npx playwright install chromium` has no build.
