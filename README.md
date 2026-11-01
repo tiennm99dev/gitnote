@@ -7,14 +7,19 @@ keeps nothing about users: a stateless Cloudflare Worker serves the app and
 relays git traffic the browser cannot send directly.
 
 Status: early development. You can connect an account, clone a repo, browse,
-edit and search its notes on the device, then commit, pull and push them.
+edit and search its notes on the device, then commit, pull and push them. The
+web app is at <https://gitnote.miti99.dev>; the Android APK comes from
+[GitHub Releases](https://github.com/tiennm99dev/gitnote/releases).
+
+Offline-first has one gap on the web: reloading the page needs a network, because
+there is no service worker yet. Notes you already have open keep working offline.
 
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `app/` | SvelteKit single-page app (Svelte 5, Vite, Tailwind 4), built with adapter-static |
-| `relay/` | Hono Worker on Cloudflare Workers: serves the SPA through Static Assets and answers `/api/*` (see [Relay](#relay)) |
+| `relay/` | Hono Worker on Cloudflare Workers: serves the SPA through Static Assets and answers `/api/*` (see [docs/architecture.md](docs/architecture.md)) |
 | `android/` | Capacitor's Android project around a native build of the SPA (see [docs/android.md](docs/android.md)) |
 
 ## Requirements
@@ -35,6 +40,7 @@ Run from the repo root:
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
 | `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in, repo and notes pages with the providers' APIs stood in for and real git behind the relay. It also builds the Android bundle into `app/build-native-e2e/` and runs it behind Capacitor's real bridge script |
+| `npm run e2e:live` | Playwright against the deployed site, with nothing stood in for (see [the live tests](docs/architecture.md#testing-against-the-live-site)) |
 | `npm run android:sync` | Build the Android bundle into `app/build/` and copy it into `android/` (see [docs/android.md](docs/android.md)) |
 | `npm run deploy` | Build the web app and deploy the Worker; wrangler refuses a directory holding an Android build |
 
@@ -47,56 +53,41 @@ Playwright needs a browser once: `npx playwright install chromium`. To use a
 system Chromium instead, set `CHROMIUM_PATH`, for example
 `CHROMIUM_PATH=/usr/bin/chromium npm run e2e`.
 
+## Privacy
+
+The server keeps nothing about you. The Worker has no storage bindings, and its logs,
+traces and Logpush are off (`relay/wrangler.jsonc`).
+
+What the relay does see in transit, because it forwards the traffic: your git requests
+with their `Authorization` header and repository contents, the GitHub sign-in codes and
+refresh tokens it exchanges, and your IP address, which the rate limiter counts by.
+None of it is written anywhere. Cloudflare terminates TLS for the relay, so using a
+deployment means trusting whoever runs it and Cloudflare; run your own if you would
+rather not (see [Self-hosting](#self-hosting)).
+
+Your token goes only to the provider's API and, through the relay, its git host. Your
+notes stay in your repo and on your device.
+
+## Supported providers
+
+github.com and gitlab.com, by GitHub App or GitLab OAuth sign-in, or a pasted token for
+either. Custom hosts, self-hosted GitLab and Git LFS are not supported; see
+[BACKLOG.md](BACKLOG.md).
+
+## Size limits
+
+A file over 50 MB gets a warning. A file is blocked over 100 MiB on GitHub and over
+95 MB on GitLab.com, and a push is blocked over about 95 MB, the relay's cap. All of
+this is checked before any network call, and the message names the limit. The full
+table is in [docs/architecture.md](docs/architecture.md#limits).
+
 ## Relay
 
-The Worker keeps nothing about users: no storage bindings, and Workers Logs,
-traces and Logpush stay off (`relay/wrangler.jsonc`). Only `/api/*` runs the
-Worker; every other path is a static asset, with unknown paths falling back to
-`index.html`. The `workers.dev` and preview hostnames are off, so the app's own
-domain is the only origin.
+Routes, data flow, storage and limits are in
+[docs/architecture.md](docs/architecture.md).
 
-| Route | Does |
-| --- | --- |
-| `GET /api/health` | Liveness probe |
-| `GET /api/git/<host>/<repo path>.git/info/refs?service=git-upload-pack` (or `git-receive-pack`) | Git smart-HTTP ref discovery |
-| `POST /api/git/<host>/<repo path>.git/git-upload-pack` and `.../git-receive-pack` | Fetch and push; needs `Content-Length`, at most 95 MB (413 above it); body uncompressed or `Content-Encoding: gzip` (415 otherwise) |
-| `POST /api/oauth/github/token` | GitHub App code exchange: JSON `{ code, code_verifier?, redirect_uri? }`, with `Content-Length`, at most 8 KB |
-| `POST /api/oauth/github/refresh` | GitHub App token refresh: JSON `{ refresh_token }`, same limits |
-
-- **Git hosts** come from the `GIT_HOSTS` var: `github.com,gitlab.com` over
-  https. Loopback entries such as `localhost:8174` use http, for local test
-  servers only. Other hosts, paths, methods and content types answer 403.
-  github.com repos must be exactly `<owner>/<repo>.git`, and no path segment
-  may be `-` (GitLab's web-route separator), so the relay never fetches a web
-  page.
-- **Responses.** A 2xx passes through only with the git content type for that
-  endpoint (otherwise a JSON 502 `unexpected_upstream_response`), and an error
-  status keeps its body only when it is `text/plain` (otherwise a JSON
-  `upstream_error` with the same status). Every `/api/*` answer carries
-  `X-Content-Type-Options: nosniff` and
-  `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`.
-- **Headers.** Only `Authorization`, `Content-Type`, `Accept`, `Git-Protocol`
-  and `User-Agent` go upstream, and a `User-Agent` that does not start with
-  `git/` becomes `git/gitnote-relay`. Redirects are never followed: an
-  upstream 3xx (a renamed repo) comes back as a JSON 502 `repo_moved`.
-- **Origins.** `/api/*` answers the Worker's own origin and the origins in
-  `CORS_ORIGINS` (`https://localhost`, the Capacitor WebView, which also gets
-  CORS headers). Requests without `Origin` pass unless `Sec-Fetch-Site` says
-  another site sent them. This stops browsers only; non-browser clients are
-  bounded by the host allowlist and the rate limits.
-- **Rate limits** per client IP (`cf-connecting-ip`): 300 requests a minute on
-  `/api/*`, 10 on `/api/oauth/*`. They are per Cloudflare location and
-  approximate.
-- **Errors** are JSON: `{ "error": "<code>", "message": "..." }`.
-- **Security headers** for the SPA live in `app/static/_headers`, because
-  asset responses skip the Worker. The Content Security Policy is generated
-  by SvelteKit (`csp` in `app/vite.config.js`) as a `<meta>` tag in the built
-  `index.html`, so it also applies inside Capacitor. The Android build
-  (`CAP_BUILD=1`) allows inline scripts for Capacitor's bridge, so it must never
-  be deployed.
-
-For local work, `relay/.dev.vars` (gitignored) can extend the vars and hold
-the GitHub App credentials, for example:
+For local work, `relay/.dev.vars` (gitignored) can extend the vars and hold the GitHub
+App credentials, for example:
 
 ```sh
 GIT_HOSTS=github.com,gitlab.com,localhost:8174
@@ -104,8 +95,36 @@ GITHUB_CLIENT_ID=<GitHub App client ID>
 GITHUB_CLIENT_SECRET=<GitHub App client secret>
 ```
 
-In production, set the credentials with `wrangler secret put GITHUB_CLIENT_ID`
-and `wrangler secret put GITHUB_CLIENT_SECRET`.
+## Deploying
+
+`.github/workflows/deploy.yml` publishes `main` after CI passes, then runs the live
+tests. It only touches this Worker. It needs:
+
+| Name | Kind | Value |
+| --- | --- | --- |
+| `CLOUDFLARE_API_TOKEN` | Secret | A token that can edit this account's Workers and the zone's Worker routes |
+| `CLOUDFLARE_ACCOUNT_ID` | Variable | The Cloudflare account ID |
+| `VITE_GITHUB_CLIENT_ID`, `VITE_GITHUB_APP_SLUG`, `VITE_GITLAB_CLIENT_ID` | Variables | See [docs/sign-in-apps.md](docs/sign-in-apps.md); blank ones turn that sign-in button off |
+| `GITNOTE_E2E_REPO`, `GITNOTE_E2E_TOKEN` | Variable, secret | See [the live tests](docs/architecture.md#testing-against-the-live-site); the job is skipped without the variable |
+
+The Worker's own secrets are set once, from `relay/`, with
+`npx wrangler secret put GITHUB_CLIENT_ID` and
+`npx wrangler secret put GITHUB_CLIENT_SECRET`. To deploy by hand, run `npm run deploy`.
+
+## Self-hosting
+
+1. Fork this repo and choose a domain on a Cloudflare zone you control.
+2. Replace the live domain with yours in `routes` in `relay/wrangler.jsonc`,
+   `connect-src` in `app/vite.config.js` and `RELAY_ORIGIN` in
+   `app/src/lib/platform/native.js`.
+3. Change the repository name in the `if:` conditions of
+   `.github/workflows/deploy.yml` and `.github/workflows/android.yml`.
+4. Pick your own `namespace_id` values under `ratelimits` in `relay/wrangler.jsonc` if
+   the account already uses those numbers.
+5. Register your own GitHub App and gitlab.com application with
+   [docs/sign-in-apps.md](docs/sign-in-apps.md), using your domain in the URLs.
+6. Set the names under [Deploying](#deploying) and push to `main`, or run
+   `npm run deploy` with the `VITE_` values in the environment.
 
 ## Commit and sync
 
@@ -156,7 +175,10 @@ failures in its state instead of throwing.
   markers in it (which a commit from the panel can still take), so the other notes
   still get committed. It is armed before the pull on opening, which can stall.
   Timers run reliably only in the foreground, so it does nothing while the app is
-  in the background.
+  in the background: on Android especially, a change made just before leaving the app
+  is committed on the device and is not pushed until you come back. Autosave commits
+  everything it can, under a generated message, so leave it off for a repo whose
+  history you care about.
 
 ## Notes
 
@@ -251,22 +273,13 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   objects are flushed before an index or ref names them, and a commit interrupted
   at any point leaves the repo working. A branch whose commit is missing anyway
   reports `repo_damaged`.
-- **Size limits** are a table in `limits.js`, checked before any network call:
-
-  | Check | GitHub | GitLab.com |
-  | --- | --- | --- |
-  | Warn per file | over 50 MB | over 50 MB |
-  | Block per file | over 100 MiB | over 95 MB (relay cap) |
-  | Block per push | over 95 MB (relay cap) | over 95 MB (relay cap) |
-
-  The push size is an estimate: the summed size of the blobs the unpushed
-  commits add. It leaves out trees and commits, so a push just under the cap
-  can still get a 413 from the relay, which is mapped to the same message.
-  Push sends the whole branch, so `commit` and `checkCommit` warn when a file
-  alone is over the relay cap (GitHub's own file limit is higher, so it can
-  commit) or when the unpushed total would pass it. `undoUnpushedCommits` is the
-  way out: the branch returns to the remote-tracking commit and the working tree
-  stays, so the changes can be committed again in smaller groups.
+- **Size limits** are a table in `limits.js`, checked before any network call; the
+  values are in [docs/architecture.md](docs/architecture.md#limits). Push sends the
+  whole branch, so `commit` and `checkCommit` warn when a file alone is over the relay
+  cap (GitHub's own file limit is higher, so it can commit) or when the unpushed total
+  would pass it. `undoUnpushedCommits` is the way out: the branch returns to the
+  remote-tracking commit and the working tree stays, so the changes can be committed
+  again in smaller groups.
 - **Writes** go through `writeFile`, which swaps in a new file. isomorphic-git
   judges a file unchanged by size, whole-second mtime and inode, so writing in
   place could hide a same-size edit. The old file is deleted only after the new
