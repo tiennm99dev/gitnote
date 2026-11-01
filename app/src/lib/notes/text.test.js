@@ -1,6 +1,6 @@
 import { EditorState } from '@codemirror/state';
 import { describe, expect, it } from 'vitest';
-import { decodeText, lineSeparatorFor } from './text.js';
+import { decodeText, lineSeparatorFor, normalizeLineBreaks } from './text.js';
 
 /**
  * @param {string} text
@@ -49,5 +49,15 @@ describe('decoding', () => {
 
 	it('reads ordinary text', () => {
 		expect(decodeText(new TextEncoder().encode('Tiếng Việt\n'))).toBe('Tiếng Việt\n');
+	});
+});
+
+describe('normalizeLineBreaks', () => {
+	it.each([
+		['x\r\ny\nz\rw', '\n', 'x\ny\nz\nw'],
+		['x\r\ny\nz\rw', '\r\n', 'x\r\ny\r\nz\r\nw'],
+		['no breaks', '\r\n', 'no breaks']
+	])('turns %j into separator %j', (text, separator, expected) => {
+		expect(normalizeLineBreaks(text, separator)).toBe(expected);
 	});
 });

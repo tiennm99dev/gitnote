@@ -27,3 +27,12 @@ export function decodeText(bytes) {
 export function lineSeparatorFor(text) {
 	return text.includes('\r\n') && !/(^|[^\r])\n/.test(text) ? '\r\n' : '\n';
 }
+
+/**
+ * @param {string} text text arriving from outside the note, such as a paste
+ * @param {string} separator the note's line separator
+ * @returns {string} the text using only that separator
+ */
+export function normalizeLineBreaks(text, separator) {
+	return text.replace(/\r\n?|\n/g, separator);
+}

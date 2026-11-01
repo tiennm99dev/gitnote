@@ -4,7 +4,8 @@
 	import { EditorView, keymap } from '@codemirror/view';
 	import { minimalSetup } from 'codemirror';
 	import { onMount, untrack } from 'svelte';
-	import { lineSeparatorFor } from '#lib/notes/text.js';
+	import { pastedImage, pastedLineBreaks } from '#lib/notes/editor-input.js';
+	import { lineSeparatorFor, normalizeLineBreaks } from '#lib/notes/text.js';
 
 	/**
 	 * @typedef {object} Props
@@ -32,7 +33,7 @@
 	 */
 	export function insert(insertion) {
 		if (!view) return;
-		view.dispatch(view.state.replaceSelection(insertion));
+		view.dispatch(view.state.replaceSelection(normalizeLineBreaks(insertion, view.state.lineBreak)));
 		view.focus();
 	}
 
@@ -43,6 +44,7 @@
 			extensions: [
 				// Reading back through `sliceDoc` then gives the file's exact bytes.
 				EditorState.lineSeparator.of(lineSeparatorFor(doc)),
+				pastedLineBreaks,
 				keymap.of([
 					{
 						key: 'Mod-s',
@@ -68,7 +70,7 @@
 				}),
 				EditorView.domEventHandlers({
 					paste: (event) => {
-						const image = [...(event.clipboardData?.files ?? [])].find((file) => file.type.startsWith('image/'));
+						const image = pastedImage(event.clipboardData, isMarkdown);
 						if (!image) return false;
 						event.preventDefault();
 						onimage(image);
