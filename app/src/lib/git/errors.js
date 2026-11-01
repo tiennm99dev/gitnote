@@ -22,6 +22,7 @@ export const ErrorCode = Object.freeze({
 	NOTHING_TO_COMMIT: 'nothing_to_commit',
 	DIRTY_TREE: 'dirty_tree',
 	MERGE_IN_PROGRESS: 'merge_in_progress',
+	MERGE_STATE_DAMAGED: 'merge_state_damaged',
 	MERGE_CONFLICT: 'merge_conflict',
 	MERGE_NOT_SUPPORTED: 'merge_not_supported',
 	NO_OPEN_MERGE: 'no_open_merge',

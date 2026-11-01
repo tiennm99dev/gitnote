@@ -563,6 +563,33 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	/**
 	 * @param {string} oid
 	 * @param {string} filepath
+	 * @returns {Promise<TreeBlob | null>} null when the commit has no file there
+	 */
+	const treeBlobAt = async (oid, filepath) => {
+		const segments = filepath.split('/');
+		/** @type {TreeBlob | null} */
+		let found = null;
+		await git.walk({
+			fs,
+			dir,
+			gitdir,
+			cache,
+			trees: [git.TREE({ ref: oid })],
+			map: async (path, [entry]) => {
+				if (path === filepath) {
+					found = await treeBlob(entry);
+					return null;
+				}
+				// Only the folders on the way down to the file are worth opening.
+				return path === '.' || segments.slice(0, path.split('/').length).join('/') === path ? true : null;
+			}
+		});
+		return found;
+	};
+
+	/**
+	 * @param {string} oid
+	 * @param {string} filepath
 	 * @returns {Promise<Uint8Array | null>} null when the commit does not have the path
 	 */
 	const readBlobOrNull = async (oid, filepath) => {
@@ -865,6 +892,48 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		}
 		return undecided;
 	};
+
+	/**
+	 * @param {MergeState} merge
+	 * @returns {Promise<string[]>} conflicted text files that still hold markers
+	 */
+	const conflictsWithMarkers = async (merge) => {
+		/** @type {string[]} */
+		const withMarkers = [];
+		for (const { path, binary } of merge.conflicts) {
+			if (binary || !(await lstatOrNull(abs(path)))) continue;
+			const text = /** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' }));
+			if (hasConflictMarkers(text)) withMarkers.push(path);
+		}
+		return withMarkers;
+	};
+
+	/**
+	 * Downloads the remote branch's new commits and moves only the
+	 * remote-tracking ref. No `depth` here: a depth-limited fetch marks the new
+	 * remote tip shallow, after which no merge base exists for a diverged branch.
+	 * @param {{ branch: string, onProgress?: ProgressCallback, signal?: AbortSignal }} options
+	 * @returns {Promise<void>}
+	 */
+	const fetchBranch = ({ branch, onProgress, signal }) =>
+		withLock(
+			networkLock,
+			async () => {
+				signal?.throwIfAborted();
+				await git.fetch({
+					...base,
+					http: withSignal(http, signal),
+					remote: REMOTE,
+					ref: branch,
+					singleBranch: true,
+					tags: false,
+					onProgress,
+					...authCallbacks(getCredential)
+				});
+				await flush();
+			},
+			signal
+		);
 
 	/**
 	 * @param {string} path
@@ -1278,26 +1347,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					return currentBranch();
 				}, signal);
 
-				await withLock(
-					networkLock,
-					async () => {
-						signal?.throwIfAborted();
-						// No `depth` here: a depth-limited fetch marks the new remote tip
-						// shallow, after which no merge base exists for a diverged branch.
-						await git.fetch({
-							...base,
-							http: withSignal(http, signal),
-							remote: REMOTE,
-							ref: branch,
-							singleBranch: true,
-							tags: false,
-							onProgress,
-							...authCallbacks(getCredential)
-						});
-						await flush();
-					},
-					signal
-				);
+				await fetchBranch({ branch, onProgress, signal });
 
 				return locked(async () => {
 					signal?.throwIfAborted();
@@ -1312,6 +1362,21 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					await assertNoUntrackedCollisions(theirsOid);
 					return applyPull({ branch, oursOid, theirsOid, remoteRef, author: { name: author.name, email: author.email } });
 				}, signal);
+			})(),
+
+		/**
+		 * Refreshes what `aheadBehind` knows about the remote and changes nothing
+		 * else, so the counts stay true while local changes hold a pull back.
+		 * @param {{ signal?: AbortSignal }} [options]
+		 * @returns {Promise<void>}
+		 */
+		fetchRemote: ({ signal } = {}) =>
+			(async () => {
+				const branch = await locked(async () => {
+					await assertCloned();
+					return currentBranch();
+				}, signal);
+				await fetchBranch({ branch, signal });
 			})(),
 
 		/**
@@ -1363,15 +1428,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				await assertCloned();
 				const merge = await requireOpenMerge();
 
-				/** @type {string[]} */
-				const withMarkers = [];
-				if (!allowMarkers) {
-					for (const { path, binary } of merge.conflicts) {
-						if (binary || !(await lstatOrNull(abs(path)))) continue;
-						const text = /** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' }));
-						if (hasConflictMarkers(text)) withMarkers.push(path);
-					}
-				}
+				const withMarkers = allowMarkers ? [] : await conflictsWithMarkers(merge);
 				const undecided = await undecidedConflicts(merge);
 				if (withMarkers.length > 0 || undecided.length > 0) {
 					const sentences = [
@@ -1418,6 +1475,89 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				await flush();
 				await rollBackPull(aborting);
 				return { oid: merge.oursOid };
+			}),
+
+		/**
+		 * Where each conflict of the open merge stands: the same checks that make
+		 * `completeMerge` refuse.
+		 * @returns {Promise<import('./merge.js').ConflictProgress[]>} empty when no merge is open
+		 */
+		describeConflicts: () =>
+			locked(async () => {
+				await assertCloned();
+				const merge = await readMergeState(fs, gitdir);
+				if (!merge) return [];
+				const withMarkers = new Set(await conflictsWithMarkers(merge));
+				const undecided = new Set(await undecidedConflicts(merge));
+				return merge.conflicts.map((conflict) => ({ ...conflict, hasMarkers: withMarkers.has(conflict.path), undecided: undecided.has(conflict.path) }));
+			}),
+
+		/**
+		 * The way out when the merge record cannot be read, which otherwise makes
+		 * every operation fail. Which commit was being merged is lost, but the
+		 * branch has not moved: the index goes back to it and the files stay as they
+		 * are, so whatever the merge left in them shows as changes to commit or
+		 * discard.
+		 * @returns {Promise<boolean>} false when the record was readable and nothing changed
+		 */
+		resetDamagedMerge: () =>
+			withLock(id, async () => {
+				try {
+					await readMergeState(fs, gitdir);
+					return false;
+				} catch (error) {
+					if (!(error instanceof GitEngineError && error.code === ErrorCode.MERGE_STATE_DAMAGED)) throw error;
+				}
+				await clearMergeState(fs, gitdir);
+				await flush();
+				await unstageOthers([]);
+				await flush();
+				return true;
+			}),
+
+		/**
+		 * The file as the branch's commit has it, for showing what changed.
+		 * @param {string} path
+		 * @returns {Promise<Uint8Array | null>} null when the commit does not have it
+		 */
+		readCommitted: (path) =>
+			locked(async () => {
+				const filepath = normalizePath(path);
+				await assertCloned();
+				return readBlobOrNull(await git.resolveRef({ fs, gitdir, ref: 'HEAD' }), filepath);
+			}),
+
+		/**
+		 * Throws away uncommitted changes: each path goes back to the branch's
+		 * commit, and a file the commit does not have is deleted. Editor drafts are
+		 * not files and stay. Refuses while a merge is open; `abortMerge` is the way
+		 * out of that.
+		 * @param {string[]} paths
+		 * @returns {Promise<string[]>} the paths that had changes
+		 */
+		discardChanges: (paths) =>
+			locked(async () => {
+				const selected = normalizePaths(paths);
+				await assertCloned();
+				await assertNoMerge();
+				const changed = new Set((await statusUnlocked()).files.map((file) => file.path));
+				const toDiscard = selected.filter((path) => changed.has(path));
+				const headOid = await git.resolveRef({ fs, gitdir, ref: 'HEAD' });
+				/** @type {Map<string, TreeBlob>} */
+				const committed = new Map();
+				for (const path of toDiscard) {
+					const blob = await treeBlobAt(headOid, path);
+					if (blob) committed.set(path, blob);
+				}
+				// Removals first: a new file can sit where a committed folder belongs.
+				for (const path of toDiscard) {
+					if (!committed.has(path)) await removeFromTree(path);
+				}
+				for (const [path, blob] of committed) await writeTreeBlob(path, blob);
+				await flush();
+				for (const filepath of toDiscard) await git.resetIndex({ ...base, ref: headOid, filepath });
+				await flush();
+				return toDiscard;
 			}),
 
 		/**
@@ -1611,8 +1751,9 @@ function assertMessage(message) {
 
 /**
  * @param {unknown} author
+ * @throws {GitEngineError} `INVALID_ARGUMENT` when git could not record this author
  */
-function assertAuthor(author) {
+export function assertAuthor(author) {
 	const value = /** @type {Partial<Author> | null | undefined} */ (author);
 	if (typeof value?.name !== 'string' || value.name.trim() === '' || typeof value.email !== 'string' || value.email.trim() === '') {
 		throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'Set an author name and email for commits.');

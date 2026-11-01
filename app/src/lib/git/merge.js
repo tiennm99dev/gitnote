@@ -6,6 +6,7 @@
  */
 
 import diff3Merge from 'diff3';
+import { ErrorCode, GitEngineError } from './errors.js';
 
 /** Git's own binary heuristic: a NUL byte in the first 8000 bytes. */
 const BINARY_SNIFF_LENGTH = 8000;
@@ -109,6 +110,11 @@ export function hasConflictMarkers(text) {
  */
 
 /**
+ * A conflict as it stands now, for a screen that resolves them.
+ * @typedef {Conflict & { hasMarkers: boolean, undecided: boolean }} ConflictProgress
+ */
+
+/**
  * The record of a pull that is changing the working tree. It is written and
  * flushed before anything moves, so an interrupted pull can always be undone:
  * - `applying`: the pull, or an abort of its merge, is under way. Found by any
@@ -153,9 +159,23 @@ export async function readMergeState(fs, gitdir) {
 	// LightningFS deletes an unlinked file's data at once but saves its directory
 	// later, so a tab that died while closing the record leaves a name with no data.
 	if (text === undefined || text === null) return null;
-	const state = JSON.parse(text);
-	if (!isMergeState(state)) throw new Error('The stored merge state is damaged.');
+	/** @type {unknown} */
+	let state;
+	try {
+		state = JSON.parse(text);
+	} catch (error) {
+		throw damagedMergeState(error);
+	}
+	if (!isMergeState(state)) throw damagedMergeState();
 	return state;
+}
+
+/**
+ * @param {unknown} [cause]
+ * @returns {GitEngineError} what every operation reports until `resetDamagedMerge` runs
+ */
+function damagedMergeState(cause) {
+	return new GitEngineError(ErrorCode.MERGE_STATE_DAMAGED, 'The record of an open merge is damaged, so it cannot be resumed.', { cause });
 }
 
 /**

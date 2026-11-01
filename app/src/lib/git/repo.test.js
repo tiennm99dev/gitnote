@@ -197,6 +197,20 @@ async function divergedRepo(seed, theirs, theirsExtra) {
 	return cloned;
 }
 
+/**
+ * A clone with a merge open on `clash.md`, after both sides changed its one line.
+ * @returns {ReturnType<typeof clonedRepo>}
+ */
+async function conflictedRepo() {
+	const context = await clonedRepo({ 'clash.md': 'base\n', 'clean.md': 'clean\n' });
+	await context.repo.writeFile('clash.md', 'mine\n');
+	await context.repo.commit({ paths: ['clash.md'], message: 'mine', author: AUTHOR });
+	await pushFromElsewhere(context.remote, { 'clash.md': 'theirs\n', 'other.md': 'other\n' }, 'theirs');
+	const pulled = await context.repo.pull({ author: AUTHOR });
+	expect(pulled.status).toBe('conflict');
+	return context;
+}
+
 describe('clone', () => {
 	it('checks out the default branch shallowly and records it', async () => {
 		const remote = await createRemote({ 'README.md': 'seed\n', 'notes/a.md': '# a\n' });
@@ -1953,6 +1967,106 @@ describe('deleting a copy', () => {
 	});
 });
 
+describe('discardChanges', () => {
+	it('restores an edit and a deletion, and deletes a new file, leaving the rest', async () => {
+		const { repo } = await clonedRepo({ 'a.md': 'a\n', 'folder/b.md': 'b\n', 'c.md': 'c\n' });
+		await repo.writeFile('a.md', 'edited\n');
+		await repo.remove('folder/b.md');
+		await repo.writeFile('new/d.md', 'new\n');
+		await repo.writeFile('c.md', 'kept edit\n');
+
+		expect(await repo.discardChanges(['a.md', 'folder/b.md', 'new/d.md'])).toEqual(['a.md', 'folder/b.md', 'new/d.md']);
+
+		expect(await repo.readText('a.md')).toBe('a\n');
+		expect(await repo.readText('folder/b.md')).toBe('b\n');
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['a.md', 'c.md', 'folder/b.md']);
+		expect((await repo.status()).files).toEqual([{ path: 'c.md', change: 'modified' }]);
+	});
+
+	it('restores a same-size edit made in the same second as the index write', async () => {
+		const { repo } = await clonedRepo({ 'a.md': 'aaaa\n' });
+		await repo.writeFile('a.md', 'bbbb\n');
+		await repo.discardChanges(['a.md']);
+		expect(await repo.readText('a.md')).toBe('aaaa\n');
+		await repo.writeFile('a.md', 'cccc\n');
+		expect((await repo.status()).files).toEqual([{ path: 'a.md', change: 'modified' }]);
+	});
+
+	it('puts back a folder a new file took the place of', async () => {
+		const { repo } = await clonedRepo({ 'folder/b.md': 'b\n' });
+		await repo.remove('folder');
+		await repo.writeFile('folder', 'now a file\n');
+		await repo.discardChanges(['folder', 'folder/b.md']);
+		expect(await repo.readText('folder/b.md')).toBe('b\n');
+		expect((await repo.status()).clean).toBe(true);
+	});
+
+	it('skips paths with no changes, and refuses a path outside the tree', async () => {
+		const { repo } = await clonedRepo();
+		expect(await repo.discardChanges(['README.md'])).toEqual([]);
+		expect((await rejection(repo.discardChanges(['../x']))).code).toBe(ErrorCode.INVALID_PATH);
+	});
+
+	it('refuses while a merge is open', async () => {
+		const { repo } = await conflictedRepo();
+		expect((await rejection(repo.discardChanges(['clash.md']))).code).toBe(ErrorCode.MERGE_IN_PROGRESS);
+	});
+});
+
+describe('readCommitted', () => {
+	it("reads the branch's version, not the working tree's", async () => {
+		const { repo } = await clonedRepo({ 'a.md': 'a\n' });
+		await repo.writeFile('a.md', 'edited\n');
+		await repo.writeFile('new.md', 'new\n');
+		expect(new TextDecoder().decode(/** @type {Uint8Array} */ (await repo.readCommitted('a.md')))).toBe('a\n');
+		expect(await repo.readCommitted('new.md')).toBeNull();
+	});
+});
+
+describe('fetchRemote', () => {
+	it('updates the behind count and leaves the branch and working tree alone', async () => {
+		const { repo, remote } = await clonedRepo({ 'a.md': 'a\n' });
+		await repo.writeFile('a.md', 'edited\n');
+		await pushFromElsewhere(remote, { 'b.md': 'b\n' }, 'remote change');
+		expect((await repo.aheadBehind()).behind).toBe(0);
+
+		await repo.fetchRemote();
+
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 0, behind: 1 });
+		expect(await repo.readText('a.md')).toBe('edited\n');
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['a.md']);
+	});
+});
+
+describe('describeConflicts', () => {
+	it('is empty with no merge open', async () => {
+		const { repo } = await clonedRepo();
+		expect(await repo.describeConflicts()).toEqual([]);
+	});
+
+	it('follows markers and side choices as they are settled', async () => {
+		const { repo } = await conflictedRepo();
+		expect(await repo.describeConflicts()).toEqual([{ path: 'clash.md', kind: 'both_modified', binary: false, hasMarkers: true, undecided: false }]);
+		await repo.writeFile('clash.md', 'settled\n');
+		expect(await repo.describeConflicts()).toEqual([{ path: 'clash.md', kind: 'both_modified', binary: false, hasMarkers: false, undecided: false }]);
+	});
+
+	it('reports a file one side deleted as undecided until a side is picked', async () => {
+		const remote = await createRemote({ 'gone.md': 'one\n' });
+		const repo = openRepo(remote);
+		await repo.clone({ url: remote.url });
+		await repo.writeFile('gone.md', 'mine\n');
+		await repo.commit({ paths: ['gone.md'], message: 'edit', author: AUTHOR });
+		await changeElsewhere(remote, {}, async (work) => {
+			await runGit(['rm', '--quiet', 'gone.md'], work);
+		});
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		expect(await repo.describeConflicts()).toEqual([{ path: 'gone.md', kind: 'deleted_by_theirs', binary: false, hasMarkers: false, undecided: true }]);
+		await repo.resolveConflict({ path: 'gone.md', side: 'theirs' });
+		expect((await repo.describeConflicts())[0]?.undecided).toBe(false);
+	});
+});
+
 describe('a merge inside a folder', () => {
 	it('writes conflict markers into a nested file, and refuses the commit until they are gone', async () => {
 		const { repo, remote } = await clonedRepo({ 'deep/er/clash.md': 'base\n' });
@@ -1998,5 +2112,45 @@ describe('a merge inside a folder', () => {
 		await repo.completeMerge({ author: AUTHOR });
 		await repo.push();
 		expect(await showRemote(remote, 'main:deep/both.md')).toBe('ONE\ntwo\nthree\nfour\nfive\nSIX\n');
+	});
+});
+
+describe('resetDamagedMerge', () => {
+	it('makes a repo with an unreadable merge record work again, keeping the files as changes', async () => {
+		const { repo, fs, remote } = await conflictedRepo();
+		await fs.promises.writeFile(`${repo.dir}/.git/gitnote-merge.json`, 'not json', { encoding: 'utf8' });
+
+		expect((await rejection(repo.status())).code).toBe(ErrorCode.MERGE_STATE_DAMAGED);
+		expect((await rejection(repo.listTree())).code).toBe(ErrorCode.MERGE_STATE_DAMAGED);
+
+		expect(await repo.resetDamagedMerge()).toBe(true);
+
+		const { files, merge } = await repo.status();
+		expect(merge).toBeNull();
+		expect(files.map((file) => file.path)).toContain('clash.md');
+		expect(await repo.readText('clash.md')).toContain('<<<<<<<');
+
+		// The way forward works: take the changes back and pull into the same merge.
+		await repo.discardChanges(files.map((file) => file.path));
+		expect((await repo.status()).clean).toBe(true);
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		await repo.writeFile('clash.md', 'settled\n');
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+		expect(await showRemote(remote, 'main:clash.md')).toBe('settled\n');
+	});
+
+	it('also takes a record that parses but is not a merge state', async () => {
+		const { repo, fs } = await conflictedRepo();
+		await fs.promises.writeFile(`${repo.dir}/.git/gitnote-merge.json`, '{"phase":"conflicted"}', { encoding: 'utf8' });
+		expect((await rejection(repo.aheadBehind())).code).toBe(ErrorCode.MERGE_STATE_DAMAGED);
+		expect(await repo.resetDamagedMerge()).toBe(true);
+		expect((await repo.status()).merge).toBeNull();
+	});
+
+	it('changes nothing when the record is readable', async () => {
+		const { repo } = await conflictedRepo();
+		expect(await repo.resetDamagedMerge()).toBe(false);
+		expect((await repo.status()).merge?.conflictedPaths).toEqual(['clash.md']);
 	});
 });
