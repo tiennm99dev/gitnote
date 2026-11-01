@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
+import { STATIC_SHELL_PORT } from './static-server.js';
 
 /**
  * Collects uncaught page errors, console errors and failed network responses
@@ -102,4 +103,39 @@ test('ships a strict Content Security Policy in the built shell', async () => {
 		'https://gitlab.com',
 		'https://gitnote.miti99.dev'
 	]);
+});
+
+test('boots under the built-in policy alone, as the WebView and Static Assets serve it', async ({ page }) => {
+	// The preview server sends its own CSP header; this server sends none, so
+	// only the <meta> policy in the built index.html applies, hashes included.
+	const origin = `http://127.0.0.1:${STATIC_SHELL_PORT}`;
+	await page.addInitScript(() => {
+		/** @type {string[]} */
+		const violations = [];
+		Object.assign(globalThis, { cspViolations: violations });
+		globalThis.document.addEventListener('securitypolicyviolation', (event) => {
+			violations.push(`${event.effectiveDirective}: ${event.blockedURI || 'inline'}`);
+		});
+	});
+	const violations = () => page.evaluate(() => /** @type {string[]} */ (Reflect.get(globalThis, 'cspViolations')));
+
+	for (const path of ['/', '/some/deep/link']) {
+		const errors = collectErrors(page);
+		const response = await page.goto(`${origin}${path}`, { waitUntil: 'networkidle' });
+		expect(response?.headers()['content-security-policy']).toBeUndefined();
+		if (path === '/') await expect(page.getByTestId('app-title')).toHaveText('gitnote');
+		else await expect(page.getByRole('heading', { name: '404' })).toBeVisible();
+		expect(await violations()).toEqual([]);
+		expect(errors).toEqual([]);
+	}
+
+	// The policy is in force, not just present: an injected inline script is
+	// blocked and reported.
+	await page.evaluate(() => {
+		const script = globalThis.document.createElement('script');
+		script.textContent = 'window.inlineRan = true;';
+		globalThis.document.body.append(script);
+	});
+	await expect.poll(violations).toContain('script-src-elem: inline');
+	expect(await page.evaluate(() => Reflect.get(globalThis, 'inlineRan'))).toBeUndefined();
 });

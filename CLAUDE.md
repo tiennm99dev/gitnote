@@ -10,7 +10,8 @@ tooling notes: [README.md](README.md).
   `npm run lint && npm run typecheck && npm test && npm run build`.
   Add `npm run e2e` when touching routes, layout, build config or anything the
   browser loads.
-- Fixed ports with `strictPort`: dev 5173, preview 4173, `wrangler dev` 8787.
+- Fixed ports with `strictPort`: dev 5173, preview 4173, e2e static shell 4174,
+  `wrangler dev` 8787.
   If a port is busy, stop the stale server instead of picking another port.
   `npm run e2e` builds and serves its own preview on 4173, so stop any
   running preview first.
