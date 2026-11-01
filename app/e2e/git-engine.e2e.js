@@ -29,6 +29,185 @@ function remoteWith(files) {
 	return createRemote(files, { root: E2E_GIT_ROOT, port: E2E_GIT_PORT });
 }
 
+/**
+ * Models the tab dying when LightningFS next saves its directory: `saves` more
+ * saves land, then that save and every later IndexedDB write are lost, while
+ * what already landed stays. Later steps of the operation run in memory only,
+ * as the dead tab they stand for would never have reached them.
+ * @param {import('@playwright/test').Page} page
+ * @param {number} saves
+ * @returns {Promise<unknown>}
+ */
+function dieAtDirectorySave(page, saves) {
+	return page.evaluate(`(() => {
+		const { put, delete: remove } = IDBObjectStore.prototype;
+		let left = ${saves};
+		IDBObjectStore.prototype.put = function (value, key) {
+			if (key === '!root' && !globalThis.tabDied) {
+				if (left === 0) globalThis.tabDied = true;
+				left -= 1;
+			}
+			return globalThis.tabDied ? this.count() : put.call(this, value, key);
+		};
+		IDBObjectStore.prototype.delete = function (key) {
+			return globalThis.tabDied ? this.count() : remove.call(this, key);
+		};
+	})()`);
+}
+
+/**
+ * @param {import('@playwright/test').BrowserContext} context
+ * @returns {Promise<import('@playwright/test').Page>}
+ */
+async function openPage(context) {
+	const page = await context.newPage();
+	await page.goto(PAGE_URL);
+	await page.waitForFunction('typeof callRepo === "function"');
+	return page;
+}
+
+/**
+ * Sets a scene up, kills the tab at the first, second, third... directory save
+ * of an operation, and checks the repo on reopening, until the operation runs
+ * past every save without dying.
+ * @param {import('@playwright/test').Browser} browser
+ * @param {object} options
+ * @param {(page: import('@playwright/test').Page) => Promise<void>} options.arrange
+ * @param {(page: import('@playwright/test').Page) => Promise<unknown>} options.act
+ * @param {(page: import('@playwright/test').Page) => Promise<void>} options.check
+ */
+async function atEveryDirectorySave(browser, { arrange, act, check }) {
+	for (let saves = 0; saves < 12; saves += 1) {
+		const context = await browser.newContext();
+		const page = await openPage(context);
+		await arrange(page);
+		await dieAtDirectorySave(page, saves);
+		await act(page).catch(() => {});
+		const died = await page.evaluate('globalThis.tabDied === true');
+		await page.close({ runBeforeUnload: false });
+		await check(await openPage(context));
+		await context.close();
+		if (!died) return;
+	}
+	throw new Error('The operation kept saving past the expected number of times.');
+}
+
+test.describe('a tab that dies at any directory save', () => {
+	test.setTimeout(180_000);
+
+	test('during a commit keeps every commit and leaves a repo that works', async ({ browser }) => {
+		/** @type {import('../test/remote-repo.js').Remote} */
+		let remote;
+		await atEveryDirectorySave(browser, {
+			arrange: async (page) => {
+				remote = await remoteWith({ 'README.md': 'seed\n', 'other.md': 'other\n' });
+				await run(page, remote.url, 'clone', [{ url: remote.url }]);
+				await run(page, remote.url, 'writeFile', ['README.md', 'an older unpushed commit\n']);
+				await run(page, remote.url, 'commit', [{ paths: ['README.md'], message: 'older', author: AUTHOR }]);
+				await run(page, remote.url, 'writeFile', ['other.md', 'being committed\n']);
+				await run(page, remote.url, 'writeFile', ['bystander.md', 'staying a draft\n']);
+			},
+			act: (page) => run(page, remote.url, 'commit', [{ paths: ['other.md'], message: 'new', author: AUTHOR }]),
+			check: async (page) => {
+				const { files } = await run(page, remote.url, 'status');
+				expect(files.map((file) => file.path)).toContain('bystander.md');
+				expect(await run(page, remote.url, 'readText', ['other.md'])).toBe('being committed\n');
+				if (files.some((file) => file.path === 'other.md')) {
+					await run(page, remote.url, 'commit', [{ paths: ['other.md'], message: 'new again', author: AUTHOR }]);
+				}
+				await run(page, remote.url, 'writeFile', ['third.md', 'after the crash\n']);
+				await run(page, remote.url, 'commit', [{ paths: ['third.md'], message: 'after', author: AUTHOR }]);
+				expect((await run(page, remote.url, 'push')).pushed).toBe(true);
+				await runGit(['fsck', '--no-dangling'], remote.bare);
+				expect(await showRemote(remote, 'main:README.md')).toBe('an older unpushed commit\n');
+				expect(await showRemote(remote, 'main:other.md')).toBe('being committed\n');
+				expect(await showRemote(remote, 'main:third.md')).toBe('after the crash\n');
+				expect((await runGit(['ls-tree', '-r', '--name-only', 'main'], remote.bare))).not.toContain('bystander.md');
+			}
+		});
+	});
+
+	test('during a pull that conflicts either undoes it or leaves the whole conflict', async ({ browser }) => {
+		/** @type {import('../test/remote-repo.js').Remote} */
+		let remote;
+		await atEveryDirectorySave(browser, {
+			arrange: async (page) => {
+				remote = await remoteWith({ 'clash.md': 'base\n', 'calm.md': 'calm\n' });
+				await run(page, remote.url, 'clone', [{ url: remote.url }]);
+				await pushFromElsewhere(remote, { 'clash.md': 'remote side\n', 'calm.md': 'calm remote\n' }, 'remote');
+				await run(page, remote.url, 'writeFile', ['clash.md', 'local side\n']);
+				await run(page, remote.url, 'commit', [{ paths: ['clash.md'], message: 'local', author: AUTHOR }]);
+			},
+			act: (page) => run(page, remote.url, 'pull', [{ author: AUTHOR }]),
+			check: async (page) => {
+				if ((await run(page, remote.url, 'getMergeState'))) {
+					expect(await run(page, remote.url, 'readText', ['clash.md'])).toContain('<<<<<<< main');
+					expect(await run(page, remote.url, 'readText', ['calm.md'])).toBe('calm remote\n');
+				} else {
+					expect((await run(page, remote.url, 'status')).clean).toBe(true);
+					expect(await run(page, remote.url, 'readText', ['clash.md'])).toBe('local side\n');
+					expect(await run(page, remote.url, 'readText', ['calm.md'])).toBe('calm\n');
+					expect((await run(page, remote.url, 'pull', [{ author: AUTHOR }])).status).toBe('conflict');
+				}
+				await run(page, remote.url, 'writeFile', ['clash.md', 'resolved\n']);
+				await run(page, remote.url, 'completeMerge', [{ author: AUTHOR }]);
+				expect((await run(page, remote.url, 'push')).pushed).toBe(true);
+				await runGit(['fsck', '--no-dangling'], remote.bare);
+				expect(await showRemote(remote, 'main:clash.md')).toBe('resolved\n');
+				expect(await showRemote(remote, 'main:calm.md')).toBe('calm remote\n');
+			}
+		});
+	});
+
+	test('while finishing a merge never loses the merge', async ({ browser }) => {
+		/** @type {import('../test/remote-repo.js').Remote} */
+		let remote;
+		await atEveryDirectorySave(browser, {
+			arrange: async (page) => {
+				remote = await remoteWith({ 'clash.md': 'base\n', 'calm.md': 'calm\n' });
+				await run(page, remote.url, 'clone', [{ url: remote.url }]);
+				await pushFromElsewhere(remote, { 'clash.md': 'remote side\n', 'calm.md': 'calm remote\n' }, 'remote');
+				await run(page, remote.url, 'writeFile', ['clash.md', 'local side\n']);
+				await run(page, remote.url, 'commit', [{ paths: ['clash.md'], message: 'local', author: AUTHOR }]);
+				await run(page, remote.url, 'pull', [{ author: AUTHOR }]);
+				await run(page, remote.url, 'writeFile', ['clash.md', 'resolved\n']);
+			},
+			act: (page) => run(page, remote.url, 'completeMerge', [{ author: AUTHOR }]),
+			check: async (page) => {
+				if (await run(page, remote.url, 'getMergeState')) await run(page, remote.url, 'completeMerge', [{ author: AUTHOR }]);
+				expect((await run(page, remote.url, 'status')).clean).toBe(true);
+				expect((await run(page, remote.url, 'push')).pushed).toBe(true);
+				await runGit(['fsck', '--no-dangling'], remote.bare);
+				expect(await showRemote(remote, 'main:clash.md')).toBe('resolved\n');
+				expect(await showRemote(remote, 'main:calm.md')).toBe('calm remote\n');
+			}
+		});
+	});
+
+	test('during an abort keeps drafts and can be finished', async ({ browser }) => {
+		/** @type {import('../test/remote-repo.js').Remote} */
+		let remote;
+		await atEveryDirectorySave(browser, {
+			arrange: async (page) => {
+				remote = await remoteWith({ 'clash.md': 'base\n', 'calm.md': 'calm\n' });
+				await run(page, remote.url, 'clone', [{ url: remote.url }]);
+				await pushFromElsewhere(remote, { 'clash.md': 'remote side\n', 'calm.md': 'calm remote\n' }, 'remote');
+				await run(page, remote.url, 'writeFile', ['clash.md', 'local side\n']);
+				await run(page, remote.url, 'commit', [{ paths: ['clash.md'], message: 'local', author: AUTHOR }]);
+				await run(page, remote.url, 'pull', [{ author: AUTHOR }]);
+				await run(page, remote.url, 'writeFile', ['calm.md', 'my draft\n']);
+			},
+			act: (page) => run(page, remote.url, 'abortMerge'),
+			check: async (page) => {
+				if (await run(page, remote.url, 'getMergeState')) await run(page, remote.url, 'abortMerge');
+				expect(await run(page, remote.url, 'readText', ['calm.md'])).toBe('my draft\n');
+				expect(await run(page, remote.url, 'readText', ['clash.md'])).toBe('local side\n');
+				expect((await run(page, remote.url, 'status')).files).toEqual([{ path: 'calm.md', change: 'modified' }]);
+			}
+		});
+	});
+});
+
 test.describe('git engine on LightningFS', () => {
 	test.beforeEach(async ({ page }) => {
 		const errors = /** @type {string[]} */ ([]);

@@ -59,6 +59,16 @@ describe('createMergeDriver', () => {
 		expect(await merge(['a\nb', 'A\nb', 'a\nb'])).toEqual({ cleanMerge: true, mergedText: 'A\nb' });
 	});
 
+	it.each([
+		['U+2028', 'keep\u2028this'],
+		['U+2029', 'keep\u2029this'],
+		['a lone CR', 'old\rmac'],
+		['a CRLF line end', 'windows\r']
+	])('keeps %s on a line neither side touched', async (_name, line) => {
+		const tail = `${line}\nb\nc\nd\ne\n`;
+		expect(await merge([`a\n${tail}`, `A\n${tail}`, `a\n${line}\nb\nc\nd\nE\n`])).toEqual({ cleanMerge: true, mergedText: `A\n${line}\nb\nc\nd\nE\n` });
+	});
+
 	it('handles an empty base', async () => {
 		expect((await merge(['', 'ours\n', 'theirs\n'])).cleanMerge).toBe(false);
 	});
@@ -93,6 +103,8 @@ describe('merge state', () => {
 		conflictedPaths: ['a.md'],
 		binaryPaths: [],
 		conflicts: [{ path: 'a.md', kind: 'both_modified', binary: false }],
+		resolvedPaths: [],
+		keptDrafts: [],
 		startedAt: '2026-11-01T00:00:00.000Z'
 	};
 
@@ -118,11 +130,19 @@ describe('merge state', () => {
 		expect(await readMergeState(fs, '/gitdir')).toBeNull();
 	});
 
+	it('counts a closed record whose name outlived its data as closed', async () => {
+		const fs = emptyFs();
+		fs.promises.readFile = async () => undefined;
+		expect(await readMergeState(fs, '/gitdir')).toBeNull();
+	});
+
 	it.each([
 		['bad JSON', 'not json'],
 		['a missing field', JSON.stringify({ ...STATE, theirsOid: undefined })],
 		['a bad oid', JSON.stringify({ ...STATE, theirsOid: 'HEAD' })],
 		['a bad path list', JSON.stringify({ ...STATE, conflictedPaths: 'a.md' })],
+		['a bad resolved list', JSON.stringify({ ...STATE, resolvedPaths: undefined })],
+		['a bad draft list', JSON.stringify({ ...STATE, keptDrafts: [1] })],
 		['a bad phase', JSON.stringify({ ...STATE, phase: 'done' })],
 		['a bad conflict kind', JSON.stringify({ ...STATE, conflicts: [{ path: 'a.md', kind: 'odd', binary: false }] })]
 	])('refuses a stored state with %s', async (_name, text) => {

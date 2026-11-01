@@ -11,6 +11,15 @@ import { networkError } from './errors.js';
 /** @typedef {import('isomorphic-git').HttpClient} HttpClient */
 /** @typedef {import('isomorphic-git').GitAuth} GitAuth */
 
+/** How long a request may go without a response, or a response without a chunk. */
+const STALL_TIMEOUT_MS = 60_000;
+
+/**
+ * fetch reports no upload progress, so a request's wait for its response also
+ * allows for sending its body this slowly.
+ */
+const MIN_UPLOAD_BYTES_PER_SECOND = 16_000;
+
 /**
  * @param {string} url a git host URL isomorphic-git wants to fetch
  * @param {string} relayOrigin e.g. `https://gitnote.miti99.dev`
@@ -30,43 +39,90 @@ export function toRelayUrl(url, relayOrigin) {
 }
 
 /**
- * @param {{ relayOrigin?: string, signal?: AbortSignal }} [options] the relay
- *   origin defaults to the page's own origin; `signal` aborts every request
+ * A connection that goes quiet ends in a `network` error rather than hanging.
+ * @param {{ relayOrigin?: string, signal?: AbortSignal, stallTimeoutMs?: number }} [options]
+ *   the relay origin defaults to the page's own origin; `signal` aborts every request
  * @returns {HttpClient}
  */
-export function createGitHttp({ relayOrigin = globalThis.location?.origin, signal } = {}) {
+export function createGitHttp({ relayOrigin = globalThis.location?.origin, signal, stallTimeoutMs = STALL_TIMEOUT_MS } = {}) {
 	if (!relayOrigin) throw new TypeError('createGitHttp needs a relay origin outside a browser page');
 	const origin = relayOrigin;
 	return {
 		async request(request) {
 			const url = toRelayUrl(request.url, origin);
-			const activeSignal = request.signal ?? signal;
+			const callerSignal = request.signal ?? signal;
+			const stall = new AbortController();
+			/** @type {ReturnType<typeof setTimeout> | undefined} */
+			let timer;
+			/** @param {number} ms */
+			const arm = (ms) => {
+				clearTimeout(timer);
+				timer = setTimeout(() => stall.abort(new Error('The connection stalled.')), ms);
+			};
+			const disarm = () => clearTimeout(timer);
 			/**
 			 * @param {unknown} error
 			 * @returns {unknown}
 			 */
-			const translate = (error) => (error instanceof TypeError && !activeSignal?.aborted ? networkError(error) : error);
+			const translate = (error) => (stall.signal.aborted || (error instanceof TypeError && !callerSignal?.aborted) ? networkError(error) : error);
+			/** @type {Uint8Array[] | undefined} */
+			let body;
+			let bodyBytes = 0;
+			if (request.body) {
+				body = [];
+				for await (const chunk of request.body) {
+					body.push(chunk);
+					bodyBytes += chunk.byteLength;
+				}
+			}
+			arm(stallTimeoutMs + (bodyBytes / MIN_UPLOAD_BYTES_PER_SECOND) * 1000);
 			try {
-				const response = await webRequest({ ...request, url, signal: activeSignal });
-				return response.body ? { ...response, body: translateBody(response.body, translate) } : response;
+				const response = await webRequest({
+					...request,
+					url,
+					...(body ? { body: replay(body) } : {}),
+					signal: callerSignal ? AbortSignal.any([callerSignal, stall.signal]) : stall.signal
+				});
+				return response.body ? { ...response, body: watchBody(response.body, translate, () => arm(stallTimeoutMs), disarm) } : response;
 			} catch (error) {
 				throw translate(error);
+			} finally {
+				disarm();
 			}
 		}
 	};
 }
 
 /**
- * A connection can also drop while the response body is arriving.
- * @param {AsyncIterableIterator<Uint8Array> | Iterable<Uint8Array>} body
- * @param {(error: unknown) => unknown} translate
+ * @param {Uint8Array[]} chunks
  * @yields {Uint8Array}
  */
-async function* translateBody(body, translate) {
+async function* replay(chunks) {
+	yield* chunks;
+}
+
+/**
+ * A connection can also drop or go quiet while the response body is arriving.
+ * The stall clock runs only while waiting for a chunk, never while the reader
+ * is busy with the last one.
+ * @param {AsyncIterableIterator<Uint8Array> | Iterable<Uint8Array>} body
+ * @param {(error: unknown) => unknown} translate
+ * @param {() => void} arm
+ * @param {() => void} disarm
+ * @yields {Uint8Array}
+ */
+async function* watchBody(body, translate, arm, disarm) {
 	try {
-		yield* body;
+		arm();
+		for await (const chunk of body) {
+			disarm();
+			yield chunk;
+			arm();
+		}
 	} catch (error) {
 		throw translate(error);
+	} finally {
+		disarm();
 	}
 }
 

@@ -115,6 +115,11 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   draft saved during the fetch makes the merge refuse, and the next pull reuses
   what was fetched. An ignored local file the remote now tracks refuses the
   pull with `checkout_conflict` before anything moves.
+- **Push** checks under the repo lock, then sends the commit it checked under a
+  separate network lock, so saving and reading never wait for the network. A
+  commit made during the send waits for the next push. Pull's fetch uses the
+  same network lock. A request or response that goes quiet for 60 seconds ends
+  in a `network` error; a request with a body gets extra time to upload it.
 - **A conflict is a result, not an error.** The branch does not move. The index
   holds the merge's result with unmerged entries for the conflicted paths, and
   `status` lists those paths plus any edit made on top. isomorphic-git writes
@@ -125,15 +130,22 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   file or one side's deletion keeps one side's exact bytes. Files that are not
   valid UTF-8 count as binary, because a line merge would damage them.
 - **Finishing a merge.** `resolveConflict` picks ours or theirs for a path,
-  `completeMerge` makes the two-parent commit, refusing while markers remain
-  unless `allowMarkers` is set, and `abortMerge` goes back to our commit and
-  discards any resolution in progress. Never commit a merge any other way: the
-  engine owns the merge's tree.
+  `completeMerge` makes the two-parent commit, refusing with
+  `conflicts_unresolved` while markers remain (unless `allowMarkers` is set) or
+  while a binary file or a one-sided delete is undecided. Picking a side, even
+  the bytes already in place, or editing or removing the file decides it.
+  `abortMerge` goes back to our commit and discards any resolution in progress;
+  an edit `status` lists outside the conflicted paths stays as a draft. Never
+  commit a merge any other way: the engine owns the merge's tree.
 - **Interrupted work.** A pull records itself and flushes before it changes
   anything. If it fails, or the tab dies, the first later operation puts the
   branch, working tree and index back to our commit, and the next pull starts
   over. A clone counts only once `gitnote.defaultBranch` is written, its last
-  step; a later `clone` clears what an interrupted one left.
+  step; a later `clone` clears what an interrupted one left. LightningFS
+  overwrites existing files at once but records new files only at a flush, so
+  objects are flushed before an index or ref names them, and a commit interrupted
+  at any point leaves the repo working. A branch whose commit is missing anyway
+  reports `repo_damaged`.
 - **Size limits** are a table in `limits.js`, checked before any network call:
 
   | Check | GitHub | GitLab.com |
@@ -145,12 +157,17 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   The push size is an estimate: the summed size of the blobs the unpushed
   commits add. It leaves out trees and commits, so a push just under the cap
   can still get a 413 from the relay, which is mapped to the same message.
+  Push sends the whole branch, so `commit` and `checkCommit` warn when a file
+  alone is over the relay cap (GitHub's own file limit is higher, so it can
+  commit) or when the unpushed total would pass it. `undoUnpushedCommits` is the
+  way out: the branch returns to the remote-tracking commit and the working tree
+  stays, so the changes can be committed again in smaller groups.
 - **Writes** go through `writeFile`, which swaps in a new file. isomorphic-git
   judges a file unchanged by size, whole-second mtime and inode, so writing in
   place could hide a same-size edit. The old file is deleted only after the new
   one is flushed, because LightningFS deletes an unlinked file's data at once.
-- **Durability and locks.** Every operation except pull's fetch holds a per-repo
-  Web Lock, and one that changes data flushes LightningFS's superblock before
+- **Durability and locks.** Every operation except pull's fetch and push's send
+  holds a per-repo Web Lock, and one that changes data flushes LightningFS's superblock before
   it resolves, so a commit survives the tab closing right after.
 - **Credentials** never go in the repo. `clone` and `repoIdForUrl` refuse a URL
   with a username or token, which would otherwise be stored in plain text.

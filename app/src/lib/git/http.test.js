@@ -65,6 +65,64 @@ describe('createGitHttp', () => {
 		await expect(read).rejects.toMatchObject({ code: ErrorCode.NETWORK });
 	});
 
+	// A fetch that never answers until its signal aborts.
+	const silentFetch = (/** @type {string} */ _url, /** @type {RequestInit} */ init) =>
+		new Promise((_resolve, reject) => {
+			init.signal?.addEventListener('abort', () => reject(init.signal?.reason));
+		});
+
+	it('ends a request nobody answers in a network error', async () => {
+		vi.stubGlobal('fetch', silentFetch);
+		const http = createGitHttp({ relayOrigin: RELAY, stallTimeoutMs: 20 });
+		await expect(http.request({ url: 'https://github.com/o/r.git/info/refs' })).rejects.toMatchObject({ code: ErrorCode.NETWORK });
+	});
+
+	it('gives a large upload longer to be answered', async () => {
+		vi.stubGlobal('fetch', silentFetch);
+		const http = createGitHttp({ relayOrigin: RELAY, stallTimeoutMs: 20 });
+		const body = [new Uint8Array(8_000)];
+		const settled = vi.fn();
+		const request = http.request({ url: 'https://github.com/o/r.git/git-receive-pack', method: 'POST', body: /** @type {never} */ (body) }).catch(settled);
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		expect(settled).not.toHaveBeenCalled();
+		await request;
+		expect(settled.mock.calls[0][0]).toMatchObject({ code: ErrorCode.NETWORK });
+	}, 5_000);
+
+	it('ends a response body that goes quiet in a network error', async () => {
+		vi.stubGlobal('fetch', async (/** @type {string} */ _url, /** @type {RequestInit} */ init) => {
+			const body = new ReadableStream({
+				start(controller) {
+					controller.enqueue(new Uint8Array([1]));
+					init.signal?.addEventListener('abort', () => controller.error(init.signal?.reason));
+				}
+			});
+			return new Response(body);
+		});
+		const response = await createGitHttp({ relayOrigin: RELAY, stallTimeoutMs: 20 }).request({ url: 'https://github.com/o/r.git/info/refs' });
+		const reader = /** @type {AsyncIterableIterator<Uint8Array>} */ (response.body);
+		expect([...(await reader.next()).value]).toEqual([1]);
+		await expect(reader.next()).rejects.toMatchObject({ code: ErrorCode.NETWORK });
+	});
+
+	it('does not count a slow reader as a stalled connection', async () => {
+		vi.stubGlobal('fetch', async () => new Response(new Uint8Array([1])));
+		const response = await createGitHttp({ relayOrigin: RELAY, stallTimeoutMs: 20 }).request({ url: 'https://github.com/o/r.git/info/refs' });
+		const reader = /** @type {AsyncIterableIterator<Uint8Array>} */ (response.body);
+		await reader.next();
+		await new Promise((resolve) => setTimeout(resolve, 60));
+		expect((await reader.next()).done).toBe(true);
+	});
+
+	it('still reports a cancel as a cancel', async () => {
+		vi.stubGlobal('fetch', silentFetch);
+		const controller = new AbortController();
+		const request = createGitHttp({ relayOrigin: RELAY }).request({ url: 'https://github.com/o/r.git/info/refs', signal: controller.signal });
+		const reason = new DOMException('stopped', 'AbortError');
+		controller.abort(reason);
+		await expect(request).rejects.toBe(reason);
+	});
+
 	it('keeps a bad URL a TypeError, not a network problem', async () => {
 		const http = createGitHttp({ relayOrigin: RELAY });
 		await expect(http.request({ url: 'ssh://github.com/o/r.git' })).rejects.toBeInstanceOf(TypeError);

@@ -11,7 +11,12 @@ import diff3Merge from 'diff3';
 const BINARY_SNIFF_LENGTH = 8000;
 
 const MARKER_SIZE = 7;
-const LINES = /^.*(\r?\n|$)/gm;
+
+/**
+ * One piece per line, ending at `\n` only, so joining the pieces gives the input
+ * back byte for byte: `\r`, U+2028 and U+2029 stay inside their line.
+ */
+const LINES = /[^\n]*\n|[^\n]+$/g;
 
 /** File name of the merge state, inside the git directory. */
 const MERGE_STATE_FILE = 'gitnote-merge.json';
@@ -98,8 +103,9 @@ export function hasConflictMarkers(text) {
 /**
  * The record of a pull that is changing the working tree. It is written and
  * flushed before anything moves, so an interrupted pull can always be undone:
- * - `applying`: the pull is under way. Found by any later operation, it means
- *   the pull died, and the branch and working tree go back to `oursOid`.
+ * - `applying`: the pull, or an abort of its merge, is under way. Found by any
+ *   later operation, it means the tab died, and the branch and working tree go
+ *   back to `oursOid`, apart from `keptDrafts`.
  * - `conflicted`: an open merge, waiting for its merge commit.
  * @typedef {object} MergeState
  * @property {'applying' | 'conflicted'} phase
@@ -109,6 +115,8 @@ export function hasConflictMarkers(text) {
  * @property {string[]} conflictedPaths every path with unmerged index entries
  * @property {string[]} binaryPaths conflicted binary files: pick ours or theirs, never markers
  * @property {Conflict[]} conflicts the same paths, with what each side did
+ * @property {string[]} resolvedPaths conflicts the user picked a side for
+ * @property {string[]} keptDrafts edits an abort leaves in the working tree
  * @property {string} startedAt ISO timestamp
  */
 
@@ -126,7 +134,7 @@ function statePath(gitdir) {
  * @returns {Promise<MergeState | null>} the open merge, or null
  */
 export async function readMergeState(fs, gitdir) {
-	/** @type {string} */
+	/** @type {string | null | undefined} */
 	let text;
 	try {
 		text = await fs.promises.readFile(statePath(gitdir), { encoding: 'utf8' });
@@ -134,6 +142,9 @@ export async function readMergeState(fs, gitdir) {
 		if (/** @type {{ code?: string }} */ (error)?.code === 'ENOENT') return null;
 		throw error;
 	}
+	// LightningFS deletes an unlinked file's data at once but saves its directory
+	// later, so a tab that died while closing the record leaves a name with no data.
+	if (text === undefined || text === null) return null;
 	const state = JSON.parse(text);
 	if (!isMergeState(state)) throw new Error('The stored merge state is damaged.');
 	return state;
@@ -193,6 +204,8 @@ function isMergeState(value) {
 		OID.test(state.theirsOid) &&
 		isStringList(state.conflictedPaths) &&
 		isStringList(state.binaryPaths) &&
+		isStringList(state.resolvedPaths) &&
+		isStringList(state.keptDrafts) &&
 		Array.isArray(state.conflicts) &&
 		state.conflicts.every(isConflict) &&
 		typeof state.startedAt === 'string'

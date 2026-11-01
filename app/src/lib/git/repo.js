@@ -5,10 +5,16 @@
  *
  * Every public operation holds the repository's lock (lock.js), and every
  * operation that changes stored data flushes the file system before it
- * resolves, so a resolved commit survives the tab closing right after. The one
- * exception is pull's fetch, which adds objects and moves only the
- * remote-tracking ref, so it runs outside that lock and a stalled connection
- * cannot hold up saving a draft.
+ * resolves, so a resolved commit survives the tab closing right after. The
+ * exceptions are pull's fetch and push's send: they add objects and move only
+ * the remote-tracking ref, so they run under a separate network lock and a
+ * stalled connection cannot hold up saving a draft.
+ *
+ * LightningFS overwrites an existing file in IndexedDB at once, but records a
+ * new file only when its directory is saved by a flush. Objects are new files,
+ * while the index and branch refs are overwritten, so a tab that dies can keep
+ * a ref or an index that names objects it lost. Objects are therefore always
+ * flushed before anything names them.
  *
  * A pull records itself on disk before it changes anything, and the first
  * operation after an interrupted pull undoes it, so a crash never leaves a
@@ -20,7 +26,7 @@ import git from 'isomorphic-git';
 import { ErrorCode, GitEngineError, toGitEngineError } from './errors.js';
 import { assertNoCredentials, requestPersistentStorage } from './fs.js';
 import { authCallbacks, withSignal } from './http.js';
-import { checkFileSize, checkPushSize } from './limits.js';
+import { checkFileSize, checkPushSize, checkUnpushedSize, limitsFor } from './limits.js';
 import { withRepoLock } from './lock.js';
 import { clearMergeState, createMergeDriver, hasConflictMarkers, isBinary, readMergeState, writeMergeState } from './merge.js';
 
@@ -29,7 +35,7 @@ globalThis.Buffer ??= Buffer;
 
 /**
  * A promise-style file system; the engine also renames files and writes links.
- * @typedef {import('isomorphic-git').PromiseFsClient & { promises: { rename: (from: string, to: string) => Promise<unknown>, symlink: (target: string, path: string) => Promise<unknown> } }} FsClient
+ * @typedef {import('isomorphic-git').PromiseFsClient & { promises: { rename: (from: string, to: string) => Promise<unknown>, symlink: (target: string, path: string) => Promise<unknown>, readlink: (path: string) => Promise<unknown> } }} FsClient
  */
 /** @typedef {import('isomorphic-git').HttpClient} HttpClient */
 /** @typedef {import('isomorphic-git').ProgressCallback} ProgressCallback */
@@ -111,6 +117,9 @@ const WRITE_BACKUP_FILE = 'gitnote-write.bak';
 /** Git's file mode for a symbolic link. */
 const SYMLINK_MODE = 0o120000;
 
+/** These would break the `name <email>` line of a commit's header. */
+const AUTHOR_FORBIDDEN = /[\p{Cc}<>]/u;
+
 /** Path segments that would reach git's own data or leave the working tree. */
 const FORBIDDEN_SEGMENTS = new Set(['', '.', '..', '.git']);
 
@@ -121,6 +130,8 @@ const FORBIDDEN_SEGMENTS = new Set(['', '.', '..', '.git']);
  */
 export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo', storage = { persist: requestPersistentStorage }, locks }) {
 	const gitdir = `${dir}/.git`;
+	/** Serialises this repository's network traffic, apart from its lock. */
+	const networkLock = `${id}#network`;
 	/** isomorphic-git's parsed-object cache, shared by this repo's operations. */
 	const cache = {};
 	const base = { fs, dir, gitdir, cache };
@@ -253,6 +264,19 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
+	 * The commit behind a branch is never expected to be absent, unlike the
+	 * parents past a shallow boundary, and nothing can be done without it.
+	 * @returns {Promise<void>}
+	 */
+	const assertHeadPresent = async () => {
+		if (await readCommitOrNull(await git.resolveRef({ fs, gitdir, ref: 'HEAD' }))) return;
+		throw new GitEngineError(
+			ErrorCode.REPO_DAMAGED,
+			"This repository's local copy is damaged: the commit its branch points at is missing. Remove it from this device and clone it again."
+		);
+	};
+
+	/**
 	 * Commits reachable from `start` without passing through `stops`, newest
 	 * first. Stops at the shallow boundary, where parents are not on disk.
 	 * @param {string} start
@@ -289,6 +313,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	 * @returns {Promise<{ branch: string, headOid: string, remoteOid: string | null, ahead: number, behind: number, remoteCommits: Set<string> }>}
 	 */
 	const aheadBehindUnlocked = async () => {
+		await assertHeadPresent();
 		const branch = await currentBranch();
 		const headOid = await git.resolveRef({ fs, gitdir, ref: 'HEAD' });
 		const remoteOid = await resolveOrNull(`refs/remotes/${REMOTE}/${branch}`);
@@ -350,6 +375,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 
 	/** @returns {Promise<RepoStatus>} */
 	const statusUnlocked = async () => {
+		await assertHeadPresent();
 		const matrix = await git.statusMatrix({ fs, dir, gitdir, cache });
 		const merge = await readMergeState(fs, gitdir);
 		const conflicted = new Set(merge?.conflictedPaths);
@@ -478,15 +504,19 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	 * found them, and closes its record last, so a crash here is simply retried.
 	 * A pull starts on a clean tree, and only paths that differ between ours and
 	 * theirs can have moved, so this restores those from ours. For the same
-	 * reason it discards a conflict's resolution in progress.
+	 * reason it discards a conflict's resolution in progress. A path in
+	 * `keptDrafts` keeps its file and only leaves the merge's index.
 	 * @param {MergeState} state
 	 * @returns {Promise<void>}
 	 */
-	const rollBackPull = async ({ branch, oursOid, theirsOid }) => {
+	const rollBackPull = async ({ branch, oursOid, theirsOid, keptDrafts }) => {
+		const kept = new Set(keptDrafts);
 		await git.writeRef({ fs, gitdir, ref: `refs/heads/${branch}`, value: oursOid, force: true });
 		for (const { path, ours } of await changedBlobs(oursOid, theirsOid)) {
-			if (ours) await writeTreeBlob(path, ours);
-			else await removeFromTree(path);
+			if (!kept.has(path)) {
+				if (ours) await writeTreeBlob(path, ours);
+				else await removeFromTree(path);
+			}
 			await git.resetIndex({ ...base, ref: oursOid, filepath: path });
 		}
 		await flush();
@@ -526,16 +556,19 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
-	 * Writes merged text as a new file, keeping the old file's mode.
+	 * Writes merged text as a new file, keeping the old file's mode unless the
+	 * merge settled on another.
 	 * @param {string} path
 	 * @param {string} text
+	 * @param {number} [mode] the git mode of the merged file
 	 * @returns {Promise<void>}
 	 */
-	const writeMergedText = async (path, text) => {
+	const writeMergedText = async (path, text, mode) => {
 		const target = abs(path);
 		const existing = await lstatOrNull(target);
 		await removeRecursive(target);
-		await fs.promises.writeFile(target, text, { encoding: 'utf8', ...(existing ? { mode: existing.mode } : {}) });
+		const fileMode = mode === undefined ? existing?.mode : mode & 0o111 ? 0o777 : 0o666;
+		await fs.promises.writeFile(target, text, { encoding: 'utf8', ...(fileMode === undefined ? {} : { mode: fileMode }) });
 	};
 
 	/**
@@ -573,8 +606,11 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			} else if (sameBlob(baseBlob, theirs)) {
 				// Only we changed it: the index and working tree already hold it.
 			} else if (!sameBlob(baseBlob, ours)) {
-				// Both sides changed it and the lines merged.
-				if (mergedText !== undefined) await writeMergedText(path, mergedText);
+				// Both sides changed it. Content and mode merge separately, and the
+				// driver only runs when both sides changed the content.
+				const mode = ours && theirs ? (baseBlob?.mode === ours.mode ? theirs.mode : ours.mode) : undefined;
+				if (mergedText !== undefined) await writeMergedText(path, mergedText, mode);
+				else if (ours && theirs && mode !== undefined) await writeTreeBlob(path, { oid: baseBlob?.oid === ours.oid ? theirs.oid : ours.oid, mode });
 				toStage.push(path);
 			} else if (theirs) {
 				await writeTreeBlob(path, theirs);
@@ -605,6 +641,8 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			conflictedPaths: [],
 			binaryPaths: [],
 			conflicts: [],
+			resolvedPaths: [],
+			keptDrafts: [],
 			startedAt: new Date().toISOString()
 		};
 		await writeMergeState(fs, gitdir, applying);
@@ -649,6 +687,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			const conflictedPaths = [...(conflict.data?.filepaths ?? [])].sort();
 
 			const conflicts = await applyConflictedMerge({ oursOid, theirsOid, conflictedPaths, driverBinaryPaths, mergedTexts });
+			// The record is overwritten at once, so it may say `conflicted` only
+			// once the tree it describes is saved; until then a crash rolls back.
+			await flush();
 			/** @type {MergeState} */
 			const merge = {
 				...applying,
@@ -701,6 +742,96 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			if (finding) findings.push(finding);
 		}
 		return findings;
+	};
+
+	/**
+	 * What committing these paths would run into, for warnings in the UI. A file
+	 * that alone exceeds the push limit already says so.
+	 * @param {string[]} paths validated paths
+	 * @returns {Promise<SizeFinding[]>}
+	 */
+	const checkPathsForCommit = async (paths) => {
+		const findings = await checkPaths(paths);
+		const { blockPushBytes } = limitsFor(provider);
+		if (findings.some((finding) => finding.size > blockPushBytes)) return findings;
+		const { headOid, remoteCommits } = await aheadBehindUnlocked();
+		let bytes = await estimatePushBytesFrom(headOid, remoteCommits);
+		for (const path of paths) bytes += (await lstatOrNull(abs(path)))?.size ?? 0;
+		const finding = checkUnpushedSize(provider, bytes);
+		return finding ? [...findings, finding] : findings;
+	};
+
+	/**
+	 * @param {string} path
+	 * @returns {Promise<Uint8Array | null>} what git would store for a working-tree path, or null without a file there
+	 */
+	const readWorkingBlob = async (path) => {
+		const stat = await lstatOrNull(abs(path));
+		if (stat?.isSymbolicLink()) return new TextEncoder().encode(/** @type {string} */ (await fs.promises.readlink(abs(path))));
+		return stat?.isFile() ? /** @type {Uint8Array} */ (await fs.promises.readFile(abs(path))) : null;
+	};
+
+	/**
+	 * Saves these paths' blobs, so the index that is about to name them can
+	 * never outlive them. `git.add` then finds each one already written.
+	 * @param {string[]} paths validated paths
+	 * @returns {Promise<void>}
+	 */
+	const saveBlobs = async (paths) => {
+		for (const path of paths) {
+			const blob = await readWorkingBlob(path);
+			if (blob) await git.writeBlob({ fs, dir, gitdir, blob });
+		}
+		await flush();
+	};
+
+	/**
+	 * Makes a commit from the index and only then moves the branch, because the
+	 * ref is overwritten at once while the commit's objects are new files.
+	 * @param {{ message: string, author: Author, parent?: string[] }} options
+	 * @returns {Promise<string>} the new commit
+	 */
+	const commitAndMoveBranch = async ({ message, author, parent }) => {
+		const branch = await currentBranch();
+		const oid = await git.commit({ ...base, message, author: { name: author.name, email: author.email }, ...(parent ? { parent } : {}), noUpdateBranch: true });
+		await flush();
+		await git.writeRef({ fs, gitdir, ref: `refs/heads/${branch}`, value: oid, force: true });
+		await flush();
+		return oid;
+	};
+
+	/**
+	 * Unstages everything but `selected`. A tab that died between staging and
+	 * committing leaves staged paths behind, which would join an unrelated commit.
+	 * @param {string[]} selected
+	 * @returns {Promise<void>}
+	 */
+	const unstageOthers = async (selected) => {
+		const keep = new Set(selected);
+		for (const [filepath, head, , stage] of await git.statusMatrix({ fs, dir, gitdir, cache })) {
+			const staged = head === 0 ? stage !== 0 : stage !== 1;
+			if (staged && !keep.has(filepath)) await git.resetIndex({ ...base, filepath });
+		}
+	};
+
+	/**
+	 * Conflicts with no markers that nobody has decided: binary files and files
+	 * one side deleted still hold what the merge put there.
+	 * @param {MergeState} merge
+	 * @returns {Promise<string[]>}
+	 */
+	const undecidedConflicts = async (merge) => {
+		const resolved = new Set(merge.resolvedPaths);
+		/** @type {string[]} */
+		const undecided = [];
+		for (const { path, kind, binary } of merge.conflicts) {
+			if (resolved.has(path) || (kind === 'both_modified' && !binary)) continue;
+			const blob = await readWorkingBlob(path);
+			if (!blob) continue;
+			const { oid: initial } = await git.readBlob({ fs, gitdir, oid: kind === 'deleted_by_us' ? merge.theirsOid : merge.oursOid, filepath: path, cache });
+			if ((await git.hashBlob({ object: blob })).oid === initial) undecided.push(path);
+		}
+		return undecided;
 	};
 
 	/**
@@ -779,6 +910,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					// finished still honours it here.
 					signal?.throwIfAborted();
 					const branch = await currentBranch();
+					// The config is overwritten at once, so it may call this a clone only
+					// once everything the clone wrote is saved.
+					await flush();
 					await git.setConfig({ fs, gitdir, path: 'gitnote.defaultBranch', value: branch });
 					const oid = await git.resolveRef({ fs, gitdir, ref: 'HEAD' });
 					await flush();
@@ -955,7 +1089,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		checkCommit: (paths) =>
 			locked(async () => {
 				await assertCloned();
-				return checkPaths(normalizePaths(paths));
+				return checkPathsForCommit(normalizePaths(paths));
 			}),
 
 		/**
@@ -979,16 +1113,17 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				if (toCommit.length === 0) {
 					throw new GitEngineError(ErrorCode.NOTHING_TO_COMMIT, 'None of the selected files has changes to commit.');
 				}
-				const findings = await checkPaths(toCommit);
+				const findings = await checkPathsForCommit(toCommit);
 				assertNotBlocked(findings);
+				await unstageOthers(toCommit);
 
 				try {
+					await saveBlobs(toCommit);
 					for (const filepath of toCommit) {
 						if (await lstatOrNull(abs(filepath))) await git.add({ ...base, filepath });
 						else await git.remove({ ...base, filepath });
 					}
-					const oid = await git.commit({ ...base, message, author: { name: author.name, email: author.email } });
-					await flush();
+					const oid = await commitAndMoveBranch({ message, author });
 					return { oid, paths: toCommit, warnings: findings };
 				} catch (error) {
 					// Leave the index as it was, so a failed commit stages nothing.
@@ -1024,7 +1159,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				}, signal);
 
 				await withLock(
-					`${id}#fetch`,
+					networkLock,
 					async () => {
 						signal?.throwIfAborted();
 						// No `depth` here: a depth-limited fetch marks the new remote tip
@@ -1084,6 +1219,10 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					await removeFromTree(filepath);
 				}
 				await flush();
+				if (!merge.resolvedPaths.includes(filepath)) {
+					await writeMergeState(fs, gitdir, { ...merge, resolvedPaths: [...merge.resolvedPaths, filepath] });
+					await flush();
+				}
 			}),
 
 		/**
@@ -1091,7 +1230,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		 * the working-tree version of each conflicted path (a missing file means
 		 * it stays deleted). Other edits stay uncommitted. Refuses while a
 		 * conflicted file still has markers, unless `allowMarkers` says they are
-		 * the file's real content.
+		 * the file's real content, and while a binary file or a file one side
+		 * deleted is undecided: neither `resolveConflict` nor an edit has settled
+		 * it, and committing would silently drop the other side.
 		 * @param {{ author: Author, message?: string, allowMarkers?: boolean }} options
 		 * @returns {Promise<{ oid: string, parents: [string, string], warnings: SizeFinding[] }>}
 		 */
@@ -1102,34 +1243,36 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				await assertCloned();
 				const merge = await requireOpenMerge();
 
+				/** @type {string[]} */
+				const withMarkers = [];
 				if (!allowMarkers) {
-					/** @type {string[]} */
-					const unresolved = [];
 					for (const { path, binary } of merge.conflicts) {
 						if (binary || !(await lstatOrNull(abs(path)))) continue;
 						const text = /** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' }));
-						if (hasConflictMarkers(text)) unresolved.push(path);
-					}
-					if (unresolved.length > 0) {
-						throw new GitEngineError(ErrorCode.CONFLICTS_UNRESOLVED, `Conflict markers are still in ${unresolved.join(', ')}.`, {
-							detail: { paths: unresolved }
-						});
+						if (hasConflictMarkers(text)) withMarkers.push(path);
 					}
 				}
-				const findings = await checkPaths(merge.conflictedPaths);
+				const undecided = await undecidedConflicts(merge);
+				if (withMarkers.length > 0 || undecided.length > 0) {
+					const sentences = [
+						...(withMarkers.length > 0 ? [`Conflict markers are still in ${withMarkers.join(', ')}.`] : []),
+						...(undecided.length > 0 ? [`Choose which side to keep for ${undecided.join(', ')}.`] : [])
+					];
+					throw new GitEngineError(ErrorCode.CONFLICTS_UNRESOLVED, sentences.join(' '), { detail: { paths: [...withMarkers, ...undecided].sort() } });
+				}
+				const findings = await checkPathsForCommit(merge.conflictedPaths);
 				assertNotBlocked(findings);
 
+				await saveBlobs(merge.conflictedPaths);
 				for (const filepath of merge.conflictedPaths) {
 					if (await lstatOrNull(abs(filepath))) await git.add({ ...base, filepath, force: true });
 					else await git.remove({ ...base, filepath });
 				}
-				const oid = await git.commit({
-					...base,
+				const oid = await commitAndMoveBranch({
 					message: message ?? `Merge remote-tracking branch '${REMOTE}/${merge.branch}'`,
-					author: { name: author.name, email: author.email },
+					author,
 					parent: [merge.oursOid, merge.theirsOid]
 				});
-				await flush();
 				await clearMergeState(fs, gitdir);
 				await flush();
 				return { oid, parents: [merge.oursOid, merge.theirsOid], warnings: findings };
@@ -1138,14 +1281,22 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		/**
 		 * Abandons the open merge: the paths the merge touched go back to our
 		 * commit, including any resolution in progress. The fetched commits stay,
-		 * so the next pull starts the same merge again. Edits to other files stay.
+		 * so the next pull starts the same merge again. An edit `status` lists
+		 * outside the conflicted paths stays in the working tree as a draft against
+		 * our commit, whichever file it is on, and the record carries the list, so
+		 * a tab that dies during the abort keeps them too.
 		 * @returns {Promise<{ oid: string }>} the branch's commit
 		 */
 		abortMerge: () =>
 			locked(async () => {
 				await assertCloned();
 				const merge = await requireOpenMerge();
-				await rollBackPull(merge);
+				const conflicted = new Set(merge.conflictedPaths);
+				const keptDrafts = (await statusUnlocked()).files.map((file) => file.path).filter((path) => !conflicted.has(path));
+				const aborting = { ...merge, phase: /** @type {const} */ ('applying'), keptDrafts };
+				await writeMergeState(fs, gitdir, aborting);
+				await flush();
+				await rollBackPull(aborting);
 				return { oid: merge.oursOid };
 			}),
 
@@ -1169,48 +1320,85 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			}),
 
 		/**
-		 * Pushes the current branch. Refuses before any network call when a
-		 * merge is open, when the remote has commits we lack, or when the
-		 * estimated pack is over the limit.
+		 * Takes back the commits the remote does not have: the branch and index
+		 * return to the remote-tracking commit and the working tree stays, so
+		 * their changes become drafts to commit again in smaller groups. This is
+		 * the way out of a push over the size limit. It refuses while the remote
+		 * has commits we lack, because those would then look like local deletions.
+		 * @returns {Promise<{ oid: string, undone: number }>} the branch's commit and how many went
+		 */
+		undoUnpushedCommits: () =>
+			locked(async () => {
+				await assertCloned();
+				await assertNoMerge();
+				const { branch, headOid, remoteOid, ahead, behind } = await aheadBehindUnlocked();
+				if (remoteOid === null || ahead === 0) return { oid: headOid, undone: 0 };
+				if (behind > 0) {
+					throw new GitEngineError(ErrorCode.NON_FAST_FORWARD, 'The remote branch has commits you do not have. Pull first, then undo.');
+				}
+				const changes = await changedBlobs(headOid, remoteOid);
+				await git.writeRef({ fs, gitdir, ref: `refs/heads/${branch}`, value: remoteOid, force: true });
+				for (const { path } of changes) await git.resetIndex({ ...base, ref: remoteOid, filepath: path });
+				await flush();
+				return { oid: remoteOid, undone: ahead };
+			}),
+
+		/**
+		 * Pushes the commit the branch is on when this runs. Refuses before any
+		 * network call when a merge is open, when the remote has commits we lack,
+		 * or when the estimated pack is over the limit. The send holds only the
+		 * network lock, so saves go on during a stalled push; a commit made
+		 * meanwhile waits for the next push.
 		 * @param {{ onProgress?: ProgressCallback, signal?: AbortSignal }} [options]
 		 * @returns {Promise<{ pushed: boolean, oid: string, bytes: number }>}
 		 */
 		push: ({ onProgress, signal } = {}) =>
-			locked(async () => {
-				await assertCloned();
-				await assertNoMerge();
-				const { branch, headOid, remoteOid, ahead, behind, remoteCommits } = await aheadBehindUnlocked();
-				if (remoteOid !== null && ahead === 0) return { pushed: false, oid: headOid, bytes: 0 };
-				if (behind > 0) {
-					throw new GitEngineError(ErrorCode.NON_FAST_FORWARD, 'The remote branch has commits you do not have. Pull first, then push.');
-				}
-				const bytes = await estimatePushBytesFrom(headOid, remoteCommits);
-				const tooLarge = checkPushSize(provider, bytes);
-				if (tooLarge) throw new GitEngineError(ErrorCode.PUSH_TOO_LARGE, tooLarge.message, { detail: { finding: tooLarge } });
+			withLock(
+				networkLock,
+				async () => {
+					const { branch, headOid, send, bytes } = await locked(async () => {
+						await assertCloned();
+						await assertNoMerge();
+						const state = await aheadBehindUnlocked();
+						if (state.remoteOid !== null && state.ahead === 0) return { branch: state.branch, headOid: state.headOid, send: false, bytes: 0 };
+						if (state.behind > 0) {
+							throw new GitEngineError(ErrorCode.NON_FAST_FORWARD, 'The remote branch has commits you do not have. Pull first, then push.');
+						}
+						const estimate = await estimatePushBytesFrom(state.headOid, state.remoteCommits);
+						const tooLarge = checkPushSize(provider, estimate);
+						if (tooLarge) throw new GitEngineError(ErrorCode.PUSH_TOO_LARGE, tooLarge.message, { detail: { finding: tooLarge } });
+						return { branch: state.branch, headOid: state.headOid, send: true, bytes: estimate };
+					}, signal);
+					if (!send) return { pushed: false, oid: headOid, bytes: 0 };
 
-				/** @type {string[]} */
-				const remoteMessages = [];
-				try {
-					await git.push({
-						...base,
-						http: withSignal(http, signal),
-						remote: REMOTE,
-						ref: branch,
-						onProgress,
-						onMessage: (message) => {
-							remoteMessages.push(message.trim());
-						},
-						signal,
-						...authCallbacks(getCredential)
-					});
-				} catch (error) {
-					// isomorphic-git hands remote messages over without awaiting them.
-					await new Promise((resolve) => setTimeout(resolve, 0));
-					throw toGitEngineError(error, { remoteMessages });
-				}
-				await flush();
-				return { pushed: true, oid: headOid, bytes };
-			}, signal)
+					/** @type {string[]} */
+					const remoteMessages = [];
+					try {
+						await git.push({
+							...base,
+							http: withSignal(http, signal),
+							remote: REMOTE,
+							// The commit that was checked, even if the branch has moved since.
+							ref: headOid,
+							remoteRef: `refs/heads/${branch}`,
+							onProgress,
+							onMessage: (message) => {
+								remoteMessages.push(message.trim());
+							},
+							signal,
+							...authCallbacks(getCredential)
+						});
+					} catch (error) {
+						// isomorphic-git hands remote messages over without awaiting them.
+						await new Promise((resolve) => setTimeout(resolve, 0));
+						if (signal?.aborted && !(error instanceof GitEngineError)) throw error;
+						throw toGitEngineError(error, { remoteMessages });
+					}
+					await locked(flush, signal);
+					return { pushed: true, oid: headOid, bytes };
+				},
+				signal
+			)
 	};
 }
 
@@ -1297,6 +1485,9 @@ function assertAuthor(author) {
 	const value = /** @type {Partial<Author> | null | undefined} */ (author);
 	if (typeof value?.name !== 'string' || value.name.trim() === '' || typeof value.email !== 'string' || value.email.trim() === '') {
 		throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'Set an author name and email for commits.');
+	}
+	if (AUTHOR_FORBIDDEN.test(value.name) || AUTHOR_FORBIDDEN.test(value.email)) {
+		throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'An author name or email cannot contain line breaks, control characters, or angle brackets.');
 	}
 }
 

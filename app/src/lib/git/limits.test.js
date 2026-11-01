@@ -3,6 +3,7 @@ import {
 	checkFileSize,
 	checkPushSize,
 	checkRepoSize,
+	checkUnpushedSize,
 	formatBytes,
 	limitsFor,
 	providerForUrl,
@@ -28,6 +29,13 @@ describe('file limits', () => {
 		expect(blocked?.message).toContain("GitHub's per-file limit");
 	});
 
+	it('says a GitHub file over the relay cap commits but cannot be pushed', () => {
+		const finding = checkFileSize('github', 'a.bin', 96 * MB);
+		expect(finding).toMatchObject({ level: 'warn', limit: RELAY_MAX_BODY_BYTES });
+		expect(finding?.message).toContain('cannot be pushed through the relay');
+		expect(checkFileSize('github', 'a.bin', RELAY_MAX_BODY_BYTES)?.message).not.toContain('cannot be pushed');
+	});
+
 	it('blocks a 120 MB file on GitHub', () => {
 		expect(checkFileSize('github', 'a.bin', 120 * MB)?.level).toBe('block');
 	});
@@ -45,6 +53,15 @@ describe('push limits', () => {
 		const finding = checkPushSize(provider, 120 * MB);
 		expect(finding).toMatchObject({ level: 'block', limit: RELAY_MAX_BODY_BYTES });
 		expect(finding?.message).toContain('smaller commits');
+	});
+
+	it('points at an operation the engine has', () => {
+		expect(checkPushSize('github', 120 * MB)?.message).toContain('Undo the unpushed commits');
+	});
+
+	it('warns when unpushed commits would pass the cap together', () => {
+		expect(checkUnpushedSize('github', RELAY_MAX_BODY_BYTES)).toBeNull();
+		expect(checkUnpushedSize('gitlab', RELAY_MAX_BODY_BYTES + 1)).toMatchObject({ level: 'warn', limit: RELAY_MAX_BODY_BYTES });
 	});
 
 	it('passes a push at the cap', () => {

@@ -12,6 +12,7 @@ export const ErrorCode = Object.freeze({
 	ALREADY_CLONED: 'already_cloned',
 	EMPTY_REPO: 'empty_repo',
 	NOT_CLONED: 'not_cloned',
+	REPO_DAMAGED: 'repo_damaged',
 	CANCELLED: 'cancelled',
 	INVALID_PATH: 'invalid_path',
 	PATH_NOT_FOUND: 'path_not_found',
@@ -132,7 +133,7 @@ function fromHttpStatus(status, response, cause) {
 	if (status === 413) {
 		return make(
 			ErrorCode.PUSH_TOO_LARGE,
-			`The push is over the relay's per-push limit of ${formatBytes(RELAY_MAX_BODY_BYTES)}. Push smaller commits one at a time.`
+			`The push is over the relay's per-push limit of ${formatBytes(RELAY_MAX_BODY_BYTES)}. Undo the unpushed commits, then make smaller commits and push after each one.`
 		);
 	}
 	if (status === 403 && relay?.error?.startsWith('git_')) {

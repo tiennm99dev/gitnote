@@ -9,7 +9,8 @@ const MiB = 1024 * 1024;
 /**
  * Largest request body the relay forwards (`MAX_BODY_BYTES` in the relay's
  * git proxy). Every push goes through the relay, so this caps a push pack on
- * every provider, and a single file can never be larger than it either.
+ * every provider. A file above it can still be committed where the host's own
+ * file limit is higher, but it cannot be pushed, and the commit warning says so.
  */
 export const RELAY_MAX_BODY_BYTES = 95 * MB;
 
@@ -121,6 +122,15 @@ export function checkFileSize(provider, path, size) {
 			message: `${path} is ${formatBytes(size)}, over ${limits.blockFileReason} of ${formatBytes(limits.blockFileBytes)}. It cannot be committed.`
 		};
 	}
+	if (size > limits.blockPushBytes) {
+		return {
+			level: 'warn',
+			path,
+			size,
+			limit: limits.blockPushBytes,
+			message: `${path} is ${formatBytes(size)}, over the relay's per-push limit of ${formatBytes(limits.blockPushBytes)}. It can be committed, but a commit holding it cannot be pushed through the relay.`
+		};
+	}
 	if (size > limits.warnFileBytes) {
 		return {
 			level: 'warn',
@@ -145,7 +155,24 @@ export function checkPushSize(provider, bytes) {
 		level: 'block',
 		size: bytes,
 		limit: limits.blockPushBytes,
-		message: `This push is about ${formatBytes(bytes)}, over the relay's per-push limit of ${formatBytes(limits.blockPushBytes)}. Push smaller commits one at a time, or remove large files from the unpushed commits.`
+		message: `This push is about ${formatBytes(bytes)}, over the relay's per-push limit of ${formatBytes(limits.blockPushBytes)}. Undo the unpushed commits, then make smaller commits and push after each one.`
+	};
+}
+
+/**
+ * Push sends the whole branch, so what is already unpushed counts as well.
+ * @param {string} provider
+ * @param {number} bytes the unpushed commits' size plus the commit being made
+ * @returns {SizeFinding | null} a warning that these commits cannot be pushed together
+ */
+export function checkUnpushedSize(provider, bytes) {
+	const limits = limitsFor(provider);
+	if (bytes <= limits.blockPushBytes) return null;
+	return {
+		level: 'warn',
+		size: bytes,
+		limit: limits.blockPushBytes,
+		message: `With this commit, your unpushed commits come to about ${formatBytes(bytes)}, over the relay's per-push limit of ${formatBytes(limits.blockPushBytes)}. Push what you have first; otherwise you will need to undo the unpushed commits to push anything.`
 	};
 }
 
