@@ -28,6 +28,7 @@
   },
   "allowScripts": {
     "esbuild": true,
+    "fsevents": false,
     "workerd": true
   }
 }

@@ -57,6 +57,8 @@ system Chromium instead, set `CHROMIUM_PATH`, for example
 - **Release-age delay.** `.npmrc` sets `min-release-age=3`. If an install
   fails with `ETARGET`, the newest release is younger than three days; use the
   previous version in the range.
-- **Install scripts.** Only the packages listed under `allowScripts` in
-  `package.json` (`esbuild`, `workerd`) may run install scripts. Review a new
-  one with `npm install-scripts ls` before approving it.
+- **Install scripts.** `allowScripts` in `package.json` lists every package
+  in the lockfile that has an install script. `esbuild` and `workerd` may run
+  theirs; `fsevents` (macOS only) is denied because it ships prebuilt
+  binaries. Review a new one with `npm install-scripts ls` before approving
+  it.
