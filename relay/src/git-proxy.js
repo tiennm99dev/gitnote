@@ -26,6 +26,13 @@ const FORWARD_RESPONSE_HEADERS = ['content-type', 'cache-control', 'expires', 'p
  */
 const DEFAULT_USER_AGENT = 'git/gitnote-relay';
 
+/**
+ * Request body encodings forwarded with the body. Native git gzips larger
+ * upload-pack negotiations; the host must see that label to decode them. Any
+ * other encoding is refused, so the host never gets bytes it cannot read.
+ */
+const FORWARD_CONTENT_ENCODINGS = new Set(['gzip', 'identity']);
+
 const SERVICES = new Set(['git-upload-pack', 'git-receive-pack']);
 const HOST_ENTRY = /^[a-z0-9.-]+(:\d{1,5})?$/;
 const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
@@ -116,13 +123,21 @@ export async function gitProxy(c) {
 		return jsonError(403, 'git_method_not_allowed', `This git endpoint only accepts ${target.method}.`);
 	}
 
+	const headers = forwardHeaders(request.headers);
 	/** @type {RequestInit} */
-	const init = { method: target.method, headers: forwardHeaders(request.headers), redirect: 'manual' };
+	const init = { method: target.method, headers, redirect: 'manual' };
 
 	if (target.method === 'POST') {
 		const contentType = request.headers.get('Content-Type')?.trim().toLowerCase();
 		if (contentType !== target.contentType) {
 			return jsonError(403, 'git_content_type_not_allowed', `This git endpoint needs Content-Type ${target.contentType}.`);
+		}
+		const encoding = request.headers.get('Content-Encoding')?.trim().toLowerCase();
+		if (encoding !== undefined) {
+			if (!FORWARD_CONTENT_ENCODINGS.has(encoding)) {
+				return jsonError(415, 'unsupported_content_encoding', 'Git request bodies must be uncompressed or gzip.');
+			}
+			headers.set('content-encoding', encoding);
 		}
 		const length = parseContentLength(request.headers.get('Content-Length'));
 		if (length === undefined) {
@@ -162,12 +177,12 @@ export async function gitProxy(c) {
 		);
 	}
 
-	const headers = new Headers();
+	const responseHeaders = new Headers();
 	for (const name of FORWARD_RESPONSE_HEADERS) {
 		const value = upstream.headers.get(name);
-		if (value !== null) headers.set(name, value);
+		if (value !== null) responseHeaders.set(name, value);
 	}
-	return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers });
+	return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders });
 }
 
 /**

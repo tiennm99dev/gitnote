@@ -1,3 +1,4 @@
+/* global IdentityTransformStream -- a Workers runtime global missing from the eslint `worker` globals */
 import { describe, expect, it } from 'vitest';
 import { MAX_BODY_BYTES, parseGitHosts, resolveGitTarget } from '../src/git-proxy.js';
 import { relay, spyConsole, stubUpstream } from './helpers.js';
@@ -133,19 +134,23 @@ describe('request body limits', () => {
 
 	it('answers 411 for a POST without Content-Length', async () => {
 		const calls = stubUpstream(() => gitResponse());
-		const stream = new ReadableStream({
-			start(controller) {
-				controller.enqueue(new TextEncoder().encode('0000'));
-				controller.close();
-			}
-		});
+		// A native stream of unknown length: the request carries no Content-Length.
+		// The test owns the writer, so the unread body ends here instead of as a
+		// runtime pipe error in a later test.
+		const { readable, writable } = new IdentityTransformStream();
+		const writer = writable.getWriter();
+		const written = writer
+			.write(new TextEncoder().encode('0000'))
+			.then(() => writer.close())
+			.catch(() => {});
 		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
 			method: 'POST',
-			body: stream,
+			body: readable,
 			headers: { 'Content-Type': UPLOAD_PACK }
 		});
 		expect(response.status).toBe(411);
 		expect(calls).toHaveLength(0);
+		await written;
 	});
 
 	it('streams an allowed POST body upstream with its length', async () => {
@@ -169,6 +174,65 @@ describe('request body limits', () => {
 		expect(calls[0].init.method).toBe('POST');
 		expect(calls[0].init.body).toBeInstanceOf(ReadableStream);
 		expect(received).toEqual(payload);
+	});
+});
+
+describe('request body encoding', () => {
+	it('forwards a gzip body unchanged with its Content-Encoding', async () => {
+		const plain = new TextEncoder().encode('0032want 0123456789012345678901234567890123456789\n'.repeat(200));
+		const gzip = new Uint8Array(await new Response(new Blob([plain]).stream().pipeThrough(new CompressionStream('gzip'))).arrayBuffer());
+		/** @type {Uint8Array | undefined} */
+		let received;
+		const calls = stubUpstream(async ({ init }) => {
+			received = new Uint8Array(await new Response(init.body).arrayBuffer());
+			return new Response('0008NAK\n', { headers: { 'Content-Type': 'application/x-git-upload-pack-result' } });
+		});
+		const response = await relay('/api/git/gitlab.com/group/notes.git/git-upload-pack', {
+			method: 'POST',
+			body: gzip,
+			headers: { 'Content-Type': UPLOAD_PACK, 'Content-Encoding': 'gzip' }
+		});
+		expect(response.status).toBe(200);
+		await response.arrayBuffer();
+		expect(calls).toHaveLength(1);
+		expect(calls[0].headers.get('content-encoding')).toBe('gzip');
+		expect(received).toEqual(gzip);
+	});
+
+	it('forwards an identity Content-Encoding', async () => {
+		const calls = stubUpstream(() => new Response('0008NAK\n'));
+		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
+			method: 'POST',
+			body: '0000',
+			headers: { 'Content-Type': UPLOAD_PACK, 'Content-Encoding': 'Identity' }
+		});
+		expect(response.status).toBe(200);
+		await response.arrayBuffer();
+		expect(calls[0].headers.get('content-encoding')).toBe('identity');
+	});
+
+	it('sends no Content-Encoding upstream when the client sent none', async () => {
+		const calls = stubUpstream(() => new Response('0008NAK\n'));
+		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
+			method: 'POST',
+			body: '0000',
+			headers: { 'Content-Type': UPLOAD_PACK }
+		});
+		expect(response.status).toBe(200);
+		await response.arrayBuffer();
+		expect(calls[0].headers.has('content-encoding')).toBe(false);
+	});
+
+	it.each(['br', 'deflate', 'zstd', 'gzip, br'])('answers 415 for Content-Encoding %s before any upstream call', async (encoding) => {
+		const calls = stubUpstream(() => gitResponse());
+		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
+			method: 'POST',
+			body: '0000',
+			headers: { 'Content-Type': UPLOAD_PACK, 'Content-Encoding': encoding }
+		});
+		expect(response.status).toBe(415);
+		expect(await response.json()).toMatchObject({ error: 'unsupported_content_encoding' });
+		expect(calls).toHaveLength(0);
 	});
 });
 
