@@ -1,6 +1,7 @@
+/* global IdentityTransformStream -- a Workers runtime global missing from the eslint `worker` globals */
 import { describe, expect, it } from 'vitest';
 import app from '../src/index.js';
-import { GITHUB_TOKEN_URL } from '../src/oauth-github.js';
+import { GITHUB_TOKEN_URL, readCapped } from '../src/oauth-github.js';
 import { relay, spyConsole, stubUpstream } from './helpers.js';
 
 const VERIFIER = 'a'.repeat(43);
@@ -96,6 +97,39 @@ describe('POST /api/oauth/github/token', () => {
 		expect(calls).toHaveLength(0);
 	});
 
+	it('answers 411 for a streamed body without Content-Length, before reading it', async () => {
+		const calls = stubUpstream(() => Response.json(TOKEN_JSON));
+		// A native stream of unknown length, larger than the cap: the request
+		// carries no Content-Length and must be refused without buffering it.
+		const { readable, writable } = new IdentityTransformStream();
+		const writer = writable.getWriter();
+		const written = writer
+			.write(new TextEncoder().encode(`{"code":"abc","padding":"${'x'.repeat(20_000)}"}`))
+			.then(() => writer.close())
+			.catch(() => {});
+		const response = await relay('/api/oauth/github/token', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: readable
+		});
+		expect(response.status).toBe(411);
+		expect(await response.json()).toMatchObject({ error: 'length_required' });
+		expect(calls).toHaveLength(0);
+		await written;
+	});
+
+	it('answers 400 for a body that is not UTF-8', async () => {
+		const calls = stubUpstream(() => Response.json(TOKEN_JSON));
+		const response = await relay('/api/oauth/github/token', {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json' },
+			body: new Uint8Array([0x7b, 0xff, 0x7d])
+		});
+		expect(response.status).toBe(400);
+		expect(await response.json()).toMatchObject({ error: 'invalid_json' });
+		expect(calls).toHaveLength(0);
+	});
+
 	it("relays GitHub's error code as a 400", async () => {
 		stubUpstream(() =>
 			Response.json({ error: 'bad_verification_code', error_description: 'The code passed is incorrect or expired.' })
@@ -125,7 +159,8 @@ describe('POST /api/oauth/github/token', () => {
 		const limiter = { limit: async () => ({ success: true }) };
 		const response = await app.request(
 			'https://gitnote.test/api/oauth/github/token',
-			{ method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: 'abc' }) },
+			// In-process requests carry no Content-Length unless set, unlike real HTTP ones.
+			{ method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Length': '14' }, body: '{"code":"abc"}' },
 			{ API_LIMITER: limiter, OAUTH_LIMITER: limiter, CORS_ORIGINS: '', GIT_HOSTS: '' }
 		);
 		expect(response.status).toBe(503);
@@ -160,5 +195,57 @@ describe('POST /api/oauth/github/refresh', () => {
 	it('only accepts POST', async () => {
 		const response = await relay('/api/oauth/github/refresh');
 		expect(response.status).toBe(404);
+	});
+});
+
+describe('capped body reads', () => {
+	/**
+	 * An endless body of 1 KB chunks that counts how many were pulled and
+	 * whether the reader cancelled it.
+	 * @returns {{ stream: ReadableStream<Uint8Array>, state: { pulls: number, cancelled: boolean } }}
+	 */
+	function endlessBody() {
+		const state = { pulls: 0, cancelled: false };
+		const stream = new ReadableStream(
+			{
+				pull(controller) {
+					state.pulls += 1;
+					controller.enqueue(new Uint8Array(1024));
+				},
+				cancel() {
+					state.cancelled = true;
+				}
+			},
+			{ highWaterMark: 0 }
+		);
+		return { stream, state };
+	}
+
+	it('stops and cancels the stream at the first chunk past the limit', async () => {
+		const { stream, state } = endlessBody();
+		expect(await readCapped(stream, 8192)).toBe('too_large');
+		expect(state.cancelled).toBe(true);
+		expect(state.pulls).toBe(9);
+	});
+
+	it('returns every byte of a body within the limit', async () => {
+		const parts = [new Uint8Array([1, 2]), new Uint8Array([3]), new Uint8Array([4, 5, 6])];
+		const stream = new ReadableStream({
+			start(controller) {
+				for (const part of parts) controller.enqueue(part);
+				controller.close();
+			}
+		});
+		expect(await readCapped(stream, 6)).toEqual(new Uint8Array([1, 2, 3, 4, 5, 6]));
+	});
+
+	it('treats a missing body as empty and a failing one as unreadable', async () => {
+		expect(await readCapped(null, 10)).toEqual(new Uint8Array(0));
+		const failing = new ReadableStream({
+			pull(controller) {
+				controller.error(new Error('connection reset'));
+			}
+		});
+		expect(await readCapped(failing, 10)).toBe('unreadable');
 	});
 });

@@ -119,19 +119,25 @@ async function readJson(c) {
 	if (!/^application\/json\s*(;|$)/i.test(contentType)) {
 		return jsonError(415, 'unsupported_media_type', 'Send the request body as application/json.');
 	}
-	const declared = Number(c.req.header('Content-Length') ?? 0);
-	if (declared > MAX_JSON_BYTES) {
-		return jsonError(413, 'payload_too_large', `OAuth request bodies are limited to ${MAX_JSON_BYTES} bytes.`);
+	// A declared length lets an oversized body be refused unread; the capped
+	// read below still bounds a body that runs past what it declared.
+	const declared = c.req.header('Content-Length')?.trim();
+	if (declared === undefined) {
+		return jsonError(411, 'length_required', 'OAuth requests need a Content-Length header.');
 	}
+	if (!/^\d{1,15}$/.test(declared)) {
+		return jsonError(400, 'bad_content_length', 'The Content-Length header is not a valid byte count.');
+	}
+	if (Number(declared) > MAX_JSON_BYTES) return tooLarge();
+	const body = await readCapped(c.req.raw.body, MAX_JSON_BYTES);
+	if (body === 'too_large') return tooLarge();
+	if (body === 'unreadable') return jsonError(400, 'invalid_json', 'The request body could not be read.');
 	/** @type {string} */
 	let text;
 	try {
-		text = await c.req.text();
+		text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: false }).decode(body);
 	} catch {
-		return jsonError(400, 'invalid_json', 'The request body could not be read.');
-	}
-	if (new TextEncoder().encode(text).byteLength > MAX_JSON_BYTES) {
-		return jsonError(413, 'payload_too_large', `OAuth request bodies are limited to ${MAX_JSON_BYTES} bytes.`);
+		return jsonError(400, 'invalid_json', 'The request body is not valid UTF-8.');
 	}
 	/** @type {unknown} */
 	let parsed;
@@ -142,6 +148,50 @@ async function readJson(c) {
 	}
 	if (!isObject(parsed)) return jsonError(400, 'invalid_json', 'The request body must be a JSON object.');
 	return parsed;
+}
+
+/**
+ * Reads a request body into memory, stopping and cancelling the stream as
+ * soon as it passes `limit` bytes, so an oversized body is never buffered in
+ * full whatever length it declared.
+ * @param {ReadableStream<Uint8Array> | null} stream
+ * @param {number} limit
+ * @returns {Promise<Uint8Array | 'too_large' | 'unreadable'>}
+ */
+export async function readCapped(stream, limit) {
+	if (stream === null) return new Uint8Array(0);
+	const reader = stream.getReader();
+	/** @type {Uint8Array[]} */
+	const chunks = [];
+	let total = 0;
+	try {
+		for (;;) {
+			const { done, value } = await reader.read();
+			if (done) break;
+			total += value.byteLength;
+			if (total > limit) {
+				await reader.cancel().catch(() => {});
+				return 'too_large';
+			}
+			chunks.push(value);
+		}
+	} catch {
+		return 'unreadable';
+	}
+	const bytes = new Uint8Array(total);
+	let offset = 0;
+	for (const chunk of chunks) {
+		bytes.set(chunk, offset);
+		offset += chunk.byteLength;
+	}
+	return bytes;
+}
+
+/**
+ * @returns {Response}
+ */
+function tooLarge() {
+	return jsonError(413, 'payload_too_large', `OAuth request bodies are limited to ${MAX_JSON_BYTES} bytes.`);
 }
 
 /**
