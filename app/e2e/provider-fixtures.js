@@ -1,3 +1,4 @@
+import { FIXTURE_CREDENTIAL } from '../test/git-http-server.js';
 import { E2E_GIT_PORT, E2E_RELAY_PORT } from './git-engine-ports.js';
 
 /**
@@ -54,6 +55,8 @@ export async function serveGit(page, provider, token) {
 		const headers = { ...request.headers() };
 		// The test runner is the relay's client here, not the page's origin.
 		for (const name of ['origin', 'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest']) delete headers[name];
+		// The app's token was checked above; the local server knows only its own credential.
+		headers.authorization = `Basic ${Buffer.from(`${FIXTURE_CREDENTIAL.username}:${FIXTURE_CREDENTIAL.password}`).toString('base64')}`;
 		const response = await route.fetch({ url: `http://127.0.0.1:${E2E_RELAY_PORT}${path}${url.search}`, headers });
 		await route.fulfill({ response });
 	});

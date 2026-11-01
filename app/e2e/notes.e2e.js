@@ -591,9 +591,12 @@ test('pasted text takes the line endings of the note', async ({ page }) => {
 test('a save in one tab leaves the other tab able to keep its text', async ({ page, context }) => {
 	const { id } = await cloneRepo(page);
 	await page.goto(noteUrl(id, 'README.md'));
+	// Tabs take turns on the stored files, so the pull on opening finishes first.
+	await expect(page.getByTestId('last-sync')).toContainText('Last sync');
 	const other = await context.newPage();
 	await other.goto(noteUrl(id, 'README.md'));
 	await expect(other.getByTestId('note-preview').getByRole('heading', { name: 'Top' })).toBeVisible();
+	await expect(other.getByTestId('last-sync')).toContainText('Last sync');
 
 	await typeNote(other, 'words from the other tab');
 	await expect(other.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
