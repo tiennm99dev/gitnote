@@ -11,6 +11,12 @@
  * A draft remembers the file it started from. If the file then changes
  * underneath it (a pull, another tab), the store says so and lets the user pick,
  * rather than overwriting either side.
+ *
+ * Tabs share one draft per path, and each keeps its own buffer. A tab removes a
+ * draft only while it still holds the text that tab stored, and a tab coming back
+ * into view stores its buffer again if the draft no longer matches. So the last
+ * tab to write or come back holds the draft; closing a tab with a dirty buffer
+ * that had lost the draft, without returning to it, loses that buffer.
  */
 
 import { writable } from 'svelte/store';
@@ -95,13 +101,20 @@ export const movedPath = (path, from, to) => `${to}${path.slice(from.length)}`;
  */
 const isNotFound = (error) => error instanceof GitEngineError && error.code === ErrorCode.PATH_NOT_FOUND;
 
+/**
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean} one path is the other, or lies inside it
+ */
+const overlaps = (a, b) => isWithin(a, b) || isWithin(b, a);
+
 // The store's methods are inferred; `Notes` below names them.
 // eslint-disable-next-line jsdoc/require-returns
 /**
  * @param {object} options
  * @param {string} options.repoId
  * @param {import('../git/limits.js').ProviderId} options.provider
- * @param {Pick<import('../git/repo.js').Repo, 'listTree' | 'readFile' | 'writeFile' | 'rename' | 'remove'>} options.repo
+ * @param {Pick<import('../git/repo.js').Repo, 'listTree' | 'readFile' | 'writeFile' | 'createFile' | 'rename' | 'remove'>} options.repo
  * @param {DraftStore} options.drafts
  */
 export function createNotes({ repoId, provider, repo, drafts }) {
@@ -131,13 +144,25 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 	const pendingDrafts = new Map();
 	/** @type {Promise<void> | null} */
 	let writing = null;
+	/**
+	 * The text of the draft this tab last stored or loaded, per path. Anything else
+	 * in that record came from another tab, and is not this tab's to remove.
+	 * @type {Map<string, string>}
+	 */
+	const ownDrafts = new Map();
 
 	const writePendingDrafts = async () => {
 		for (const [path, draft] of pendingDrafts) {
 			pendingDrafts.delete(path);
 			try {
-				if (draft) await drafts.put(draft);
-				else await drafts.remove(repoId, path);
+				if (draft) {
+					await drafts.put(draft);
+					ownDrafts.set(path, draft.text);
+				} else {
+					const own = ownDrafts.get(path);
+					ownDrafts.delete(path);
+					if (own !== undefined) await drafts.removeIfText(repoId, path, own);
+				}
 				if (state.note?.path === path && !pendingDrafts.has(path)) setNote({ draftStored: true, draftFailed: false });
 			} catch {
 				if (state.note?.path === path) setNote({ draftStored: false, draftFailed: true });
@@ -166,7 +191,12 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		while (writing) await writing;
 	};
 
-	const loadTree = async () => {
+	/**
+	 * Reads the file list, for callers that must not act on an old one: a failure
+	 * rejects, and also sets `treeError`.
+	 * @returns {Promise<void>}
+	 */
+	const readTree = async () => {
 		try {
 			const [entries, draftPaths] = await Promise.all([repo.listTree(), drafts.listPaths(repoId).catch(() => state.draftPaths)]);
 			// A write queued meanwhile is newer than what storage answered.
@@ -179,19 +209,29 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			set({ entries, draftPaths: [...merged], treeLoaded: true, treeError: null });
 		} catch (error) {
 			set({ treeLoaded: true, treeError: error instanceof Error ? error.message : 'The file list could not be read.' });
+			throw error;
 		}
 	};
 
 	/**
-	 * Reads what is on disk for a path.
+	 * Reads the file list for showing; a failure stays in `treeError`.
+	 * @returns {Promise<void>}
+	 */
+	const loadTree = () => readTree().catch(() => undefined);
+
+	/**
+	 * Reads what is on disk for a path. After a failed listing the entries say
+	 * nothing, so only the file itself can tell whether it is there.
 	 * @param {string} path
 	 * @returns {Promise<{ kind: NoteKind, size: number, text: string | null }>} `text` is null unless the kind holds text
 	 */
 	const readDisk = async (path) => {
-		const entry = state.entries.find((item) => item.path === path);
-		if (!entry) return { kind: 'missing', size: 0, text: null };
-		if (imageTypeFor(path)) return { kind: 'image', size: entry.size, text: null };
-		if (entry.size > MAX_TEXT_BYTES) return { kind: 'large', size: entry.size, text: null };
+		if (!state.treeError) {
+			const entry = state.entries.find((item) => item.path === path);
+			if (!entry) return { kind: 'missing', size: 0, text: null };
+			if (imageTypeFor(path)) return { kind: 'image', size: entry.size, text: null };
+			if (entry.size > MAX_TEXT_BYTES) return { kind: 'large', size: entry.size, text: null };
+		}
 		/** @type {Uint8Array} */
 		let bytes;
 		try {
@@ -200,9 +240,26 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			if (isNotFound(error)) return { kind: 'missing', size: 0, text: null };
 			throw error;
 		}
+		if (imageTypeFor(path)) return { kind: 'image', size: bytes.byteLength, text: null };
+		if (bytes.byteLength > MAX_TEXT_BYTES) return { kind: 'large', size: bytes.byteLength, text: null };
 		const text = decodeText(bytes);
 		if (text === null) return { kind: 'binary', size: bytes.byteLength, text: null };
 		return { kind: isMarkdownPath(path) ? 'markdown' : 'text', size: bytes.byteLength, text };
+	};
+
+	/**
+	 * The file's real text, for comparing with a buffer. The display limit does not
+	 * apply: an open buffer may have grown past it.
+	 * @param {string} path
+	 * @returns {Promise<string | null>} the text on disk now; null without a text file there
+	 */
+	const readDiskText = async (path) => {
+		try {
+			return decodeText(await repo.readFile(path));
+		} catch (error) {
+			if (isNotFound(error)) return null;
+			throw error;
+		}
 	};
 
 	/**
@@ -223,7 +280,10 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				return null;
 			})
 		]);
+		const diskText = draft && disk.kind === 'large' ? await readDiskText(path) : disk.text;
 		if (request !== openRequest) return;
+		if (draft) ownDrafts.set(path, draft.text);
+		else ownDrafts.delete(path);
 		versions += 1;
 		/** @type {OpenNote} */
 		const base = {
@@ -241,7 +301,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		};
 		if (!draft) {
 			set({ note: base });
-		} else if (draft.text === disk.text) {
+		} else if (draft.text === diskText) {
 			// Saved in another tab, or a tab that died right before removing it.
 			queueDraft(path, null);
 			set({ note: base });
@@ -254,19 +314,10 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 					savedText: draft.base,
 					dirty: true,
 					restored: true,
-					diskChanged: disk.text !== draft.base
+					diskChanged: diskText !== draft.base
 				}
 			});
 		}
-	};
-
-	/**
-	 * @param {string} path
-	 * @returns {Promise<string | null>} the text on disk now; null without a text file there
-	 */
-	const readDiskText = async (path) => {
-		await loadTree();
-		return (await readDisk(path)).text;
 	};
 
 	/**
@@ -277,12 +328,12 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 	 */
 	const create = async (path, text = '') => {
 		const target = normalizePath(path);
-		await loadTree();
+		await readTree();
 		for (const { path: existing } of state.entries) {
 			if (isWithin(existing, target)) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} already exists.`);
 			if (isWithin(target, existing)) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${existing} is a file, not a folder.`);
 		}
-		await repo.writeFile(target, text);
+		await repo.createFile(target, text);
 		await loadTree();
 		return target;
 	};
@@ -302,14 +353,21 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				await loadTree();
 				return;
 			}
-			normalizePath(path);
+			try {
+				normalizePath(path);
+			} catch (error) {
+				openRequest += 1;
+				set({ note: null });
+				throw error;
+			}
 			if (state.note?.path !== path) set({ note: null });
 			await load(path);
 		},
 
 		/**
 		 * Rereads storage after another tab may have written. A clean note follows
-		 * the file; a dirty one is only told about it.
+		 * the file; a dirty one is only told about it, and stores its buffer again
+		 * if the draft no longer holds it.
 		 * @returns {Promise<void>}
 		 */
 		async refresh() {
@@ -321,7 +379,16 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				if (state.note?.path === note.path && (disk.kind !== note.kind || disk.size !== note.size)) await load(note.path);
 				return;
 			}
-			const onDisk = (await readDisk(note.path)).text;
+			if (note.dirty) {
+				await flushDrafts();
+				const stored = await drafts.get(repoId, note.path).catch(() => undefined);
+				const current = state.note;
+				if (stored !== undefined && current?.version === note.version && current.dirty && stored?.text !== current.text && !pendingDrafts.has(note.path)) {
+					setNote({ draftStored: false });
+					queueDraft(note.path, { repoId, path: note.path, text: current.text, base: current.savedText });
+				}
+			}
+			const onDisk = await readDiskText(note.path);
 			if (state.note?.version !== note.version || onDisk === state.note.savedText) return;
 			if (!state.note.dirty) await load(note.path);
 			else setNote({ diskChanged: onDisk !== state.note.text });
@@ -397,7 +464,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		 */
 		async createFolder(path) {
 			const target = normalizePath(path);
-			await loadTree();
+			await readTree();
 			if (state.entries.some((entry) => isWithin(entry.path, target))) {
 				throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} already exists.`);
 			}
@@ -406,7 +473,9 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		},
 
 		/**
-		 * Renames or moves a file or folder, and any drafts along with it.
+		 * Renames or moves a file or folder, and any drafts along with it. A draft
+		 * counts as a file here: nothing moves onto one, and one whose file is gone
+		 * moves under the same rules as a file.
 		 * @param {string} from
 		 * @param {string} to
 		 * @returns {Promise<string>} the validated new path
@@ -414,9 +483,20 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		async move(from, to) {
 			const source = normalizePath(from);
 			const target = normalizePath(to);
+			if (source === target) return target;
 			await flushDrafts();
-			await loadTree();
+			await readTree();
 			const carried = state.draftPaths.filter((path) => isWithin(path, source));
+			if (target.startsWith(`${source}/`)) {
+				throw new GitEngineError(ErrorCode.INVALID_PATH, 'A folder cannot move inside itself.');
+			}
+			if (state.draftPaths.some((path) => !isWithin(path, source) && overlaps(path, target))) {
+				throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} has unsaved text. Save or discard it first.`);
+			}
+			const hasFile = state.entries.some((entry) => isWithin(entry.path, source));
+			if (!hasFile && carried.length > 0 && state.entries.some((entry) => overlaps(entry.path, target))) {
+				throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} already exists.`);
+			}
 			try {
 				await repo.rename(source, target);
 			} catch (error) {
@@ -427,6 +507,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				const draft = await drafts.get(repoId, path);
 				if (draft) await drafts.put({ ...draft, path: movedPath(path, source, target) });
 				await drafts.remove(repoId, path);
+				ownDrafts.delete(path);
 			}
 			await loadTree();
 			return target;
@@ -440,14 +521,17 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		async remove(path) {
 			const target = normalizePath(path);
 			await flushDrafts();
-			await loadTree();
+			await readTree();
 			const carried = state.draftPaths.filter((item) => isWithin(item, target));
 			try {
 				await repo.remove(target);
 			} catch (error) {
 				if (!(isNotFound(error) && carried.length > 0)) throw error;
 			}
-			for (const item of carried) await drafts.remove(repoId, item);
+			for (const item of carried) {
+				await drafts.remove(repoId, item);
+				ownDrafts.delete(item);
+			}
 			if (state.note && isWithin(state.note.path, target)) {
 				openRequest += 1;
 				set({ note: null });
@@ -463,7 +547,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		 *   `markdown` is the link to insert; `warning` is a size warning to show
 		 */
 		async addImage(notePath, file) {
-			await loadTree();
+			await readTree();
 			const path = imagePathFor({ notePath, fileName: file.name, mimeType: file.type, taken: new Set(state.entries.map((entry) => entry.path)) });
 			if (!path) {
 				throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'Only PNG, JPEG, GIF, WebP and SVG images can be added.');
@@ -472,7 +556,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			if (finding?.level === 'block') {
 				throw new GitEngineError(ErrorCode.FILE_TOO_LARGE, finding.message, { detail: { findings: [finding] } });
 			}
-			await repo.writeFile(path, new Uint8Array(await file.arrayBuffer()));
+			await repo.createFile(path, new Uint8Array(await file.arrayBuffer()));
 			await loadTree();
 			const alt = baseName(path).replace(/\.[^.]*$/, '');
 			return { path, markdown: `![${alt}](${relativeUrlFrom(notePath, path)})`, warning: finding?.message ?? null };
@@ -487,7 +571,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		async search(query, signal) {
 			const wanted = fold(query.trim());
 			if (wanted === '') return { hits: [], truncated: false };
-			await loadTree();
+			await readTree();
 			/** @type {SearchHit[]} */
 			const hits = [];
 			for (const { path, size } of state.entries) {
@@ -498,7 +582,8 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				try {
 					text = decodeText(await repo.readFile(path));
 				} catch (error) {
-					if (isNotFound(error)) continue;
+					// Git allows names the engine refuses; one must not end the whole scan.
+					if (isNotFound(error) || (error instanceof GitEngineError && error.code === ErrorCode.INVALID_PATH)) continue;
 					throw error;
 				}
 				if (text === null) continue;

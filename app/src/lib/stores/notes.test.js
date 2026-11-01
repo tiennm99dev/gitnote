@@ -98,6 +98,13 @@ describe('opening', () => {
 		await expect(context.notes.open('.git/config')).rejects.toMatchObject({ code: ErrorCode.INVALID_PATH });
 	});
 
+	it('closes the open note when a path it cannot open is asked for', async () => {
+		const { notes } = context;
+		await notes.open('README.md');
+		await expect(notes.open('.git/config')).rejects.toMatchObject({ code: ErrorCode.INVALID_PATH });
+		expect(get(notes).note).toBeNull();
+	});
+
 	it('uses the last of two quick opens', async () => {
 		const { notes } = context;
 		await Promise.all([notes.open('README.md'), notes.open('notes/plain.txt')]);
@@ -379,6 +386,74 @@ describe('files and folders', () => {
 		expect(await repo.readText('notes/today.md')).toBe(SEED['notes/today.md']);
 	});
 
+	it('leaves everything alone when a note moves to its own path', async () => {
+		const { notes, repo } = context;
+		await notes.open('README.md');
+		notes.edit('draft\n');
+		await notes.flushDrafts();
+		expect(await notes.move('README.md', 'README.md')).toBe('README.md');
+		expect(get(notes).draftPaths).toEqual(['README.md']);
+		await repo.remove('README.md');
+		expect(await notes.move('README.md', 'README.md')).toBe('README.md');
+		expect(get(notes).draftPaths).toEqual(['README.md']);
+	});
+
+	/**
+	 * Leaves unsaved text on a path.
+	 * @param {import('./notes.js').Notes} notes
+	 * @param {string} path
+	 * @param {string} text
+	 * @returns {Promise<void>}
+	 */
+	const draftOn = async (notes, path, text) => {
+		await notes.open(path);
+		notes.edit(text);
+		await notes.flushDrafts();
+	};
+
+	it('never moves a draft over another draft', async () => {
+		const { notes, drafts, repo } = context;
+		await draftOn(notes, 'README.md', 'first');
+		await draftOn(notes, 'notes/today.md', 'second');
+		await expect(notes.move('README.md', 'notes/today.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+
+		await repo.remove('README.md');
+		await expect(notes.move('README.md', 'notes/today.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect((await drafts.get(REPO_ID, 'notes/today.md'))?.text).toBe('second');
+		expect((await drafts.get(REPO_ID, 'README.md'))?.text).toBe('first');
+	});
+
+	it('never moves a file onto a path whose file is gone but whose draft remains', async () => {
+		const { notes, drafts, repo } = context;
+		await draftOn(notes, 'README.md', 'mine');
+		await draftOn(notes, 'notes/today.md', 'kept');
+		await repo.remove('notes/today.md');
+		await expect(notes.move('README.md', 'notes/today.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		await expect(notes.move('notes/plain.txt', 'notes/today.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect((await drafts.get(REPO_ID, 'notes/today.md'))?.text).toBe('kept');
+		expect(await repo.readText('notes/plain.txt')).toBe('plain\n');
+	});
+
+	it('never moves a folder over a draft inside the target', async () => {
+		const { notes, drafts, repo } = context;
+		await draftOn(notes, 'notes/today.md', 'kept');
+		await repo.remove('notes');
+		await repo.writeFile('other/today.md', 'file\n');
+		await expect(notes.move('other', 'notes')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect((await drafts.get(REPO_ID, 'notes/today.md'))?.text).toBe('kept');
+	});
+
+	it('never moves a draft whose file is gone onto a file, or inside itself', async () => {
+		const { notes, drafts, repo } = context;
+		await draftOn(notes, 'README.md', 'mine');
+		await repo.remove('README.md');
+		await expect(notes.move('README.md', 'notes/today.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		await expect(notes.move('README.md', 'notes')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		await expect(notes.move('README.md', 'notes/today.md/x.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		await expect(notes.move('README.md', 'README.md/x.md')).rejects.toMatchObject({ code: ErrorCode.INVALID_PATH });
+		expect((await drafts.get(REPO_ID, 'README.md'))?.text).toBe('mine');
+	});
+
 	it('moves a draft whose file is gone', async () => {
 		const { notes, repo } = context;
 		await notes.open('README.md');
@@ -426,6 +501,246 @@ describe('files and folders', () => {
 		expect(isWithin('a', 'a')).toBe(true);
 		expect(isWithin('ab/c.md', 'a')).toBe(false);
 		expect(movedPath('a/b/c.md', 'a/b', 'x')).toBe('x/c.md');
+	});
+});
+
+describe('when the file list cannot be read', () => {
+	beforeEach(async () => {
+		context = await setUp();
+	});
+
+	/**
+	 * The store over the real engine, with a listing that fails until told not to.
+	 * @returns {{ notes: import('./notes.js').Notes, failing: { list: boolean } }}
+	 */
+	const withFailingList = () => {
+		const { repo, drafts } = context;
+		const failing = { list: true };
+		const notes = createNotes({
+			repoId: REPO_ID,
+			provider: 'github',
+			drafts,
+			repo: {
+				...repo,
+				listTree: async () => {
+					if (failing.list) throw new Error('the disk said no');
+					return repo.listTree();
+				}
+			}
+		});
+		return { notes, failing };
+	};
+
+	it('opens a note that exists from the file itself, not as missing', async () => {
+		const { notes } = withFailingList();
+		await notes.open('README.md');
+		expect(openNote(notes)).toMatchObject({ kind: 'markdown', text: '# Readme\n', size: 9 });
+		expect(get(notes).treeError).toBe('the disk said no');
+		await notes.open('nothing.md');
+		expect(openNote(notes).kind).toBe('missing');
+	});
+
+	it('still tells images and oversized files apart', async () => {
+		const { repo } = context;
+		await repo.writeFile('pic.png', new Uint8Array([137, 80, 78, 71]));
+		await repo.writeFile('huge.md', 'x'.repeat(5_000_001));
+		const { notes } = withFailingList();
+		await notes.open('pic.png');
+		expect(openNote(notes)).toMatchObject({ kind: 'image', size: 4 });
+		await notes.open('huge.md');
+		expect(openNote(notes)).toMatchObject({ kind: 'large', size: 5_000_001 });
+	});
+
+	it('refuses to create, and leaves the file holding what it held', async () => {
+		const { repo } = context;
+		await repo.writeFile('README.md', 'uncommitted real text\n');
+		const { notes, failing } = withFailingList();
+		await expect(notes.create('README.md')).rejects.toThrow('the disk said no');
+		await expect(notes.createFolder('notes')).rejects.toThrow('the disk said no');
+		await expect(notes.create('fresh.md')).rejects.toThrow('the disk said no');
+		expect(await repo.readText('README.md')).toBe('uncommitted real text\n');
+
+		failing.list = false;
+		expect(await notes.create('fresh.md')).toBe('fresh.md');
+		expect(get(notes).treeError).toBeNull();
+	});
+
+	it('refuses to add an image rather than guess which names are free', async () => {
+		const { repo } = context;
+		await repo.writeFile('assets/cat.png', new Uint8Array([1]));
+		const { notes } = withFailingList();
+		await expect(notes.addImage('a.md', new File([new Uint8Array(4)], 'cat.png', { type: 'image/png' }))).rejects.toThrow('the disk said no');
+		expect([...(await repo.readFile('assets/cat.png'))]).toEqual([1]);
+	});
+
+	it('refuses moves, deletes and searches that would act on a stale list', async () => {
+		const { repo } = context;
+		const { notes } = withFailingList();
+		await expect(notes.move('README.md', 'x.md')).rejects.toThrow('the disk said no');
+		await expect(notes.remove('README.md')).rejects.toThrow('the disk said no');
+		await expect(notes.search('milk')).rejects.toThrow('the disk said no');
+		expect(await repo.readText('README.md')).toBe('# Readme\n');
+	});
+
+	it('saves over the file it was opened from', async () => {
+		const { repo } = context;
+		const { notes } = withFailingList();
+		await notes.open('README.md');
+		notes.edit('edited\n');
+		expect(await notes.save()).toBe(true);
+		expect(await repo.readText('README.md')).toBe('edited\n');
+	});
+
+	it('never overwrites a file the list did not know about', async () => {
+		const { repo, drafts } = context;
+		const notes = createNotes({ repoId: REPO_ID, provider: 'github', drafts, repo: { ...repo, listTree: async () => [] } });
+		await expect(notes.create('README.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect(await repo.readText('README.md')).toBe('# Readme\n');
+		await repo.writeFile('assets/cat.png', new Uint8Array([1]));
+		await expect(notes.addImage('a.md', new File([new Uint8Array(4)], 'cat.png', { type: 'image/png' }))).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect([...(await repo.readFile('assets/cat.png'))]).toEqual([1]);
+	});
+});
+
+describe('two tabs on one note', () => {
+	beforeEach(async () => {
+		context = await setUp();
+	});
+
+	it('a save leaves a draft that now holds the other tab\'s text', async () => {
+		const { open, repo } = context;
+		const [a, b] = [open(), open()];
+		await a.open('README.md');
+		await b.open('README.md');
+		a.edit('A words');
+		await a.flushDrafts();
+		b.edit('B words');
+		await b.flushDrafts();
+
+		await a.save();
+		await a.flushDrafts();
+		expect(await repo.readText('README.md')).toBe('A words');
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded)).toMatchObject({ text: 'B words', dirty: true, restored: true });
+		expect(get(a).draftPaths).toEqual([]);
+		await a.refresh();
+		expect(get(a).draftPaths).toEqual(['README.md']);
+	});
+
+	it('a tab that comes back stores its buffer again when its draft has gone', async () => {
+		const { open, drafts } = context;
+		const [a, b] = [open(), open()];
+		await a.open('README.md');
+		await b.open('README.md');
+		b.edit('B words');
+		await b.flushDrafts();
+		a.edit('A words');
+		await a.flushDrafts();
+		await a.save();
+		await a.flushDrafts();
+		expect(drafts.records.size).toBe(0);
+
+		await b.refresh();
+		await b.flushDrafts();
+		expect(openNote(b)).toMatchObject({ text: 'B words', dirty: true, draftStored: true, diskChanged: true });
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded)).toMatchObject({ text: 'B words', restored: true });
+	});
+
+	it('a tab that comes back takes the draft back from the tab that replaced it', async () => {
+		const { open, drafts } = context;
+		const [a, b] = [open(), open()];
+		await a.open('README.md');
+		await b.open('README.md');
+		a.edit('A words');
+		await a.flushDrafts();
+		b.edit('B words');
+		await b.flushDrafts();
+
+		await a.refresh();
+		await a.flushDrafts();
+		expect((await drafts.get(REPO_ID, 'README.md'))?.text).toBe('A words');
+	});
+
+	it('a discard removes only the draft this tab wrote', async () => {
+		const { open, drafts } = context;
+		const [a, b] = [open(), open()];
+		await a.open('README.md');
+		await b.open('README.md');
+		a.edit('A words');
+		await a.flushDrafts();
+		b.edit('B words');
+		await b.flushDrafts();
+		await a.discard();
+		await a.flushDrafts();
+		expect((await drafts.get(REPO_ID, 'README.md'))?.text).toBe('B words');
+	});
+
+	it('a save removes the draft it wrote itself, even after a slow write', async () => {
+		const { notes, drafts } = context;
+		await notes.open('README.md');
+		notes.edit('one');
+		notes.edit('two');
+		await notes.save();
+		await notes.flushDrafts();
+		expect(drafts.records.size).toBe(0);
+	});
+});
+
+describe('a buffer that grows past the display limit', () => {
+	beforeEach(async () => {
+		context = await setUp();
+	});
+
+	const BIG = 'x'.repeat(5_000_100);
+
+	it('saves again without a false conflict', async () => {
+		const { notes, repo } = context;
+		await notes.open('README.md');
+		notes.edit(BIG);
+		expect(await notes.save()).toBe(true);
+		notes.edit(`${BIG}y`);
+		expect(await notes.save()).toBe(true);
+		expect(openNote(notes).diskChanged).toBe(false);
+		expect((await repo.readText('README.md')).length).toBe(5_000_101);
+	});
+
+	it('still notices a real change to the file', async () => {
+		const { notes, repo } = context;
+		await notes.open('README.md');
+		notes.edit(BIG);
+		await notes.save();
+		await repo.writeFile('README.md', `${BIG}theirs`);
+		notes.edit(`${BIG}y`);
+		expect(await notes.save()).toBe(false);
+		expect(openNote(notes).diskChanged).toBe(true);
+	});
+
+	it('stays editable on refresh once clean', async () => {
+		const { notes } = context;
+		await notes.open('README.md');
+		notes.edit(BIG);
+		await notes.save();
+		await notes.flushDrafts();
+		await notes.refresh();
+		expect(openNote(notes)).toMatchObject({ kind: 'markdown', text: BIG, dirty: false });
+	});
+
+	it('restores its draft after a reload with no false conflict', async () => {
+		const { notes, open } = context;
+		await notes.open('README.md');
+		notes.edit(BIG);
+		await notes.save();
+		notes.edit(`${BIG}y`);
+		await notes.flushDrafts();
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded)).toMatchObject({ kind: 'markdown', text: `${BIG}y`, restored: true, diskChanged: false });
 	});
 });
 
@@ -499,6 +814,17 @@ describe('search', () => {
 		expect((await notes.search('plain')).hits).toEqual([]);
 		await repo.writeFile('fresh.md', 'unicorn\n');
 		expect((await notes.search('unicorn')).hits.map((hit) => hit.path)).toEqual(['fresh.md']);
+	});
+
+	it('skips a tracked name the engine cannot address, and finds the rest', async () => {
+		const { repo, drafts } = context;
+		const notes = createNotes({
+			repoId: REPO_ID,
+			provider: 'github',
+			drafts,
+			repo: { ...repo, listTree: async () => [...(await repo.listTree()), { path: 'we\\ird.md', size: 4, type: 'file' }] }
+		});
+		expect((await notes.search('dentist')).hits.map((hit) => hit.path)).toEqual(['notes/today.md']);
 	});
 
 	it('finds nothing for a blank query', async () => {

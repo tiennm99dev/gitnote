@@ -25,6 +25,10 @@ export function memoryDraftStore() {
 			records.set(key(draft.repoId, draft.path), JSON.stringify(draft));
 		},
 		remove: async (repoId, path) => void records.delete(key(repoId, path)),
+		removeIfText: async (repoId, path, text) => {
+			const record = records.get(key(repoId, path));
+			if (record !== undefined && JSON.parse(record).text === text) records.delete(key(repoId, path));
+		},
 		listPaths: async (repoId) =>
 			[...records.values()]
 				.map((record) => JSON.parse(record))

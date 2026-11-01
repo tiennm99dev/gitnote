@@ -21,6 +21,7 @@ const STORE = 'drafts';
  * @property {(repoId: string, path: string) => Promise<Draft | null>} get
  * @property {(draft: Draft) => Promise<void>} put
  * @property {(repoId: string, path: string) => Promise<void>} remove
+ * @property {(repoId: string, path: string, text: string) => Promise<void>} removeIfText removes the draft only if it still holds this text
  * @property {(repoId: string) => Promise<string[]>} listPaths
  * @property {(repoId: string) => Promise<void>} clear
  */
@@ -81,6 +82,15 @@ export function createWebDraftStore() {
 		},
 		remove: async (repoId, path) => {
 			await run('readwrite', (store) => store.delete([repoId, path]));
+		},
+		removeIfText: async (repoId, path, text) => {
+			await run('readwrite', (store) => {
+				const read = store.get([repoId, path]);
+				read.onsuccess = () => {
+					if (read.result?.text === text) store.delete([repoId, path]);
+				};
+				return read;
+			});
 		},
 		listPaths: async (repoId) => {
 			const keys = await run('readonly', (store) => store.getAllKeys(repoRange(repoId)));
