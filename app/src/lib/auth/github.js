@@ -31,9 +31,10 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 	 * @param {Record<string, string>} fields
 	 * @param {number} now
 	 * @param {(detail: string | null, code: string | null, status: number) => AuthError} rejected
+	 * @param {boolean} [showOutageDetail] see `postTokenRequest`
 	 * @returns {Promise<import('./oauth.js').TokenSet>}
 	 */
-	const callRelay = async (route, fields, now, rejected) =>
+	const callRelay = async (route, fields, now, rejected, showOutageDetail = false) =>
 		parseTokenResponse(
 			await postTokenRequest({
 				fetch: fetchImpl,
@@ -41,7 +42,8 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 				headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
 				body: JSON.stringify(fields),
 				hostLabel: RELAY_LABEL,
-				rejected
+				rejected,
+				showOutageDetail
 			}),
 			now
 		);
@@ -62,8 +64,12 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 		},
 
 		exchangeCode: ({ code, verifier, redirectUri, now }) =>
-			callRelay('token', { code, code_verifier: verifier, redirect_uri: redirectUri }, now, (detail) =>
-				new AuthError(AuthErrorCode.SIGN_IN_FAILED, detail ?? 'GitHub refused the sign-in. Try again.')
+			callRelay(
+				'token',
+				{ code, code_verifier: verifier, redirect_uri: redirectUri },
+				now,
+				(detail) => new AuthError(AuthErrorCode.SIGN_IN_FAILED, detail ?? 'GitHub refused the sign-in. Try again.'),
+				true
 			),
 
 		refresh: ({ refreshToken, now }) =>
@@ -86,12 +92,12 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 				return { repos: toRepos(items), truncated };
 			}
 			const installUrl = appSlug ? `https://github.com/apps/${encodeURIComponent(appSlug)}/installations/new` : 'https://github.com/settings/installations';
-			const { items: installations } = await readPages((page) =>
+			const { items: installations, truncated: moreInstallations } = await readPages((page) =>
 				api(`/user/installations?per_page=${PER_PAGE}&page=${page}`).then((data) => /** @type {{ installations?: unknown } | null} */ (data)?.installations)
 			);
 			/** @type {unknown[]} */
 			const raw = [];
-			let truncated = false;
+			let truncated = moreInstallations;
 			for (const installation of installations) {
 				const id = /** @type {{ id?: unknown }} */ (installation)?.id;
 				if (typeof id !== 'number') continue;

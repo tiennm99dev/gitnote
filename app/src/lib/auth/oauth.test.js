@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { memoryStorage } from '../../../test/auth-doubles.js';
 import { AuthErrorCode } from './errors.js';
+import { createGithubAdapter } from './github.js';
+import { createGitlabAdapter } from './gitlab.js';
 import { isTokenText, parseTokenResponse, PENDING_TTL_MS, pkceChallenge, randomToken, savePending, takePending } from './oauth.js';
 
 /** @type {import('./oauth.js').PendingSignIn} */
@@ -70,6 +72,59 @@ describe('parseTokenResponse', () => {
 
 	it.each([[null], ['text'], [{}], [{ access_token: 'has space' }], [{ access_token: 5 }]])('refuses %j', (data) => {
 		expect(() => parseTokenResponse(data, 1000)).toThrow(expect.objectContaining({ code: AuthErrorCode.UNAVAILABLE }));
+	});
+});
+
+describe('a token endpoint that answers with an outage', () => {
+	const REDIRECT = 'https://app.example.com/auth/callback';
+	const SETUP_MESSAGE = 'GitHub sign-in is not configured on this relay.';
+
+	/**
+	 * @param {number} status
+	 * @param {unknown} body
+	 * @returns {typeof fetch}
+	 */
+	const answering = (status, body) => async () => new Response(typeof body === 'string' ? body : JSON.stringify(body), { status });
+	/**
+	 * @param {typeof fetch} fetch
+	 * @returns {import('./session.js').ProviderAdapter}
+	 */
+	const github = (fetch) => createGithubAdapter({ clientId: 'id', relayOrigin: 'https://relay.example.com', fetch });
+	const exchange = { code: 'c', verifier: 'v', redirectUri: REDIRECT, now: 1000 };
+
+	it.each([502, 503])("shows the relay's own reason for a %i on sign-in, so a setup mistake does not read as an outage", async (status) => {
+		const failed = github(answering(status, { error: 'oauth_not_configured', message: SETUP_MESSAGE })).exchangeCode(exchange);
+
+		await expect(failed).rejects.toMatchObject({ code: AuthErrorCode.UNAVAILABLE, message: expect.stringContaining(SETUP_MESSAGE) });
+	});
+
+	it.each([
+		['no reason', 503, {}],
+		['a page instead of JSON', 502, '<html>Bad gateway</html>'],
+		['an empty reason', 503, { message: '' }],
+		['a reason that is not text', 503, { message: { nested: true } }]
+	])('falls back to the plain outage message with %s', async (_label, status, body) => {
+		const failed = github(answering(status, body)).exchangeCode(exchange);
+
+		await expect(failed).rejects.toMatchObject({ code: AuthErrorCode.UNAVAILABLE, message: expect.stringContaining('not available right now') });
+	});
+
+	it('does not present a rate limit as a reason', async () => {
+		const failed = github(answering(429, { message: 'slow down' })).exchangeCode(exchange);
+
+		await expect(failed).rejects.toMatchObject({ code: AuthErrorCode.UNAVAILABLE, message: expect.stringContaining('not available right now') });
+	});
+
+	it('keeps a refresh unavailable and general, so the sign-in stays', async () => {
+		const failed = github(answering(502, { error: 'incorrect_client_credentials', message: 'The client secret is wrong.' })).refresh({ refreshToken: 'r', now: 1000 });
+
+		await expect(failed).rejects.toMatchObject({ code: AuthErrorCode.UNAVAILABLE, message: expect.stringContaining('not available right now') });
+	});
+
+	it('does not repeat what a provider says in its own outage', async () => {
+		const failed = createGitlabAdapter({ clientId: 'id', fetch: answering(500, { message: 'internal detail' }) }).exchangeCode(exchange);
+
+		await expect(failed).rejects.toMatchObject({ code: AuthErrorCode.UNAVAILABLE, message: expect.stringContaining('not available right now') });
 	});
 });
 

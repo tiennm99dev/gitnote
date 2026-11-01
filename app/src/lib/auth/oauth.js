@@ -163,6 +163,8 @@ export function parseTokenResponse(data, now) {
  * Posts to a token endpoint and sorts the failures. `rejected` decides what a
  * 4xx means; a 429 or 5xx may pass, so the caller keeps what it has.
  * `credentials: 'omit'` keeps any provider cookie out of the exchange.
+ * `showOutageDetail` puts a 5xx answer's own message in the error: the relay uses
+ * those for setup mistakes such as a wrong client secret, which waiting cannot fix.
  * @param {object} options
  * @param {typeof fetch} options.fetch
  * @param {string} options.url
@@ -170,9 +172,10 @@ export function parseTokenResponse(data, now) {
  * @param {string} options.body
  * @param {string} options.hostLabel names the other side in messages
  * @param {(detail: string | null, code: string | null, status: number) => AuthError} options.rejected builds the error for a 4xx
+ * @param {boolean} [options.showOutageDetail]
  * @returns {Promise<unknown>} the JSON body of a 2xx answer
  */
-export async function postTokenRequest({ fetch: fetchImpl, url, headers, body, hostLabel, rejected }) {
+export async function postTokenRequest({ fetch: fetchImpl, url, headers, body, hostLabel, rejected, showOutageDetail = false }) {
 	/** @type {Response} */
 	let response;
 	try {
@@ -190,11 +193,12 @@ export async function postTokenRequest({ fetch: fetchImpl, url, headers, body, h
 	/** @type {unknown} */
 	const data = await response.json().catch(() => null);
 	if (response.ok) return data;
-	if (response.status === 429 || response.status >= 500) {
-		throw new AuthError(AuthErrorCode.UNAVAILABLE, `${hostLabel} is not available right now (status ${response.status}). Try again later.`);
-	}
 	const fields = /** @type {{ error?: unknown, message?: unknown, error_description?: unknown }} */ (typeof data === 'object' && data !== null ? data : {});
 	const detail = fields.message ?? fields.error_description;
+	if (response.status === 429 || response.status >= 500) {
+		const explained = showOutageDetail && response.status >= 500 && typeof detail === 'string' && detail !== '';
+		throw new AuthError(AuthErrorCode.UNAVAILABLE, explained ? `${hostLabel} could not finish the sign-in: ${detail}` : `${hostLabel} is not available right now (status ${response.status}). Try again later.`);
+	}
 	throw rejected(typeof detail === 'string' ? detail : null, typeof fields.error === 'string' ? fields.error : null, response.status);
 }
 

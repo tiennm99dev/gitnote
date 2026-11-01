@@ -92,18 +92,20 @@ export function createGitlabAdapter({ clientId, fetch: fetchImpl = (...args) => 
  * Builds the app's repo records from API data, dropping what it cannot use. The
  * clone URL is built, not taken from the API, so a token only ever goes to the
  * provider's own host, and it ends in `.git` as the relay requires. Project
- * statistics come back only for members with the Reporter role or above.
+ * statistics come back only for members with the Reporter role or above. Keyed
+ * by id: this list is sorted by activity, so a project that becomes active during
+ * the read can move to a later page and come back twice.
  * @param {unknown[]} raw
  * @returns {RemoteRepo[]}
  */
 function toRepos(raw) {
-	/** @type {RemoteRepo[]} */
-	const repos = [];
+	/** @type {Map<number, RemoteRepo>} */
+	const repos = new Map();
 	for (const item of raw) {
 		const project = /** @type {{ id?: unknown, path_with_namespace?: unknown, default_branch?: unknown, statistics?: { repository_size?: unknown }, visibility?: unknown, empty_repo?: unknown }} */ (item);
 		if (typeof project?.id !== 'number' || !isRepoPath(project.path_with_namespace, PROJECT_PATH)) continue;
 		const size = project.statistics?.repository_size;
-		repos.push({
+		repos.set(project.id, {
 			provider: 'gitlab',
 			id: project.id,
 			fullName: project.path_with_namespace,
@@ -114,5 +116,5 @@ function toRepos(raw) {
 			empty: project.empty_repo === true
 		});
 	}
-	return repos;
+	return [...repos.values()];
 }

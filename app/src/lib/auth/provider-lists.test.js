@@ -51,6 +51,16 @@ describe('GitHub repositories', () => {
 		]);
 	});
 
+	it('say so when the list of installations itself is cut short', async () => {
+		/** @type {Record<string, unknown>} */
+		const answers = {};
+		for (let page = 1; page <= 10; page += 1) {
+			answers[`/user/installations?per_page=100&page=${page}`] = { installations: Array.from({ length: 100 }, () => ({ id: 'not usable' })) };
+		}
+
+		expect((await adapter.listRepos(apiDouble(answers), 'oauth')).truncated).toBe(true);
+	});
+
 	it('point at the install page when the App is on no repo yet', async () => {
 		const api = apiDouble({ '/user/installations?per_page=100&page=1': { installations: [] } });
 
@@ -108,6 +118,18 @@ describe('GitLab projects', () => {
 			{ provider: 'gitlab', id: 5, fullName: 'group/sub/notes', url: 'https://gitlab.com/group/sub/notes.git', defaultBranch: 'main', sizeBytes: 1234, isPrivate: true, empty: false },
 			{ provider: 'gitlab', id: 6, fullName: 'group/blank', url: 'https://gitlab.com/group/blank.git', defaultBranch: null, sizeBytes: null, isPrivate: false, empty: true }
 		]);
+	});
+
+	it('are listed once each when a project moves to a later page during the read', async () => {
+		const page = Array.from({ length: 100 }, (_, index) => ({ id: index + 1, path_with_namespace: `group/project-${index + 1}` }));
+		const api = apiDouble({
+			[LIST]: page,
+			[LIST.replace(/page=1$/, 'page=2')]: [page[99], { id: 101, path_with_namespace: 'group/project-101' }]
+		});
+
+		const { repos } = await adapter.listRepos(api, 'oauth');
+
+		expect(repos.map((repo) => repo.id)).toEqual(Array.from({ length: 101 }, (_, index) => index + 1));
 	});
 
 	it('list branches by project id', async () => {
