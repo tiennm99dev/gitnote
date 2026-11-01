@@ -26,6 +26,13 @@ export default defineConfig({
 		{
 			command: `npm run build && npm run preview -- --port ${PORT} --strictPort`,
 			url: `http://localhost:${PORT}`,
+			// Fixture IDs that turn the sign-in buttons on. The tests stand in for
+			// the providers' sign-in pages, so nothing reaches GitHub or GitLab.
+			env: {
+				VITE_GITHUB_CLIENT_ID: 'e2e-github-client',
+				VITE_GITHUB_APP_SLUG: 'gitnote-e2e',
+				VITE_GITLAB_CLIENT_ID: 'e2e-gitlab-client'
+			},
 			// Always build and serve fresh: a reused preview would test a stale build.
 			// A busy port fails the run; stop the stale server instead.
 			reuseExistingServer: false,
