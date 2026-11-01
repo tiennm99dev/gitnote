@@ -4,7 +4,7 @@
 	import { authSession } from '#lib/auth/index.js';
 	import { PROVIDER_IDS, PROVIDERS } from '#lib/auth/providers.js';
 	import { deleteDeviceRepo, openDeviceRepo } from '#lib/git/device-repos.js';
-	import { describeLocalWork, listLocalRepos } from '#lib/git/local-repos.js';
+	import { describeLocalWork, describeWorkCounts, isSameWork, listLocalRepos, removeLocalCopies } from '#lib/git/local-repos.js';
 
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
 
@@ -19,7 +19,7 @@
 	let busy = $state(null);
 	/**
 	 * The sign-out being confirmed.
-	 * @type {{ provider: ProviderId, work: import('#lib/git/local-repos.js').LocalWork[], wipe: boolean } | null}
+	 * @type {{ provider: ProviderId, work: import('#lib/git/local-repos.js').LocalWork[], wipe: boolean, changed: boolean } | null}
 	 */
 	let leaving = $state(null);
 
@@ -84,32 +84,52 @@
 
 	/**
 	 * @param {ProviderId} provider
+	 * @returns {Promise<import('#lib/git/local-repos.js').LocalWork[]>}
+	 */
+	const countWork = (provider) =>
+		describeLocalWork(
+			listLocalRepos().filter((repo) => repo.provider === provider),
+			openDeviceRepo
+		);
+
+	/**
+	 * @param {ProviderId} provider
 	 * @returns {Promise<void>}
 	 */
 	const startSignOut = (provider) =>
 		run(provider, async () => {
-			const repos = listLocalRepos().filter((repo) => repo.provider === provider);
-			leaving = { provider, work: await describeLocalWork(repos, openDeviceRepo), wipe: false };
+			leaving = { provider, work: await countWork(provider), wipe: false, changed: false };
 		});
 
+	/**
+	 * Another tab may have committed or cloned since the list was shown, so the
+	 * choice stands only for what is there now. The sign-in goes last: with it
+	 * still here, a deletion that fails can simply be tried again.
+	 * @returns {Promise<void> | undefined}
+	 */
 	const finishSignOut = () => {
 		if (!leaving) return;
 		const { provider, work, wipe } = leaving;
 		return run(provider, async () => {
+			const current = await countWork(provider);
+			if (!isSameWork(work, current)) {
+				leaving = { provider, work: current, wipe: wipe && current.length > 0, changed: true };
+				return;
+			}
+			if (wipe) {
+				const failed = await removeLocalCopies(
+					work.map(({ repo }) => repo),
+					deleteDeviceRepo
+				);
+				if (failed.length > 0) {
+					leaving = { provider, work: await countWork(provider), wipe, changed: false };
+					throw new Error(`Could not delete ${failed.map((repo) => repo.fullName).join(', ')}. You are still signed in, so you can try again.`);
+				}
+			}
 			await authSession.signOut(provider);
 			leaving = null;
 			await reload();
-			if (wipe) for (const { repo } of work) await deleteDeviceRepo(repo.id);
 		});
-	};
-
-	/**
-	 * @param {import('#lib/git/local-repos.js').LocalWork} item
-	 * @returns {string}
-	 */
-	const describeWork = ({ unpushed, drafts }) => {
-		if (unpushed === null || drafts === null) return 'could not be read, so it may hold unpushed work';
-		return `${unpushed} unpushed ${unpushed === 1 ? 'commit' : 'commits'}, ${drafts} uncommitted ${drafts === 1 ? 'file' : 'files'}`;
 	};
 </script>
 
@@ -170,10 +190,13 @@
 					{#if leaving?.provider === id}
 						<div class="flex flex-col gap-2 rounded bg-gray-100 p-3" data-testid={`sign-out-${id}`}>
 							<p>Signing out removes the {provider.label} sign-in from this device.</p>
+							{#if leaving.changed}
+								<p role="alert" class="text-amber-800" data-testid="sign-out-changed">The copies on this device changed while this was open. Check the list, then choose again.</p>
+							{/if}
 							{#if leaving.work.length > 0}
 								<ul class="list-disc pl-5">
 									{#each leaving.work as item (item.repo.id)}
-										<li data-testid="sign-out-work">{item.repo.fullName}: {describeWork(item)}</li>
+										<li data-testid="sign-out-work">{item.repo.fullName}: {describeWorkCounts(item)}</li>
 									{/each}
 								</ul>
 								<label class="flex items-center gap-2">

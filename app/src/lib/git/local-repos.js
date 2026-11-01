@@ -90,6 +90,44 @@ function parseLocalRepo(text) {
  */
 
 /**
+ * @param {Pick<LocalWork, 'unpushed' | 'drafts'>} work
+ * @returns {string} what deleting a copy would lose, for people
+ */
+export function describeWorkCounts({ unpushed, drafts }) {
+	if (unpushed === null || drafts === null) return 'could not be read, so it may hold unpushed work';
+	return `${unpushed} unpushed ${unpushed === 1 ? 'commit' : 'commits'}, ${drafts} uncommitted ${drafts === 1 ? 'file' : 'files'}`;
+}
+
+/**
+ * @param {LocalWork[]} shown what the user was shown
+ * @param {LocalWork[]} current a fresh count
+ * @returns {boolean} whether the user decided on what is there now
+ */
+export function isSameWork(shown, current) {
+	return JSON.stringify(shown) === JSON.stringify(current);
+}
+
+/**
+ * Deletes copies one by one. One that fails does not stop the others, and stays
+ * recorded so that the deletion can be tried again.
+ * @param {LocalRepo[]} repos
+ * @param {(id: string) => Promise<void>} remove
+ * @returns {Promise<LocalRepo[]>} the copies that could not be deleted
+ */
+export async function removeLocalCopies(repos, remove) {
+	/** @type {LocalRepo[]} */
+	const failed = [];
+	for (const repo of repos) {
+		try {
+			await remove(repo.id);
+		} catch {
+			failed.push(repo);
+		}
+	}
+	return failed;
+}
+
+/**
  * Counts the unpushed work in local copies. A copy that cannot be read reports
  * nulls rather than zero, so a warning never understates what is at risk.
  * @param {LocalRepo[]} repos

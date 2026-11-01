@@ -4,11 +4,11 @@
 	import { AuthError, AuthErrorCode } from '#lib/auth/errors.js';
 	import { authSession } from '#lib/auth/index.js';
 	import { PROVIDERS } from '#lib/auth/providers.js';
-	import { openDeviceRepo } from '#lib/git/device-repos.js';
+	import { deleteDeviceRepo, openDeviceRepo } from '#lib/git/device-repos.js';
 	import { ErrorCode, GitEngineError } from '#lib/git/errors.js';
 	import { getStorageUsage, repoIdForUrl } from '#lib/git/fs.js';
 	import { checkRepoSize, formatBytes } from '#lib/git/limits.js';
-	import { forgetLocalRepo, listLocalRepos, saveLocalRepo } from '#lib/git/local-repos.js';
+	import { describeLocalWork, describeWorkCounts, forgetLocalRepo, isSameWork, listLocalRepos, saveLocalRepo } from '#lib/git/local-repos.js';
 
 	/** @typedef {import('#lib/auth/session.js').RemoteRepo} RemoteRepo */
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
@@ -37,6 +37,11 @@
 	let storageWarning = $state(null);
 	/** @type {{ repo: import('#lib/git/local-repos.js').LocalRepo, files: number | null }[]} */
 	let copies = $state([]);
+	/**
+	 * The deletion being confirmed.
+	 * @type {{ work: import('#lib/git/local-repos.js').LocalWork, changed: boolean } | null}
+	 */
+	let removing = $state(null);
 
 	const account = $derived(accounts.find((item) => item.provider === provider));
 	const shown = $derived.by(() => {
@@ -52,7 +57,7 @@
 		const repo = /** @type {RemoteRepo | null} */ (selected);
 		if (!repo) return false;
 		const id = repoIdForUrl(repo.url);
-		return copies.some((copy) => copy.repo.id === id);
+		return copies.some((copy) => copy.repo.ready && copy.repo.id === id);
 	});
 
 	/**
@@ -72,15 +77,14 @@
 	/** Lists what is on this device, which works with no account and no network. */
 	const loadCopies = async () => {
 		copies = await Promise.all(
-			listLocalRepos()
-				.filter((repo) => repo.ready)
-				.map(async (repo) => {
-					try {
-						return { repo, files: (await openDeviceRepo(repo).listTree()).length };
-					} catch {
-						return { repo, files: null };
-					}
-				})
+			listLocalRepos().map(async (repo) => {
+				if (!repo.ready) return { repo, files: null };
+				try {
+					return { repo, files: (await openDeviceRepo(repo).listTree()).length };
+				} catch {
+					return { repo, files: null };
+				}
+			})
 		);
 	};
 
@@ -90,10 +94,13 @@
 		list = null;
 		selected = null;
 		clearReport();
+		// The page already asks for a new sign-in, and asking the provider cannot help.
+		if (accounts.find((item) => item.provider === id)?.needsSignIn) return;
 		try {
-			list = await authSession.listRepos(id);
+			const answer = await authSession.listRepos(id);
+			if (provider === id) list = answer;
 		} catch (error) {
-			report(error);
+			if (provider === id) report(error);
 		}
 	};
 
@@ -108,6 +115,11 @@
 		try {
 			const names = await authSession.listBranches(repo);
 			if (selected !== repo) return;
+			// GitHub's repo list cannot say this, and a repo with no branches has no commits.
+			if (names.length === 0) {
+				selected = { ...repo, empty: true };
+				return;
+			}
 			// Keep the default branch on offer even if the list was cut short.
 			branches = repo.defaultBranch && !names.includes(repo.defaultBranch) ? [repo.defaultBranch, ...names] : names;
 		} catch (error) {
@@ -123,25 +135,69 @@
 		const entry = { id, url, provider: repoProvider, fullName, branch, ready: false };
 		clearReport();
 		progress = 'Starting…';
-		// Recorded first, so sign-out can still wipe a clone cut off by a closed tab.
-		saveLocalRepo(entry);
+		let recorded = false;
 		try {
-			const result = await openDeviceRepo(entry).clone({
-				url,
-				ref,
-				onProgress: ({ phase, loaded: done, total }) => {
-					progress = total ? `${phase}: ${Math.round((done / total) * 100)}%` : phase;
-				}
-			});
-			saveLocalRepo({ ...entry, branch: result.branch, ready: true });
-			selected = null;
-		} catch (error) {
-			if (error instanceof GitEngineError && error.code === ErrorCode.ALREADY_CLONED) {
-				saveLocalRepo({ ...entry, ready: true });
-			} else {
-				forgetLocalRepo(id);
-				report(error);
+			// Recorded first, so a clone cut off by a closed tab can still be deleted.
+			saveLocalRepo(entry);
+			recorded = true;
+			const repo = openDeviceRepo(entry);
+			try {
+				const result = await repo.clone({
+					url,
+					ref,
+					onProgress: ({ phase, loaded: done, total }) => {
+						progress = total ? `${phase}: ${Math.round((done / total) * 100)}%` : phase;
+					}
+				});
+				saveLocalRepo({ ...entry, branch: result.branch, ready: true });
+				selected = null;
+			} catch (error) {
+				if (!(error instanceof GitEngineError && error.code === ErrorCode.ALREADY_CLONED)) throw error;
+				// Another tab got there first, perhaps with another branch.
+				const onDevice = await repo.aheadBehind().then(
+					(state) => state.branch,
+					() => branch
+				);
+				saveLocalRepo({ ...entry, branch: onDevice, ready: true });
 			}
+		} catch (error) {
+			if (recorded) forgetLocalRepo(id);
+			report(error);
+		} finally {
+			progress = null;
+		}
+		await loadCopies();
+	};
+
+	/**
+	 * @param {import('#lib/git/local-repos.js').LocalRepo} repo
+	 * @returns {Promise<import('#lib/git/local-repos.js').LocalWork>}
+	 */
+	const countCopy = async (repo) => (await describeLocalWork([repo], openDeviceRepo))[0];
+
+	/** @param {import('#lib/git/local-repos.js').LocalRepo} repo */
+	const startRemove = async (repo) => {
+		clearReport();
+		removing = { work: await countCopy(repo), changed: false };
+	};
+
+	/** Works with no account, as the copy may outlive its sign-in. */
+	const finishRemove = async () => {
+		if (!removing) return;
+		const { work } = removing;
+		clearReport();
+		progress = 'Deleting…';
+		try {
+			// Another tab may have committed since the count was shown.
+			const current = await countCopy(work.repo);
+			if (isSameWork([work], [current])) {
+				await deleteDeviceRepo(work.repo.id);
+				removing = null;
+			} else {
+				removing = { work: current, changed: true };
+			}
+		} catch (error) {
+			report(error);
 		} finally {
 			progress = null;
 		}
@@ -160,7 +216,7 @@
 			storageWarning = `This site uses ${formatBytes(usage.usage)} of the ${formatBytes(usage.quota)} this browser allows it. Near the limit, the browser may refuse writes or clear data, and unpushed commits exist nowhere else. Push them.`;
 		}
 		loaded = true;
-		const first = accounts.find((item) => !item.needsSignIn);
+		const first = accounts.find((item) => !item.needsSignIn) ?? accounts[0];
 		if (first) await loadRepos(first.provider);
 	});
 </script>
@@ -278,7 +334,27 @@
 				{#each copies as { repo, files } (repo.id)}
 					<li class="rounded border border-gray-300 p-2" data-testid="local-copy">
 						<span class="font-medium">{repo.fullName}</span>
-						<span class="text-sm text-gray-600">{repo.branch}{files === null ? ', could not be read' : `, ${files} ${files === 1 ? 'file' : 'files'}`}</span>
+						<span class="text-sm text-gray-600" data-testid="local-copy-state">{repo.branch}{!repo.ready ? ', clone not finished' : files === null ? ', could not be read' : `, ${files} ${files === 1 ? 'file' : 'files'}`}</span>
+						{#if removing?.work.repo.id === repo.id}
+							<div class="mt-2 flex flex-col gap-2 rounded bg-gray-100 p-3" data-testid="remove-copy">
+								{#if removing.changed}
+									<p role="alert" class="text-amber-800">This copy changed while this was open. Check what it holds, then choose again.</p>
+								{/if}
+								<p>This deletes the copy from this device, including anything not pushed. It holds {describeWorkCounts(removing.work)}.</p>
+								<div class="flex gap-2">
+									<button type="button" class="rounded bg-red-700 px-3 py-2 text-white disabled:opacity-50" disabled={progress !== null} onclick={finishRemove}>Delete this copy</button>
+									<button
+										type="button"
+										class="rounded border border-gray-900 px-3 py-2"
+										onclick={() => {
+											removing = null;
+										}}>Keep it</button
+									>
+								</div>
+							</div>
+						{:else}
+							<button type="button" class="ml-2 text-sm underline disabled:opacity-50" disabled={progress !== null} onclick={() => startRemove(repo)}>Delete from this device</button>
+						{/if}
 					</li>
 				{/each}
 			</ul>

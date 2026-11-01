@@ -1,4 +1,4 @@
-/* global indexedDB */
+/* global indexedDB, window, IDBObjectStore */
 import { createHash } from 'node:crypto';
 import { expect, test } from '@playwright/test';
 import { createRemote, pushFromElsewhere, runGit } from '../test/remote-repo.js';
@@ -346,6 +346,37 @@ test.describe('the GitHub App sign-in', () => {
 		expect(problems).toEqual([]);
 	});
 
+	test('the gitlab.com sign-in runs on the device under the production CSP, without the relay', async ({ page }) => {
+		const problems = collectBreakage(page);
+		await page.route('https://gitlab.com/oauth/authorize**', async (route) => {
+			const url = new URL(route.request().url());
+			const back = new URL(String(url.searchParams.get('redirect_uri')));
+			back.search = new URLSearchParams({ code: 'e2e-code', state: String(url.searchParams.get('state')) }).toString();
+			await route.fulfill({ status: 302, headers: { location: back.href } });
+		});
+		await serveApi(page, 'gitlab', GOOD_TOKEN, { '/projects?membership=true&simple=false&statistics=true&order_by=last_activity_at&per_page=100&page=1': [] });
+		/** @type {URLSearchParams | null} */
+		let exchange = null;
+		await page.route('https://gitlab.com/oauth/token', async (route) => {
+			exchange = new URLSearchParams(route.request().postData() ?? '');
+			await route.fulfill({ status: 200, headers: CORS, body: JSON.stringify({ access_token: GOOD_TOKEN, refresh_token: REFRESH_TOKEN, expires_in: 7200, token_type: 'Bearer' }) });
+		});
+
+		await page.goto('/connect');
+		await page.getByRole('button', { name: 'Sign in with GitLab' }).click();
+
+		await expect(page).toHaveURL(/\/repos$/);
+		await expect(page.getByTestId('no-repos')).toBeVisible();
+		const sent = /** @type {URLSearchParams} */ (/** @type {unknown} */ (exchange));
+		expect(sent.get('client_id')).toBe('e2e-gitlab-client');
+		expect(sent.get('code')).toBe('e2e-code');
+		expect(sent.get('code_verifier')).toBeTruthy();
+		const stored = await dumpBrowserStorage(page);
+		expect(stored).not.toContain(GOOD_TOKEN);
+		expect(stored).not.toContain(REFRESH_TOKEN);
+		expect(problems).toEqual([]);
+	});
+
 	test('refuses a redirect it did not start, and clears the code from the address bar', async ({ page }) => {
 		let exchanged = false;
 		await page.route('**/api/oauth/github/token', async (route) => {
@@ -373,6 +404,290 @@ test.describe('the GitHub App sign-in', () => {
 		await page.getByRole('button', { name: 'Sign in with GitHub' }).click();
 
 		await expect(page.getByTestId('callback-error')).toContainText('declined');
+	});
+});
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @param {ProviderId} [provider]
+ * @param {string} [token]
+ * @returns {Promise<void>}
+ */
+async function pasteToken(page, provider = 'github', token = GOOD_TOKEN) {
+	await page.goto('/connect');
+	const section = page.getByTestId(`account-${provider}`);
+	await section.getByLabel('Or paste a token').fill(token);
+	await section.getByRole('button', { name: 'Check and save' }).click();
+	await expect(page.getByTestId(`account-${provider}-status`)).toContainText('octo');
+}
+
+/**
+ * The picker's answers for a pasted GitHub token that sees these repos.
+ * @param {{ id: number, fullName: string }[]} repos
+ * @returns {Record<string, unknown>}
+ */
+function githubAnswers(repos) {
+	/** @type {Record<string, unknown>} */
+	const answers = { '/user/repos?per_page=100&sort=updated&page=1': repos.map(({ id, fullName }) => ({ id, full_name: fullName, default_branch: 'main', size: 12, private: true })) };
+	for (const { fullName } of repos) answers[`/repos/${fullName}/branches?per_page=100&page=1`] = [{ name: 'main' }, { name: 'drafts' }];
+	return answers;
+}
+
+/**
+ * Clones a repo through the picker on `/repos`.
+ * @param {import('@playwright/test').Page} page
+ * @param {string} fullName
+ * @returns {Promise<void>}
+ */
+async function cloneThroughPicker(page, fullName) {
+	await page.goto('/repos');
+	await page.getByRole('button', { name: new RegExp(fullName) }).click();
+	await expect(page.getByTestId('branch-select').locator('option')).toHaveCount(2);
+	await page.getByTestId('clone-button').click();
+	await expect(page.getByTestId('local-copy').filter({ hasText: fullName })).toContainText('main, 3 files');
+}
+
+test('a dead sign-in still asks for a new one on the repo page after a reload, and the copies stay', async ({ page }) => {
+	const { id, fullName } = await repoWithBranches();
+	await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await pasteToken(page);
+	await cloneThroughPicker(page, fullName);
+
+	// The token dies. The first visit learns that from the provider.
+	await page.route(`${PROVIDERS.github.api}/**`, (route) => route.fulfill({ status: 401, headers: CORS, body: '{"message":"Bad credentials"}' }));
+	await page.reload();
+	await expect(page.getByTestId('repos-error')).toContainText('sign-in has ended');
+
+	// Later visits know already, and must say so without asking the provider.
+	await page.reload();
+	await expect(page.getByRole('link', { name: 'Sign in again' })).toBeVisible();
+	await expect(page.getByTestId('local-copy')).toContainText('main, 3 files');
+	await page.getByRole('link', { name: 'Sign in again' }).click();
+	await expect(page).toHaveURL(/\/connect$/);
+});
+
+test('an empty GitHub repo is named as empty instead of offering a branch that cannot be cloned', async ({ page }) => {
+	await serveApi(page, 'github', GOOD_TOKEN, {
+		'/user/repos?per_page=100&sort=updated&page=1': [{ id: 44, full_name: 'octo/blank', default_branch: 'main', size: 0, private: true }],
+		'/repos/octo/blank/branches?per_page=100&page=1': []
+	});
+	await pasteToken(page);
+	await page.goto('/repos');
+
+	await page.getByTestId('repo-option').click();
+
+	await expect(page.getByTestId('repo-empty')).toBeVisible();
+	await expect(page.getByTestId('clone-button')).toHaveCount(0);
+});
+
+test('switching accounts ignores the slower answer from the account left behind', async ({ page }) => {
+	await serveApi(page, 'github', GOOD_TOKEN, {});
+	await serveApi(page, 'gitlab', GOOD_TOKEN, {
+		'/projects?membership=true&simple=false&statistics=true&order_by=last_activity_at&per_page=100&page=1': [{ id: 50, path_with_namespace: 'octo/on-gitlab', default_branch: 'main', visibility: 'private', empty_repo: false }]
+	});
+	await pasteToken(page, 'github');
+	await pasteToken(page, 'gitlab');
+
+	/** @type {() => void} */
+	let releaseGithub = () => {};
+	const githubMayAnswer = new Promise((resolve) => {
+		releaseGithub = () => resolve(undefined);
+	});
+	let githubAsked = false;
+	await page.route(`${PROVIDERS.github.api}/user/repos**`, async (route) => {
+		githubAsked = true;
+		await githubMayAnswer;
+		await route.fulfill({ status: 200, headers: CORS, body: JSON.stringify([{ id: 51, full_name: 'octo/on-github', default_branch: 'main', size: 1, private: true }]) });
+	});
+
+	await page.goto('/repos');
+	await expect.poll(() => githubAsked).toBe(true);
+	await page.getByRole('button', { name: 'GitLab', exact: true }).click();
+	await expect(page.getByRole('button', { name: /octo\/on-gitlab/ })).toBeVisible();
+
+	const answered = page.waitForEvent('requestfinished', (request) => request.url().includes('/user/repos'));
+	releaseGithub();
+	await answered;
+	await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 100)));
+
+	await expect(page.getByRole('button', { name: /octo\/on-github/ })).toHaveCount(0);
+	await expect(page.getByRole('button', { name: /octo\/on-gitlab/ })).toBeVisible();
+	await expect(page.getByRole('button', { name: 'GitLab', exact: true })).toHaveAttribute('aria-pressed', 'true');
+});
+
+test('a browser that refuses to record the clone reports it and lets the user try again', async ({ page }) => {
+	const { id, fullName } = await repoWithBranches();
+	await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await pasteToken(page);
+	await page.goto('/repos');
+	await page.getByRole('button', { name: new RegExp(fullName) }).click();
+
+	await page.evaluate(() => {
+		const original = Storage.prototype.setItem;
+		/**
+		 * @this {Storage}
+		 * @param {string} key
+		 * @param {string} value
+		 */
+		Storage.prototype.setItem = function (key, value) {
+			if (key.startsWith('gitnote.repo.')) throw new DOMException('quota', 'QuotaExceededError');
+			original.call(this, key, value);
+		};
+	});
+	await page.getByTestId('clone-button').click();
+
+	await expect(page.getByTestId('repos-error')).toContainText('quota');
+	await expect(page.getByTestId('clone-progress')).toHaveCount(0);
+	await expect(page.getByTestId('clone-button')).toBeEnabled();
+});
+
+test('a copy another tab cloned first is recorded with the branch actually on the device', async ({ page, context }) => {
+	const { id, fullName } = await repoWithBranches();
+	const answers = githubAnswers([{ id, fullName }]);
+	await serveApi(page, 'github', GOOD_TOKEN, answers);
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await pasteToken(page);
+
+	const other = await context.newPage();
+	await serveApi(other, 'github', GOOD_TOKEN, answers);
+	await serveGit(other, 'github', GOOD_TOKEN);
+	await other.goto('/repos');
+	await other.getByTestId('repo-option').click();
+	await expect(other.getByTestId('branch-select').locator('option')).toHaveCount(2);
+
+	await page.goto('/repos');
+	await page.getByTestId('repo-option').click();
+	await expect(page.getByTestId('branch-select').locator('option')).toHaveCount(2);
+	await page.getByTestId('branch-select').selectOption('drafts');
+	await page.getByTestId('clone-button').click();
+	await expect(page.getByTestId('local-copy')).toContainText('drafts, 2 files');
+
+	// The other tab's list is stale, and it asks for `main`.
+	await expect(other.getByTestId('branch-select')).toHaveValue('main');
+	await other.getByTestId('clone-button').click();
+
+	await expect(other.getByTestId('local-copy')).toContainText('drafts, 2 files');
+	await expect(other.getByTestId('repo-on-device')).toBeVisible();
+	await page.reload();
+	await expect(page.getByTestId('local-copy')).toContainText('drafts, 2 files');
+});
+
+test.describe('deleting copies', () => {
+	test('sign-out recounts at confirmation, so a copy cloned meanwhile is shown before it is deleted', async ({ page, context }) => {
+		const first = await repoWithBranches();
+		const second = await repoWithBranches();
+		const answers = githubAnswers([
+			{ id: 61, fullName: first.fullName },
+			{ id: 62, fullName: second.fullName }
+		]);
+		await serveApi(page, 'github', GOOD_TOKEN, answers);
+		await serveGit(page, 'github', GOOD_TOKEN);
+		await pasteToken(page);
+		await cloneThroughPicker(page, first.fullName);
+
+		await page.goto('/connect');
+		const github = page.getByTestId('account-github');
+		await github.getByRole('button', { name: 'Sign out' }).click();
+		await expect(page.getByTestId('sign-out-work')).toHaveCount(1);
+		await page.getByTestId('sign-out-github').getByRole('checkbox').check();
+
+		const other = await context.newPage();
+		await serveApi(other, 'github', GOOD_TOKEN, answers);
+		await serveGit(other, 'github', GOOD_TOKEN);
+		await cloneThroughPicker(other, second.fullName);
+		await other.close();
+
+		await github.getByRole('button', { name: 'Sign out and delete' }).click();
+		await expect(page.getByTestId('sign-out-changed')).toBeVisible();
+		await expect(page.getByTestId('sign-out-work')).toHaveCount(2);
+		await expect(page.getByTestId('account-github-status')).toBeVisible();
+		expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('gitnote.repo.')).length)).toBe(2);
+
+		await github.getByRole('button', { name: 'Sign out and delete' }).click();
+		await expect(github.getByLabel('Or paste a token')).toBeVisible();
+		expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('gitnote.repo.')).length)).toBe(0);
+	});
+
+	test('a wipe that fails keeps the sign-in and can be tried again', async ({ page }) => {
+		const { id, fullName } = await repoWithBranches();
+		await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+		await serveGit(page, 'github', GOOD_TOKEN);
+		await pasteToken(page);
+		await cloneThroughPicker(page, fullName);
+
+		await page.goto('/connect');
+		const github = page.getByTestId('account-github');
+		await github.getByRole('button', { name: 'Sign out' }).click();
+		await page.getByTestId('sign-out-github').getByRole('checkbox').check();
+
+		await page.evaluate(() => {
+			/** @type {Record<string, unknown>} */ (/** @type {unknown} */ (window)).restoreDelete = ((original) => () => {
+				IDBObjectStore.prototype.delete = original;
+			})(IDBObjectStore.prototype.delete);
+			IDBObjectStore.prototype.delete = () => {
+				throw new DOMException('storage refused', 'UnknownError');
+			};
+		});
+		await github.getByRole('button', { name: 'Sign out and delete' }).click();
+
+		await expect(page.getByTestId('account-github-error')).toContainText(`Could not delete ${fullName}`);
+		await expect(page.getByTestId('sign-out-github')).toBeVisible();
+		await expect(page.getByTestId('account-github-status')).toBeVisible();
+
+		await page.evaluate(() => /** @type {{ restoreDelete: () => void }} */ (/** @type {unknown} */ (window)).restoreDelete());
+		await github.getByRole('button', { name: 'Sign out and delete' }).click();
+
+		await expect(github.getByLabel('Or paste a token')).toBeVisible();
+		await page.goto('/repos');
+		await expect(page.getByTestId('no-accounts')).toBeVisible();
+		await expect(page.getByTestId('local-copy')).toHaveCount(0);
+	});
+
+	test('the repo page deletes a copy with no account, after saying what it holds', async ({ page }) => {
+		const { id, fullName } = await repoWithBranches();
+		await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+		await serveGit(page, 'github', GOOD_TOKEN);
+		await pasteToken(page);
+		await cloneThroughPicker(page, fullName);
+
+		await page.goto('/connect');
+		const github = page.getByTestId('account-github');
+		await github.getByRole('button', { name: 'Sign out' }).click();
+		await page.getByTestId('sign-out-github').getByRole('button', { name: 'Sign out', exact: true }).click();
+		await expect(github.getByLabel('Or paste a token')).toBeVisible();
+
+		await page.goto('/repos');
+		await expect(page.getByTestId('no-accounts')).toBeVisible();
+		await page.getByRole('button', { name: 'Delete from this device' }).click();
+		await expect(page.getByTestId('remove-copy')).toContainText('0 unpushed commits, 0 uncommitted files');
+
+		// Changing your mind keeps it.
+		await page.getByRole('button', { name: 'Keep it' }).click();
+		await expect(page.getByTestId('local-copy')).toContainText('main, 3 files');
+
+		await page.getByRole('button', { name: 'Delete from this device' }).click();
+		await page.getByRole('button', { name: 'Delete this copy' }).click();
+		await expect(page.getByTestId('local-copy')).toHaveCount(0);
+		await page.reload();
+		await expect(page.getByTestId('no-accounts')).toBeVisible();
+		await expect(page.getByTestId('local-copy')).toHaveCount(0);
+		expect(await dumpBrowserStorage(page)).not.toContain('notes/a.md');
+	});
+
+	test('a clone cut off by a closed tab is listed as unfinished and can be deleted', async ({ page }) => {
+		await page.goto('/repos');
+		await page.evaluate(() => {
+			const id = 'github.com/octo/cut-off';
+			localStorage.setItem(`gitnote.repo.${id}`, JSON.stringify({ id, url: 'https://github.com/octo/cut-off.git', provider: 'github', fullName: 'octo/cut-off', branch: 'main', ready: false }));
+		});
+		await page.reload();
+
+		await expect(page.getByTestId('local-copy-state')).toContainText('clone not finished');
+		await page.getByRole('button', { name: 'Delete from this device' }).click();
+		await page.getByRole('button', { name: 'Delete this copy' }).click();
+		await expect(page.getByTestId('local-copy')).toHaveCount(0);
 	});
 });
 

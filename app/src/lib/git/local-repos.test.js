@@ -4,7 +4,7 @@ import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
 import { memoryStorage } from '../../../test/auth-doubles.js';
 import { createRemote, RELAY_PORT } from '../../../test/remote-repo.js';
 import { createGitHttp } from './http.js';
-import { describeLocalWork, forgetLocalRepo, listLocalRepos, saveLocalRepo } from './local-repos.js';
+import { describeLocalWork, describeWorkCounts, forgetLocalRepo, isSameWork, listLocalRepos, removeLocalCopies, saveLocalRepo } from './local-repos.js';
 import { createRepo } from './repo.js';
 
 /** @type {import('./local-repos.js').LocalRepo} */
@@ -30,6 +30,39 @@ describe('the list of local repos', () => {
 		storage.setItem('gitnote.repo.y', JSON.stringify({ ...ENTRY, provider: 'custom' }));
 
 		expect(listLocalRepos(storage)).toEqual([]);
+	});
+});
+
+describe('removeLocalCopies', () => {
+	it('tries every copy and returns the ones that failed', async () => {
+		const repos = ['a', 'b', 'c'].map((id) => ({ ...ENTRY, id }));
+		/** @type {string[]} */
+		const tried = [];
+
+		const failed = await removeLocalCopies(repos, async (id) => {
+			tried.push(id);
+			if (id === 'a') throw new Error('storage refused');
+		});
+
+		expect(tried).toEqual(['a', 'b', 'c']);
+		expect(failed.map((repo) => repo.id)).toEqual(['a']);
+	});
+});
+
+describe('isSameWork', () => {
+	it('notices a new copy and a changed count', () => {
+		const shown = [{ repo: ENTRY, unpushed: 0, drafts: 0 }];
+
+		expect(isSameWork(shown, [{ repo: { ...ENTRY }, unpushed: 0, drafts: 0 }])).toBe(true);
+		expect(isSameWork(shown, [{ repo: ENTRY, unpushed: 1, drafts: 0 }])).toBe(false);
+		expect(isSameWork(shown, [...shown, { repo: { ...ENTRY, id: 'x' }, unpushed: 0, drafts: 0 }])).toBe(false);
+	});
+});
+
+describe('describeWorkCounts', () => {
+	it('never understates a copy it could not read', () => {
+		expect(describeWorkCounts({ unpushed: null, drafts: null })).toContain('may hold unpushed work');
+		expect(describeWorkCounts({ unpushed: 1, drafts: 2 })).toBe('1 unpushed commit, 2 uncommitted files');
 	});
 });
 
