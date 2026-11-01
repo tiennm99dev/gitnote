@@ -1,6 +1,7 @@
 import { readdir, readFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import { expect, test } from '@playwright/test';
+import { deployProblem } from '../scripts/check-deployable-build.js';
 import { E2E_BUILD_DIR } from './static-server.js';
 
 /** Sign-in client IDs that only the browser tests' build may hold. */
@@ -43,8 +44,5 @@ test('fixture sign-in IDs stay out of the directory the Worker deploys', async (
 test('the deployable directory does not hold an Android build, whose policy allows inline scripts', async () => {
 	const deployed = await readBuild('build');
 	test.skip(deployed === null && !process.env.CI, 'Run `npm run build` first: there is no deployable build to check.');
-	const policy = /<meta http-equiv="content-security-policy" content="([^"]+)"/.exec(String(deployed))?.[1] ?? '';
-	const scriptSrc = policy.split(';').find((part) => part.trim().startsWith('script-src'));
-	expect(scriptSrc, 'after `npm run android:sync`, run `npm run build` before deploying').toBeTruthy();
-	expect(scriptSrc).not.toContain('unsafe-inline');
+	expect(deployProblem(String(deployed)), 'after `npm run android:sync`, run `npm run build` before these tests').toBeNull();
 });

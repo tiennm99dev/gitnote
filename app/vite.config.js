@@ -70,7 +70,7 @@ export default defineConfig({
 	test: {
 		expect: { requireAssertions: true },
 		environment: 'node',
-		include: ['src/**/*.{test,spec}.js', 'e2e/**/*.test.js'],
+		include: ['src/**/*.{test,spec}.js', 'e2e/**/*.test.js', 'scripts/**/*.test.js'],
 		// A local git server and the real relay in front of it.
 		globalSetup: ['test/git-fixture-setup.js'],
 		testTimeout: 30_000,
