@@ -57,39 +57,49 @@ export function callbackQuery(url) {
  * Takes sign-in callbacks from both ways Android delivers them: `appUrlOpen` when
  * the app is alive, `getLaunchUrl` when the callback launched it.
  *
- * Android hands the original launch intent back whenever the task is recreated
- * from Recents, so a launch URL may be a sign-in that finished days ago. One whose
- * sign-in is not awaited is dropped quietly. An `appUrlOpen` is always a new event,
- * so it goes on to the callback page, which reports what is wrong with it.
+ * Any website or app can fire this link, so one this device is not waiting for
+ * stays out of the way: it must not leave the open page, and must not close the
+ * Custom Tab of a real sign-in. An `appUrlOpen` like that is reported. A launch URL
+ * like that is dropped quietly, because Android hands the original launch intent
+ * back whenever the task is recreated from Recents, so it may be a sign-in that
+ * finished days ago.
  * @param {object} options
  * @param {(url: string) => boolean} options.isAwaited whether this device is waiting for that callback
  * @param {(query: string) => unknown} options.open shows the callback page with this query
+ * @param {() => void} options.ignored tells the user a sign-in link was not used
  * @param {Pick<typeof App, 'addListener' | 'getLaunchUrl'>} [options.app]
  * @param {Pick<typeof Browser, 'close'>} [options.browser]
  * @returns {() => void} stops listening
  */
-export function watchSignInReturn({ isAwaited, open, app = App, browser = Browser }) {
+export function watchSignInReturn({ isAwaited, open, ignored, app = App, browser = Browser }) {
 	/**
 	 * Android can report one launch both ways.
 	 * @type {Set<string>}
 	 */
 	const delivered = new Set();
 
-	/** @param {string} url */
-	const deliver = (url) => {
+	/**
+	 * @param {string} url
+	 * @param {() => void} [unawaited]
+	 */
+	const receive = (url, unawaited) => {
 		const query = callbackQuery(url);
 		if (query === null || delivered.has(url)) return;
+		if (!isAwaited(url)) {
+			unawaited?.();
+			return;
+		}
 		delivered.add(url);
 		// The tab may already be gone, and leaving it open harms nothing.
 		browser.close().catch(() => undefined);
 		open(query);
 	};
 
-	const listening = app.addListener('appUrlOpen', ({ url }) => deliver(url));
+	const listening = app.addListener('appUrlOpen', ({ url }) => receive(url, ignored));
 	app
 		.getLaunchUrl()
 		.then((launch) => {
-			if (launch?.url && callbackQuery(launch.url) !== null && isAwaited(launch.url)) deliver(launch.url);
+			if (launch?.url) receive(launch.url);
 		})
 		.catch((/** @type {unknown} */ error) => console.error('Could not read the launch URL.', error));
 	listening.catch((/** @type {unknown} */ error) => console.error('Could not listen for app links.', error));

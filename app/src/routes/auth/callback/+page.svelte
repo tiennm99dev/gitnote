@@ -1,21 +1,28 @@
 <script>
-	import { onMount } from 'svelte';
-	import { goto, replaceState } from '$app/navigation';
+	import { afterNavigate, goto, replaceState } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { authSession } from '#lib/auth/index.js';
 
 	/** @type {string | null} */
 	let failure = $state(null);
 
-	onMount(async () => {
+	/** Tells the latest callback from one still waiting on the provider. */
+	let attempts = 0;
+
+	// SvelteKit keeps this component when a second callback arrives while it shows the
+	// first one's outcome, so each navigation is handled here rather than on mount.
+	afterNavigate(async () => {
+		attempts += 1;
+		const attempt = attempts;
+		failure = null;
 		const callbackUrl = location.href;
 		// The code should not stay in the address bar or the history.
 		replaceState(resolve('/auth/callback'), {});
 		try {
 			await authSession.completeSignIn(callbackUrl);
-			await goto(resolve('/repos'), { replaceState: true });
+			if (attempt === attempts) await goto(resolve('/repos'), { replaceState: true });
 		} catch (error) {
-			failure = error instanceof Error ? error.message : 'The sign-in failed.';
+			if (attempt === attempts) failure = error instanceof Error ? error.message : 'The sign-in failed.';
 		}
 	});
 </script>

@@ -9,6 +9,7 @@
 	import { getStorageUsage, repoIdForUrl } from '#lib/git/fs.js';
 	import { checkRepoSize, formatBytes } from '#lib/git/limits.js';
 	import { describeWorkCounts, listLocalRepos, saveLocalRepo, settleFailedClone } from '#lib/git/local-repos.js';
+	import { watchAppLifecycle } from '#lib/platform/native.js';
 
 	/** @typedef {import('#lib/auth/session.js').RemoteRepo} RemoteRepo */
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
@@ -128,6 +129,22 @@
 		}
 	};
 
+	/**
+	 * Installing the GitHub App happens in the device's browser and ends on the web
+	 * app, so coming back to the Android app is the only sign the list has changed.
+	 * This keeps the search and the selection, and a failed read keeps the list shown.
+	 */
+	const refreshRepos = async () => {
+		const id = provider;
+		if (!id || accounts.find((item) => item.provider === id)?.needsSignIn) return;
+		try {
+			const answer = await authSession.listRepos(id);
+			if (provider === id) list = answer;
+		} catch (error) {
+			console.warn('Could not refresh the repository list.', error);
+		}
+	};
+
 	/** @param {RemoteRepo} repo */
 	const select = async (repo) => {
 		selected = repo;
@@ -225,6 +242,8 @@
 		}
 		await loadCopies();
 	};
+
+	onMount(() => watchAppLifecycle({ pause: () => undefined, resume: refreshRepos }));
 
 	onMount(async () => {
 		try {

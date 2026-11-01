@@ -39,22 +39,58 @@ describe('callbackQuery', () => {
 });
 
 describe('watchSignInReturn', () => {
-	it('opens the callback page for a link that arrives while the app is alive, and closes the tab', async () => {
+	it('opens the callback page for an awaited link that arrives while the app is alive, and closes the tab', async () => {
 		const { app, browser, listeners } = nativeDouble();
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: () => false, open, app, browser });
+		const ignored = vi.fn();
+		watchSignInReturn({ isAwaited: () => true, open, ignored, app, browser });
 		await vi.waitFor(() => expect(listeners.has('appUrlOpen')).toBe(true));
 
 		listeners.get('appUrlOpen')?.({ url: CALLBACK });
 
 		expect(open).toHaveBeenCalledExactlyOnceWith('?code=abc&state=xyz');
 		expect(browser.close).toHaveBeenCalledOnce();
+		expect(ignored).not.toHaveBeenCalled();
+	});
+
+	it('reports a link nobody is waiting for without leaving the page or closing the real sign-in tab', async () => {
+		const { app, browser, listeners } = nativeDouble();
+		const open = vi.fn();
+		const ignored = vi.fn();
+		const awaited = new Set([CALLBACK]);
+		watchSignInReturn({ isAwaited: (url) => awaited.has(url), open, ignored, app, browser });
+		await vi.waitFor(() => expect(listeners.has('appUrlOpen')).toBe(true));
+
+		listeners.get('appUrlOpen')?.({ url: `${NATIVE_REDIRECT_URI}?code=forged&state=none` });
+
+		expect(ignored).toHaveBeenCalledOnce();
+		expect(open).not.toHaveBeenCalled();
+		expect(browser.close).not.toHaveBeenCalled();
+
+		listeners.get('appUrlOpen')?.({ url: CALLBACK });
+
+		expect(open).toHaveBeenCalledExactlyOnceWith('?code=abc&state=xyz');
+	});
+
+	it('does not report the second delivery of a callback already handled', async () => {
+		const { app, browser, listeners } = nativeDouble();
+		const ignored = vi.fn();
+		const awaited = new Set([CALLBACK]);
+		const open = vi.fn(() => awaited.clear());
+		watchSignInReturn({ isAwaited: (url) => awaited.has(url), open, ignored, app, browser });
+		await vi.waitFor(() => expect(listeners.has('appUrlOpen')).toBe(true));
+
+		listeners.get('appUrlOpen')?.({ url: CALLBACK });
+		listeners.get('appUrlOpen')?.({ url: CALLBACK });
+
+		expect(open).toHaveBeenCalledOnce();
+		expect(ignored).not.toHaveBeenCalled();
 	});
 
 	it('ignores any other link', async () => {
 		const { app, browser, listeners } = nativeDouble();
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: () => true, open, app, browser });
+		watchSignInReturn({ isAwaited: () => true, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(listeners.has('appUrlOpen')).toBe(true));
 
 		listeners.get('appUrlOpen')?.({ url: 'gitnote://oauth/other?code=a' });
@@ -66,7 +102,7 @@ describe('watchSignInReturn', () => {
 	it('finishes a sign-in whose callback launched the app', async () => {
 		const { app, browser } = nativeDouble({ launchUrl: CALLBACK });
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: (url) => url === CALLBACK, open, app, browser });
+		watchSignInReturn({ isAwaited: (url) => url === CALLBACK, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(open).toHaveBeenCalledExactlyOnceWith('?code=abc&state=xyz'));
 	});
 
@@ -74,7 +110,7 @@ describe('watchSignInReturn', () => {
 		const { app, browser } = nativeDouble({ launchUrl: CALLBACK });
 		const open = vi.fn();
 		const isAwaited = vi.fn(() => false);
-		watchSignInReturn({ isAwaited, open, app, browser });
+		watchSignInReturn({ isAwaited, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(isAwaited).toHaveBeenCalled());
 		expect(open).not.toHaveBeenCalled();
 	});
@@ -82,7 +118,7 @@ describe('watchSignInReturn', () => {
 	it('delivers a callback once when Android reports it both ways', async () => {
 		const { app, browser, listeners } = nativeDouble({ launchUrl: CALLBACK });
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: () => true, open, app, browser });
+		watchSignInReturn({ isAwaited: () => true, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(open).toHaveBeenCalledOnce());
 
 		listeners.get('appUrlOpen')?.({ url: CALLBACK });
@@ -94,7 +130,7 @@ describe('watchSignInReturn', () => {
 		const { app, browser, listeners } = nativeDouble();
 		browser.close.mockRejectedValue(new Error('no tab'));
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: () => true, open, app, browser });
+		watchSignInReturn({ isAwaited: () => true, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(listeners.has('appUrlOpen')).toBe(true));
 
 		listeners.get('appUrlOpen')?.({ url: CALLBACK });
@@ -106,7 +142,7 @@ describe('watchSignInReturn', () => {
 		const { app, browser, listeners } = nativeDouble({ launchFails: true });
 		const logged = vi.spyOn(console, 'error').mockImplementation(() => undefined);
 		const open = vi.fn();
-		watchSignInReturn({ isAwaited: () => true, open, app, browser });
+		watchSignInReturn({ isAwaited: () => true, open, ignored: vi.fn(), app, browser });
 		await vi.waitFor(() => expect(logged).toHaveBeenCalled());
 		logged.mockRestore();
 
@@ -117,7 +153,7 @@ describe('watchSignInReturn', () => {
 
 	it('removes its listener when stopped', async () => {
 		const { app, browser, remove } = nativeDouble();
-		const stop = watchSignInReturn({ isAwaited: () => true, open: vi.fn(), app, browser });
+		const stop = watchSignInReturn({ isAwaited: () => true, open: vi.fn(), ignored: vi.fn(), app, browser });
 		stop();
 		await vi.waitFor(() => expect(remove).toHaveBeenCalledOnce());
 	});

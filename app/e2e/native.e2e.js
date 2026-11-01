@@ -152,7 +152,7 @@ test('a callback that launches the app finishes the sign-in, and the same launch
 	expect(exchange.body).toBeNull();
 });
 
-test('an app link this device did not ask for shows an error, and other links do nothing', async ({ page }) => {
+test('an app link this device did not ask for stays on the page and says so, and other links do nothing', async ({ page }) => {
 	const device = await installNativeShell(page);
 	await page.goto(`${NATIVE_ORIGIN}/connect`);
 	await expect.poll(() => device.isListening('appUrlOpen')).toBe(true);
@@ -160,10 +160,76 @@ test('an app link this device did not ask for shows an error, and other links do
 	await device.fire('appUrlOpen', { url: 'gitnote://oauth/elsewhere?code=stolen&state=none' });
 	await page.waitForTimeout(250);
 	await expect(page).toHaveURL(`${NATIVE_ORIGIN}/connect`);
+	await expect(page.getByTestId('sign-in-link-ignored')).toBeHidden();
 
 	await device.fire('appUrlOpen', { url: `${CALLBACK}?code=stolen&state=none` });
-	await expect(page.getByTestId('callback-error')).toContainText('did not start on this device');
+	await expect(page.getByTestId('sign-in-link-ignored')).toBeVisible();
+	await expect(page).toHaveURL(`${NATIVE_ORIGIN}/connect`);
 	expect(device.secure.size).toBe(0);
+
+	await page.getByTestId('sign-in-link-ignored').getByRole('button', { name: 'Dismiss' }).click();
+	await expect(page.getByTestId('sign-in-link-ignored')).toBeHidden();
+});
+
+test('a forged app link during a sign-in leaves the real one to finish, and clears its code', async ({ page }) => {
+	const device = await installNativeShell(page);
+	await serveApi(page, 'github', GOOD_TOKEN, { '/user/installations?per_page=100&page=1': { installations: [] } });
+	const exchange = await serveGithubExchange(page);
+	const authorize = await startSignIn(page, device, 'Sign in with GitHub');
+	await expect.poll(() => device.isListening('appUrlOpen')).toBe(true);
+
+	await device.fire('appUrlOpen', { url: `${CALLBACK}?code=forged&state=none` });
+	await expect(page.getByTestId('sign-in-link-ignored')).toBeVisible();
+	expect(device.tabCloses()).toBe(0);
+
+	await device.fire('appUrlOpen', { url: returnLink(authorize) });
+	await expect(page).toHaveURL(`${NATIVE_ORIGIN}/repos`);
+	expect(exchange.body?.code).toBe('e2e-code');
+	expect([...device.secure.values()][0]).toContain(GOOD_TOKEN);
+	await expect(page.getByTestId('sign-in-link-ignored')).toBeHidden();
+});
+
+test('the callback page handles a second sign-in that returns while it shows the first one failing', async ({ page }) => {
+	const device = await installNativeShell(page);
+	await serveApi(page, 'gitlab', GOOD_TOKEN, { '/projects?membership=true&simple=false&statistics=true&order_by=last_activity_at&per_page=100&page=1': [] });
+	await page.route(`${RELAY}/api/oauth/github/token`, (route) => route.fulfill({ status: 502, contentType: 'application/json', headers: { 'access-control-allow-origin': NATIVE_ORIGIN }, body: '{"error":"bad_gateway","message":"down"}' }));
+	await page.route('https://gitlab.com/oauth/token', (route) => route.fulfill({ status: 200, contentType: 'application/json', headers: { 'access-control-allow-origin': '*' }, body: JSON.stringify(TOKEN_ANSWER) }));
+
+	const github = await startSignIn(page, device, 'Sign in with GitHub');
+	const gitlab = await startSignIn(page, device, 'Sign in with GitLab');
+	await expect.poll(() => device.isListening('appUrlOpen')).toBe(true);
+
+	await device.fire('appUrlOpen', { url: returnLink(github) });
+	await expect(page.getByTestId('callback-error')).toBeVisible();
+	await expect(page).toHaveURL(`${NATIVE_ORIGIN}/auth/callback`);
+
+	await device.fire('appUrlOpen', { url: returnLink(gitlab) });
+	await expect(page).toHaveURL(`${NATIVE_ORIGIN}/repos`);
+	expect([...device.secure.values()][0]).toContain(GOOD_TOKEN);
+});
+
+test('coming back to the app re-reads the repository list, so a new GitHub App install shows up', async ({ page }) => {
+	const device = await installNativeShell(page);
+	const signedIn = { '/user/installations?per_page=100&page=1': { installations: [] } };
+	await serveApi(page, 'github', GOOD_TOKEN, { ...signedIn, '/user/repos?per_page=100&sort=updated&page=1': [] });
+
+	await page.goto(`${NATIVE_ORIGIN}/connect`);
+	const github = page.getByTestId('account-github');
+	await github.getByLabel('Or paste a token').fill(GOOD_TOKEN);
+	await github.getByRole('button', { name: 'Check and save' }).click();
+	await expect(page.getByTestId('account-github-status')).toContainText('octo');
+	await page.getByRole('link', { name: 'Repositories' }).click();
+	await expect(page.getByTestId('no-repos')).toBeVisible();
+	await expect.poll(() => device.isListening('resume')).toBe(true);
+
+	await serveApi(page, 'github', GOOD_TOKEN, {
+		...signedIn,
+		'/user/repos?per_page=100&sort=updated&page=1': [{ id: 41, full_name: 'octo/notes', default_branch: 'main', size: 12, private: true }]
+	});
+	await device.fire('resume');
+
+	await expect(page.getByTestId('repo-option')).toHaveText(/octo\/notes/);
+	await expect(page.getByTestId('no-repos')).toBeHidden();
 });
 
 test('git goes through the relay by its full address, and pausing commits locally, then resuming pushes', async ({ page }) => {
@@ -195,7 +261,9 @@ test('git goes through the relay by its full address, and pausing commits locall
 	await expect(page.getByTestId('account-github-status')).toContainText('octo');
 	expect([...device.secure.values()][0]).toContain(GOOD_TOKEN);
 
-	// A clone across origins only works if the real relay answers this origin's CORS.
+	// Playwright answers the preflight of a routed request itself, so the relay's real
+	// answer here is only the final Access-Control-Allow-Origin. Its preflight has its
+	// own test, against the headers a real clone sends, in `lib/git/http.test.js`.
 	await page.getByRole('link', { name: 'Repositories' }).click();
 	await page.getByTestId('repo-option').click();
 	await page.getByTestId('clone-button').click();
