@@ -110,13 +110,30 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
 - **Shallow only once.** The clone uses `depth: 1`; later fetches pass no
   depth, because a depth-limited fetch leaves a diverged branch with no merge
   base.
-- **Pull** runs only on a clean tree. A conflict is a result, not an error:
-  the working tree gets diff3 markers, the index the unmerged entries, and the
-  branch does not move. isomorphic-git writes no `MERGE_HEAD`, so the merge is
-  stored in `gitnote-merge.json` in the git directory, where a reload finds it.
-  A binary file keeps our bytes, and lands in `binaryPaths` for an ours/theirs
-  choice. Files that are not valid UTF-8 count as binary, because a line merge
-  would damage them.
+- **Pull** runs only on a clean tree, and takes `signal` to cancel. Its fetch
+  runs outside the repo lock, so saving a draft never waits for the network; a
+  draft saved during the fetch makes the merge refuse, and the next pull reuses
+  what was fetched. An ignored local file the remote now tracks refuses the
+  pull with `checkout_conflict` before anything moves.
+- **A conflict is a result, not an error.** The branch does not move. The index
+  holds the merge's result with unmerged entries for the conflicted paths, and
+  `status` lists those paths plus any edit made on top. isomorphic-git writes
+  no `MERGE_HEAD`, so the merge is stored in `gitnote-merge.json` in the git
+  directory, where a reload finds it. `merge.conflicts` says what each side did
+  to each path (`both_modified`, `deleted_by_us`, `deleted_by_theirs`) and
+  whether it is binary. Only `both_modified` text gets diff3 markers; a binary
+  file or one side's deletion keeps one side's exact bytes. Files that are not
+  valid UTF-8 count as binary, because a line merge would damage them.
+- **Finishing a merge.** `resolveConflict` picks ours or theirs for a path,
+  `completeMerge` makes the two-parent commit, refusing while markers remain
+  unless `allowMarkers` is set, and `abortMerge` goes back to our commit and
+  discards any resolution in progress. Never commit a merge any other way: the
+  engine owns the merge's tree.
+- **Interrupted work.** A pull records itself and flushes before it changes
+  anything. If it fails, or the tab dies, the first later operation puts the
+  branch, working tree and index back to our commit, and the next pull starts
+  over. A clone counts only once `gitnote.defaultBranch` is written, its last
+  step; a later `clone` clears what an interrupted one left.
 - **Size limits** are a table in `limits.js`, checked before any network call:
 
   | Check | GitHub | GitLab.com |
@@ -126,13 +143,17 @@ parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
   | Block per push | over 95 MB (relay cap) | over 95 MB (relay cap) |
 
   The push size is an estimate: the summed size of the blobs the unpushed
-  commits add.
+  commits add. It leaves out trees and commits, so a push just under the cap
+  can still get a 413 from the relay, which is mapped to the same message.
 - **Writes** go through `writeFile`, which swaps in a new file. isomorphic-git
   judges a file unchanged by size, whole-second mtime and inode, so writing in
-  place could hide a same-size edit.
-- **Durability and locks.** Every operation holds a per-repo Web Lock, and one
-  that changes data flushes LightningFS's superblock before it resolves, so a
-  commit survives the tab closing right after.
+  place could hide a same-size edit. The old file is deleted only after the new
+  one is flushed, because LightningFS deletes an unlinked file's data at once.
+- **Durability and locks.** Every operation except pull's fetch holds a per-repo
+  Web Lock, and one that changes data flushes LightningFS's superblock before
+  it resolves, so a commit survives the tab closing right after.
+- **Credentials** never go in the repo. `clone` and `repoIdForUrl` refuse a URL
+  with a username or token, which would otherwise be stored in plain text.
 
 Failures are `GitEngineError`s with a stable `code` and a readable message
 (`errors.js`).

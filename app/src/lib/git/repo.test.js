@@ -1,7 +1,10 @@
+import git from 'isomorphic-git';
+import { symlink, writeFile } from 'node:fs/promises';
+import path from 'node:path';
 import { memfs } from 'memfs';
 import { describe, expect, it, vi } from 'vitest';
 import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
-import { createRemote, pushFromElsewhere, rejectPushes, RELAY_PORT, remoteHead, runGit, showRemote } from '../../../test/remote-repo.js';
+import { createRemote, changeElsewhere, nativeBlobHash as runGitHash, pushFromElsewhere, rejectPushes, RELAY_PORT, remoteHead, runGit, showRemote } from '../../../test/remote-repo.js';
 import { ErrorCode, GitEngineError } from './errors.js';
 import { createGitHttp } from './http.js';
 import { createRepo, normalizePath } from './repo.js';
@@ -86,6 +89,51 @@ async function commitFile(repo, path, content) {
 	return oid;
 }
 
+/**
+ * Makes matching writes to the file system fail, as a full quota would.
+ * @param {FsClient} fs
+ * @param {(path: string, data: unknown) => boolean} matches
+ * @returns {() => void} stops the failures
+ */
+function failWrites(fs, matches) {
+	const original = fs.promises.writeFile;
+	fs.promises.writeFile = (/** @type {string} */ path, /** @type {unknown} */ data, /** @type {unknown} */ options) => {
+		if (matches(path, data)) return Promise.reject(Object.assign(new Error(`ENOSPC: no space left, ${path}`), { code: 'ENOSPC' }));
+		return original.call(fs.promises, path, data, options);
+	};
+	return () => {
+		fs.promises.writeFile = original;
+	};
+}
+
+/**
+ * Pushes a repo that just finished a merge and reads the commit back with
+ * native git, the independent witness of the merge's tree.
+ * @param {import('../../../test/remote-repo.js').Remote} remote
+ * @param {import('./repo.js').Repo} repo
+ * @returns {Promise<string[]>} the tree's file paths on the remote
+ */
+async function pushedTree(remote, repo) {
+	expect((await repo.push()).pushed).toBe(true);
+	await runGit(['fsck', '--no-dangling'], remote.bare);
+	return (await runGit(['ls-tree', '-r', '--name-only', 'main'], remote.bare)).trim().split('\n');
+}
+
+/**
+ * A repo with one commit on each side that clash over one file, plus the
+ * remote changes in `theirs`.
+ * @param {Record<string, string | Uint8Array>} seed
+ * @param {Record<string, string | Uint8Array>} theirs
+ * @param {(work: string) => Promise<void>} [theirsExtra] more changes to the remote's clone
+ * @returns {ReturnType<typeof clonedRepo>}
+ */
+async function divergedRepo(seed, theirs, theirsExtra) {
+	const cloned = await clonedRepo({ ...seed, 'clash.md': 'line\n' });
+	await changeElsewhere(cloned.remote, { ...theirs, 'clash.md': 'theirs\n' }, theirsExtra);
+	await commitFile(cloned.repo, 'clash.md', 'ours\n');
+	return cloned;
+}
+
 describe('clone', () => {
 	it('checks out the default branch shallowly and records it', async () => {
 		const remote = await createRemote({ 'README.md': 'seed\n', 'notes/a.md': '# a\n' });
@@ -127,6 +175,79 @@ describe('clone', () => {
 		expect(error.code).toBe(ErrorCode.CANCELLED);
 		expect(await repo.isCloned()).toBe(false);
 		expect((await repo.clone({ url: remote.url })).branch).toBe('main');
+	});
+
+	it('recovers from an interrupted clone, which no catch block ever saw', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const fs = /** @type {FsClient} */ (/** @type {unknown} */ (memfs().fs));
+		const repo = openRepo(remote, { fs });
+		// What a tab that died mid-download leaves behind.
+		await fs.promises.mkdir('/repo');
+		await git.init({ fs, dir: '/repo', defaultBranch: 'main' });
+		await git.addRemote({ fs, dir: '/repo', remote: 'origin', url: remote.url });
+		await fs.promises.writeFile('/repo/left-over.md', 'partial\n');
+
+		expect(await repo.isCloned()).toBe(false);
+		expect((await rejection(repo.status())).code).toBe(ErrorCode.NOT_CLONED);
+		expect((await rejection(repo.aheadBehind())).code).toBe(ErrorCode.NOT_CLONED);
+		expect((await rejection(repo.pull({ author: AUTHOR }))).code).toBe(ErrorCode.NOT_CLONED);
+		expect((await rejection(repo.readText('left-over.md'))).code).toBe(ErrorCode.NOT_CLONED);
+
+		expect((await repo.clone({ url: remote.url })).branch).toBe('main');
+		expect((await repo.status()).clean).toBe(true);
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['README.md']);
+	});
+
+	it('keeps a complete clone when the optional storage request fails', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const repo = openRepo(remote, { storage: { persist: () => Promise.reject(new Error('denied')) } });
+
+		expect((await repo.clone({ url: remote.url })).persisted).toBeNull();
+		expect(await repo.isCloned()).toBe(true);
+	});
+
+	it('asks the browser for persistent storage when the caller says nothing', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const persist = vi.fn(async () => true);
+		vi.stubGlobal('navigator', { storage: { persist } });
+		try {
+			expect((await openRepo(remote).clone({ url: remote.url })).persisted).toBe(true);
+			expect(persist).toHaveBeenCalledOnce();
+		} finally {
+			vi.unstubAllGlobals();
+		}
+	});
+
+	it('refuses a URL with a credential before storing anything', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const fs = /** @type {FsClient} */ (/** @type {unknown} */ (memfs().fs));
+		const counted = countingHttp();
+		const repo = openRepo(remote, { fs, http: counted.http });
+
+		const error = await rejection(repo.clone({ url: remote.url.replace('http://', 'http://x-access-token:SECRET@') }));
+
+		expect(error.code).toBe(ErrorCode.INVALID_ARGUMENT);
+		expect(counted.requests()).toBe(0);
+		expect(await repo.isCloned()).toBe(false);
+		await expect(fs.promises.lstat('/repo')).rejects.toMatchObject({ code: 'ENOENT' });
+	});
+
+	it.each(['not a url', 'ssh://github.com/o/r.git'])('refuses the URL %j', async (url) => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		expect((await rejection(openRepo(remote).clone({ url }))).code).toBe(ErrorCode.INVALID_ARGUMENT);
+	});
+
+	it('reports any abort as a cancel, whatever its reason', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const controller = new AbortController();
+		const repo = openRepo(remote);
+
+		const error = await rejection(
+			repo.clone({ url: remote.url, onProgress: () => controller.abort(new Error('user left')), signal: controller.signal })
+		);
+
+		expect(error.code).toBe(ErrorCode.CANCELLED);
+		expect(await repo.isCloned()).toBe(false);
 	});
 
 	it('refuses to clone over an existing clone', async () => {
@@ -188,6 +309,35 @@ describe('working tree', () => {
 		const { repo } = await clonedRepo({ 'a.md': 'same\n' });
 		await repo.writeFile('a.md', 'same\n');
 		expect((await repo.status()).clean).toBe(true);
+	});
+
+	it('deletes the old file only after the file system has saved the new one', async () => {
+		const { repo, fs } = await clonedRepo({ 'a.md': 'old\n' });
+		/** @type {string[]} */
+		const events = [];
+		const promises = /** @type {{ flush?: () => Promise<void>, unlink: (path: string) => Promise<void> }} */ (/** @type {unknown} */ (fs.promises));
+		const unlink = promises.unlink;
+		promises.flush = async () => void events.push('flush');
+		promises.unlink = (path) => {
+			events.push(`unlink ${path}`);
+			return unlink.call(fs.promises, path);
+		};
+
+		await repo.writeFile('a.md', 'new\n');
+
+		expect(events).toEqual(['flush', 'unlink /repo/.git/gitnote-write.bak', 'flush']);
+		expect(await repo.readText('a.md')).toBe('new\n');
+	});
+
+	it('clears a backup a closed tab left behind', async () => {
+		const { repo, fs } = await clonedRepo({ 'a.md': 'old\n' });
+		await fs.promises.writeFile('/repo/.git/gitnote-write.bak', 'stale');
+
+		await repo.writeFile('a.md', 'new\n');
+		await repo.writeFile('fresh.md', 'new\n');
+
+		await expect(fs.promises.lstat('/repo/.git/gitnote-write.bak')).rejects.toMatchObject({ code: 'ENOENT' });
+		expect(await repo.readText('a.md')).toBe('new\n');
 	});
 
 	it('round-trips bytes unchanged', async () => {
@@ -444,7 +594,8 @@ describe('pull', () => {
 			expect(await repo.readText(path)).toBe(content);
 		}
 		expect((await repo.status()).clean).toBe(true);
-		expect((await repo.aheadBehind()).behind).toBe(0);
+		// The local commit and the merge commit; the remote has the shallow boundary.
+		expect(await repo.aheadBehind()).toEqual({ branch: 'main', ahead: 2, behind: 0, hasRemote: true });
 
 		expect((await repo.push()).pushed).toBe(true);
 		const parents = await runGit(['log', '-1', '--format=%p', 'main'], remote.bare);
@@ -508,6 +659,7 @@ describe('pull', () => {
 		});
 		expect(await repo.readText('clash.md')).toBe('<<<<<<< main\nours\n=======\ntheirs\n>>>>>>> origin/main\n');
 		expect(await repo.readText('calm.md')).toBe('calm remote\n');
+		expect((await repo.status()).files).toEqual([{ path: 'clash.md', change: 'modified' }]);
 		const ahead = await repo.aheadBehind();
 		expect(ahead.ahead).toBe(1);
 		expect(ahead.behind).toBe(1);
@@ -598,6 +750,443 @@ describe('pull', () => {
 		expect(result.status).toBe('conflict');
 		expect(Buffer.from(await repo.readFile('data.bin')).equals(ours)).toBe(true);
 	});
+
+	it('takes a stalled fetch off the lock: a save completes and the pull cancels', async () => {
+		const remote = await createRemote({ 'a.md': 'seed\n' });
+		const http = createGitHttp({ relayOrigin: RELAY_ORIGIN });
+		let stalled = false;
+		const repo = openRepo(remote, {
+			http: {
+				request: (request) =>
+					stalled
+						? new Promise((_resolve, reject) => {
+								request.signal?.addEventListener('abort', () => reject(request.signal?.reason));
+							})
+						: http.request(request)
+			}
+		});
+		await repo.clone({ url: remote.url });
+		await pushFromElsewhere(remote, { 'a.md': 'remote\n' }, 'remote edit');
+		stalled = true;
+		const controller = new AbortController();
+
+		const pulling = rejection(repo.pull({ author: AUTHOR, signal: controller.signal }));
+		await repo.writeFile('draft.md', 'saved during the stall\n');
+		expect(await repo.readText('draft.md')).toBe('saved during the stall\n');
+		controller.abort(new Error('user left'));
+
+		expect((await pulling).code).toBe(ErrorCode.CANCELLED);
+		expect(await repo.readText('a.md')).toBe('seed\n');
+		expect((await repo.aheadBehind()).behind).toBe(0);
+	});
+
+	it('refuses to merge over a draft saved during the fetch, and keeps what it fetched', async () => {
+		const remote = await createRemote({ 'a.md': 'seed\n' });
+		const http = createGitHttp({ relayOrigin: RELAY_ORIGIN });
+		/** @type {null | (() => Promise<void>)} */
+		let beforeRequest = null;
+		const repo = openRepo(remote, {
+			http: {
+				request: async (request) => {
+					const hook = beforeRequest;
+					beforeRequest = null;
+					await hook?.();
+					return http.request(request);
+				}
+			}
+		});
+		await repo.clone({ url: remote.url });
+		await pushFromElsewhere(remote, { 'a.md': 'remote\n' }, 'remote edit');
+		beforeRequest = () => repo.writeFile('a.md', 'my draft\n');
+
+		expect((await rejection(repo.pull({ author: AUTHOR }))).code).toBe(ErrorCode.DIRTY_TREE);
+
+		expect(await repo.readText('a.md')).toBe('my draft\n');
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 0, behind: 1 });
+	});
+});
+
+describe('conflict state', () => {
+	it('records what each side did, for text and binary files, in both delete directions', async () => {
+		const bytes = Uint8Array.from([0, 255, 1, 10]);
+		const { remote, repo } = await clonedRepo({ 'we-keep.md': 'base\n', 'we-keep.bin': bytes, 'they-keep.md': 'base\n', 'they-keep.bin': bytes });
+		const theirText = 'theirs\n';
+		const theirBytes = Uint8Array.from([0, 254, 2, 10]);
+		await changeElsewhere(remote, { 'they-keep.md': theirText, 'they-keep.bin': theirBytes }, async (work) => {
+			await runGit(['rm', '--quiet', 'we-keep.md', 'we-keep.bin'], work);
+		});
+		const ourBytes = Uint8Array.from([0, 253, 3, 10]);
+		await repo.writeFile('we-keep.md', 'ours\n');
+		await repo.writeFile('we-keep.bin', ourBytes);
+		await repo.remove('they-keep.md');
+		await repo.remove('they-keep.bin');
+		await repo.commit({ paths: ['we-keep.md', 'we-keep.bin', 'they-keep.md', 'they-keep.bin'], message: 'local', author: AUTHOR });
+
+		const result = await repo.pull({ author: AUTHOR });
+
+		expect(result.status).toBe('conflict');
+		if (result.status !== 'conflict') return;
+		expect(result.merge.conflicts).toEqual([
+			{ path: 'they-keep.bin', kind: 'deleted_by_us', binary: true },
+			{ path: 'they-keep.md', kind: 'deleted_by_us', binary: false },
+			{ path: 'we-keep.bin', kind: 'deleted_by_theirs', binary: true },
+			{ path: 'we-keep.md', kind: 'deleted_by_theirs', binary: false }
+		]);
+		expect(result.merge.binaryPaths).toEqual(['they-keep.bin', 'we-keep.bin']);
+		expect(await repo.readText('they-keep.md')).toBe(theirText);
+		expect([...(await repo.readFile('they-keep.bin'))]).toEqual([...theirBytes]);
+		expect(await repo.readText('we-keep.md')).toBe('ours\n');
+		expect([...(await repo.readFile('we-keep.bin'))]).toEqual([...ourBytes]);
+		expect((await repo.status()).files.map((file) => file.path)).toEqual(['they-keep.bin', 'they-keep.md', 'we-keep.bin', 'we-keep.md']);
+	});
+
+	it('starts each marker on its own line in a note with no final newline', async () => {
+		const { remote, repo } = await clonedRepo({ 'n.md': 'base' });
+		await pushFromElsewhere(remote, { 'n.md': 'theirs' }, 'remote edit');
+		await commitFile(repo, 'n.md', 'ours');
+
+		await repo.pull({ author: AUTHOR });
+
+		expect(await repo.readText('n.md')).toBe('<<<<<<< main\nours\n=======\ntheirs\n>>>>>>> origin/main\n');
+	});
+});
+
+describe('completeMerge', () => {
+	it('keeps every clean remote change alongside a conflict, read back with native git', async () => {
+		const bytes = Uint8Array.from([0, 255, 1, 10]);
+		const theirBytes = Uint8Array.from([0, 254, 2, 10]);
+		const { remote, repo } = await divergedRepo(
+			{ 'calm.md': 'calm\n', 'gone.md': 'gone\n', 'folder/only.md': 'only\n', 'pic.bin': bytes, 'same.bin': bytes, 'both.md': 'one\ntwo\nthree\nfour\n' },
+			{ 'calm.md': 'calm remote\n', 'added.md': 'added\n', 'deep/er/new.md': 'new\n', 'pic.bin': theirBytes, 'both.md': 'ONE\ntwo\nthree\nfour\n' },
+			async (work) => {
+				await runGit(['rm', '--quiet', 'gone.md', 'folder/only.md'], work);
+			}
+		);
+		await commitFile(repo, 'both.md', 'one\ntwo\nthree\nFOUR\n');
+		await commitFile(repo, 'ours-only.md', 'ours only\n');
+		const theirsOid = await remoteHead(remote);
+
+		const pulled = await repo.pull({ author: AUTHOR });
+
+		expect(pulled.status).toBe('conflict');
+		expect((await repo.status()).files).toEqual([{ path: 'clash.md', change: 'modified' }]);
+		const paths = (await repo.listTree()).map((entry) => entry.path);
+		expect(paths).not.toContain('gone.md');
+		expect(paths).not.toContain('folder/only.md');
+		expect(await repo.readText('both.md')).toBe('ONE\ntwo\nthree\nFOUR\n');
+
+		await repo.writeFile('clash.md', 'resolved\n');
+		const { oid, parents } = await repo.completeMerge({ author: AUTHOR });
+
+		expect(parents[1]).toBe(theirsOid);
+		expect((await repo.status()).clean).toBe(true);
+		expect(await repo.getMergeState()).toBeNull();
+		expect(await repo.aheadBehind()).toMatchObject({ behind: 0 });
+		expect(await pushedTree(remote, repo)).toEqual(['added.md', 'both.md', 'calm.md', 'clash.md', 'deep/er/new.md', 'ours-only.md', 'pic.bin', 'same.bin']);
+		expect(await remoteHead(remote)).toBe(oid);
+		expect((await runGit(['log', '-1', '--format=%P', 'main'], remote.bare)).trim().split(' ')).toEqual(parents);
+		expect(await showRemote(remote, 'main:clash.md')).toBe('resolved\n');
+		expect(await showRemote(remote, 'main:calm.md')).toBe('calm remote\n');
+		expect(await showRemote(remote, 'main:both.md')).toBe('ONE\ntwo\nthree\nFOUR\n');
+		expect(await showRemote(remote, 'main:deep/er/new.md')).toBe('new\n');
+		expect(Buffer.from(await repo.readFile('pic.bin')).equals(Buffer.from(theirBytes))).toBe(true);
+		expect(Buffer.from(await repo.readFile('same.bin')).equals(Buffer.from(bytes))).toBe(true);
+		expect((await runGit(['rev-parse', 'main:pic.bin'], remote.bare)).trim()).toBe(await runGitHash(theirBytes));
+	});
+
+	it('keeps an executable remote file executable', async () => {
+		const { remote, repo } = await divergedRepo({}, {}, async (work) => {
+			await writeFile(path.join(work, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
+			await runGit(['add', 'run.sh'], work);
+		});
+
+		await repo.pull({ author: AUTHOR });
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+
+		expect(await runGit(['ls-tree', 'main', 'run.sh'], remote.bare)).toMatch(/^100755 /);
+	});
+
+	it('keeps a remote symbolic link a link', async () => {
+		const { remote, repo } = await divergedRepo({}, {}, async (work) => {
+			await symlink('clash.md', path.join(work, 'link.md'));
+			await runGit(['add', 'link.md'], work);
+		});
+
+		await repo.pull({ author: AUTHOR });
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+
+		expect(await runGit(['ls-tree', 'main', 'link.md'], remote.bare)).toMatch(/^120000 /);
+	});
+
+	it('leaves an edit made during the merge uncommitted, and shows it', async () => {
+		const { remote, repo } = await divergedRepo({ 'calm.md': 'calm\n', 'mine.md': 'mine\n' }, { 'calm.md': 'calm remote\n' });
+		await repo.pull({ author: AUTHOR });
+		await repo.writeFile('mine.md', 'edited during the merge\n');
+		await repo.writeFile('calm.md', 'edited over the merge\n');
+		await repo.writeFile('scratch.md', 'new\n');
+
+		expect((await repo.status()).files).toEqual([
+			{ path: 'calm.md', change: 'modified' },
+			{ path: 'clash.md', change: 'modified' },
+			{ path: 'mine.md', change: 'modified' },
+			{ path: 'scratch.md', change: 'added' }
+		]);
+
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+
+		expect((await repo.status()).files).toEqual([
+			{ path: 'calm.md', change: 'modified' },
+			{ path: 'mine.md', change: 'modified' },
+			{ path: 'scratch.md', change: 'added' }
+		]);
+		await pushedTree(remote, repo);
+		expect(await showRemote(remote, 'main:calm.md')).toBe('calm remote\n');
+		expect(await showRemote(remote, 'main:mine.md')).toBe('mine\n');
+	});
+
+	it('refuses while markers remain, unless told they are the real content', async () => {
+		const { remote, repo } = await divergedRepo({}, {});
+		await repo.pull({ author: AUTHOR });
+
+		const error = await rejection(repo.completeMerge({ author: AUTHOR }));
+
+		expect(error.code).toBe(ErrorCode.CONFLICTS_UNRESOLVED);
+		expect(error.detail.paths).toEqual(['clash.md']);
+		expect(await repo.getMergeState()).not.toBeNull();
+
+		await repo.completeMerge({ author: AUTHOR, allowMarkers: true });
+		await pushedTree(remote, repo);
+		expect(await showRemote(remote, 'main:clash.md')).toContain('<<<<<<<');
+	});
+
+	it('stages a conflicted file the user removed as a deletion', async () => {
+		const { remote, repo } = await divergedRepo({ 'other.md': 'other\n' }, {});
+		await repo.pull({ author: AUTHOR });
+		await repo.remove('clash.md');
+
+		expect((await repo.status()).files).toEqual([{ path: 'clash.md', change: 'deleted' }]);
+		await repo.completeMerge({ author: AUTHOR, message: 'drop the clash' });
+
+		expect(await pushedTree(remote, repo)).toEqual(['other.md']);
+		expect((await runGit(['log', '-1', '--format=%s', 'main'], remote.bare)).trim()).toBe('drop the clash');
+	});
+
+	it('takes one side of a binary conflict with its exact bytes', async () => {
+		const seed = Uint8Array.from([0, 1, 10]);
+		const ours = Uint8Array.from([0, 2, 255, 10]);
+		const theirs = Uint8Array.from([0, 3, 254, 10]);
+		const { remote, repo } = await clonedRepo({ 'img.bin': seed });
+		await pushFromElsewhere(remote, { 'img.bin': theirs }, 'remote');
+		await repo.writeFile('img.bin', ours);
+		await repo.commit({ paths: ['img.bin'], message: 'local', author: AUTHOR });
+		await repo.pull({ author: AUTHOR });
+
+		await repo.resolveConflict({ path: 'img.bin', side: 'theirs' });
+		expect([...(await repo.readFile('img.bin'))]).toEqual([...theirs]);
+		await repo.resolveConflict({ path: 'img.bin', side: 'ours' });
+		expect([...(await repo.readFile('img.bin'))]).toEqual([...ours]);
+		await repo.resolveConflict({ path: 'img.bin', side: 'theirs' });
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+
+		expect((await runGit(['rev-parse', 'main:img.bin'], remote.bare)).trim()).toBe(await runGitHash(theirs));
+	});
+
+	it('lets a side that deleted the file win', async () => {
+		const { remote, repo } = await clonedRepo({ 'n.md': 'base\n', 'keep.md': 'keep\n' });
+		await changeElsewhere(remote, {}, async (work) => {
+			await runGit(['rm', '--quiet', 'n.md'], work);
+		});
+		await commitFile(repo, 'n.md', 'ours\n');
+		await repo.pull({ author: AUTHOR });
+
+		await repo.resolveConflict({ path: 'n.md', side: 'theirs' });
+		await repo.completeMerge({ author: AUTHOR });
+
+		expect((await repo.status()).clean).toBe(true);
+		expect(await pushedTree(remote, repo)).toEqual(['keep.md']);
+	});
+
+	it('refuses to choose a side where no conflict is', async () => {
+		const { repo } = await divergedRepo({ 'other.md': 'other\n' }, {});
+		expect((await rejection(repo.resolveConflict({ path: 'clash.md', side: 'ours' }))).code).toBe(ErrorCode.NO_OPEN_MERGE);
+		await repo.pull({ author: AUTHOR });
+		expect((await rejection(repo.resolveConflict({ path: 'other.md', side: 'ours' }))).code).toBe(ErrorCode.INVALID_ARGUMENT);
+	});
+
+	it('answers plainly when no merge is open', async () => {
+		const { repo } = await clonedRepo();
+		expect((await rejection(repo.completeMerge({ author: AUTHOR }))).code).toBe(ErrorCode.NO_OPEN_MERGE);
+		expect((await rejection(repo.abortMerge())).code).toBe(ErrorCode.NO_OPEN_MERGE);
+	});
+
+	it('closes the merge state when a closed tab left it after the merge commit', async () => {
+		const { remote, repo, fs } = await divergedRepo({}, {});
+		await repo.pull({ author: AUTHOR });
+		const stored = await fs.promises.readFile('/repo/.git/gitnote-merge.json', { encoding: 'utf8' });
+		await repo.writeFile('clash.md', 'resolved\n');
+		const { oid } = await repo.completeMerge({ author: AUTHOR });
+		await fs.promises.writeFile('/repo/.git/gitnote-merge.json', stored);
+
+		const reloaded = openRepo(remote, { fs });
+
+		expect(await reloaded.getMergeState()).toBeNull();
+		expect((await reloaded.status()).clean).toBe(true);
+		expect((await reloaded.push()).oid).toBe(oid);
+	});
+});
+
+describe('abortMerge', () => {
+	it('goes back to our commit, keeps other edits, and lets the next pull start over', async () => {
+		const { remote, repo } = await divergedRepo(
+			{ 'calm.md': 'calm\n', 'gone.md': 'gone\n', 'mine.md': 'mine\n' },
+			{ 'calm.md': 'calm remote\n', 'fresh/new.md': 'new\n' },
+			async (work) => {
+				await runGit(['rm', '--quiet', 'gone.md'], work);
+			}
+		);
+		const pulled = await repo.pull({ author: AUTHOR });
+		await repo.writeFile('clash.md', 'half resolved\n');
+
+		expect(await repo.abortMerge()).toEqual({ oid: pulled.oid });
+
+		expect(await repo.getMergeState()).toBeNull();
+		expect((await repo.status()).clean).toBe(true);
+		expect(await repo.readText('clash.md')).toBe('ours\n');
+		expect(await repo.readText('calm.md')).toBe('calm\n');
+		expect(await repo.readText('gone.md')).toBe('gone\n');
+		expect((await rejection(repo.readText('fresh/new.md'))).code).toBe(ErrorCode.PATH_NOT_FOUND);
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['calm.md', 'clash.md', 'gone.md', 'mine.md']);
+		expect((await rejection(repo.remove('fresh'))).code).toBe(ErrorCode.PATH_NOT_FOUND);
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 1, behind: 1 });
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+		expect(await pushedTree(remote, repo)).toEqual(['calm.md', 'clash.md', 'fresh/new.md', 'mine.md']);
+	});
+
+	it('keeps an edit to a file the merge did not touch', async () => {
+		const { repo } = await divergedRepo({ 'mine.md': 'mine\n' }, {});
+		await repo.pull({ author: AUTHOR });
+		await repo.writeFile('mine.md', 'edited\n');
+
+		await repo.abortMerge();
+
+		expect((await repo.status()).files).toEqual([{ path: 'mine.md', change: 'modified' }]);
+	});
+});
+
+describe('a pull that fails partway', () => {
+	/**
+	 * @param {import('./repo.js').Repo} repo
+	 * @param {Record<string, string>} content what the tree must hold
+	 */
+	async function expectUndone(repo, content) {
+		expect(await repo.getMergeState()).toBeNull();
+		expect((await repo.status()).clean).toBe(true);
+		for (const [path, text] of Object.entries(content)) expect(await repo.readText(path)).toBe(text);
+	}
+
+	it('refuses before moving anything when the remote now tracks an ignored local file', async () => {
+		const { remote, repo } = await clonedRepo({ '.gitignore': 'drafts/\n', 'a.md': 'old\n' });
+		await repo.writeFile('drafts/x.md', 'my private draft\n');
+		await pushFromElsewhere(remote, { '.gitignore': '', 'a.md': 'new\n', 'drafts/x.md': 'theirs\n' }, 'remote adds it');
+
+		const error = await rejection(repo.pull({ author: AUTHOR }));
+
+		expect(error.code).toBe(ErrorCode.CHECKOUT_CONFLICT);
+		expect(error.detail.files).toEqual(['drafts/x.md']);
+		expect(await repo.readText('drafts/x.md')).toBe('my private draft\n');
+		await expectUndone(repo, { 'a.md': 'old\n' });
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 0, behind: 1 });
+	});
+
+	it('does the same on the way to a conflict, which would overwrite without asking', async () => {
+		const { remote, repo } = await divergedRepo({ '.gitignore': 'drafts/\n' }, {});
+		await repo.writeFile('drafts/x.md', 'my private draft\n');
+		await pushFromElsewhere(remote, { '.gitignore': '', 'drafts/x.md': 'theirs\n' }, 'remote adds it');
+
+		expect((await rejection(repo.pull({ author: AUTHOR }))).code).toBe(ErrorCode.CHECKOUT_CONFLICT);
+		expect(await repo.readText('drafts/x.md')).toBe('my private draft\n');
+		await expectUndone(repo, { 'clash.md': 'ours\n' });
+	});
+
+	it('puts the branch back when a fast-forward checkout runs out of space, then retries', async () => {
+		const { remote, repo, fs } = await clonedRepo({ 'a.md': 'old\n', 'z.md': 'keep\n' });
+		await pushFromElsewhere(remote, { 'a.md': 'new\n', 'z-new.md': 'new\n' }, 'remote edit');
+		const heal = failWrites(fs, (path) => path.endsWith('z-new.md'));
+
+		await rejection(repo.pull({ author: AUTHOR }));
+		heal();
+
+		await expectUndone(repo, { 'a.md': 'old\n', 'z.md': 'keep\n' });
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['a.md', 'z.md']);
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 0, behind: 1 });
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('fast_forward');
+		expect(await repo.readText('z-new.md')).toBe('new\n');
+		expect((await repo.status()).clean).toBe(true);
+	});
+
+	it('puts the branch back when a clean merge checkout fails', async () => {
+		const { remote, repo, fs } = await clonedRepo({ 'a.md': 'old\n' });
+		await pushFromElsewhere(remote, { 'b-remote.md': 'r\n' }, 'remote');
+		const ours = await commitFile(repo, 'local.md', 'l\n');
+		const heal = failWrites(fs, (path) => path.endsWith('b-remote.md'));
+
+		await rejection(repo.pull({ author: AUTHOR }));
+		heal();
+
+		expect(await git.resolveRef({ fs, gitdir: '/repo/.git', ref: 'HEAD' })).toBe(ours);
+		await expectUndone(repo, { 'a.md': 'old\n', 'local.md': 'l\n' });
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('merged');
+	});
+
+	it('undoes a conflict whose record could not be written, so no marker becomes a commit', async () => {
+		const { repo, remote, fs } = await divergedRepo({ 'calm.md': 'calm\n' }, { 'calm.md': 'remote\n', 'added.md': 'added\n' });
+		const heal = failWrites(fs, (path, data) => path.endsWith('gitnote-merge.json') && String(data).includes('"conflicted"'));
+
+		await rejection(repo.pull({ author: AUTHOR }));
+		heal();
+
+		await expectUndone(repo, { 'clash.md': 'ours\n', 'calm.md': 'calm\n' });
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['calm.md', 'clash.md']);
+		const again = await repo.pull({ author: AUTHOR });
+		expect(again.status).toBe('conflict');
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+		expect(await pushedTree(remote, repo)).toEqual(['added.md', 'calm.md', 'clash.md']);
+	});
+
+	it('finishes undoing on the next operation when the tab died mid-pull', async () => {
+		const { remote, repo, fs } = await clonedRepo({ 'a.md': 'old\n', 'b.md': 'b\n' });
+		await pushFromElsewhere(remote, { 'a.md': 'new\n', 'c.md': 'new\n' }, 'remote edit');
+		// From the first new file on nothing can be written, as if the tab had
+		// gone, so the rollback cannot run either.
+		let dead = false;
+		const heal = failWrites(fs, (path) => {
+			dead ||= path.endsWith('c.md');
+			return dead;
+		});
+
+		await rejection(repo.pull({ author: AUTHOR }));
+		heal();
+		const stored = await fs.promises.readFile('/repo/.git/gitnote-merge.json', { encoding: 'utf8' });
+		expect(JSON.parse(stored).phase).toBe('applying');
+
+		const reloaded = openRepo(remote, { fs });
+
+		await expectUndone(reloaded, { 'a.md': 'old\n', 'b.md': 'b\n' });
+		expect(await reloaded.aheadBehind()).toMatchObject({ ahead: 0, behind: 1 });
+		expect((await reloaded.pull({ author: AUTHOR })).status).toBe('fast_forward');
+		expect(await reloaded.readText('c.md')).toBe('new\n');
+	});
 });
 
 describe('size limits', () => {
@@ -652,5 +1241,40 @@ describe('size limits', () => {
 		await commitFile(repo, 'copy.md', 'aaaa');
 		await commitFile(repo, 'a.md', 'bbbbbb');
 		expect(await repo.estimatePushBytes()).toBe(4 + 6);
+	});
+
+	it('counts only the local blobs after a merge, not the shallow boundary', async () => {
+		const { remote, repo } = await clonedRepo({ 'seed.bin': new Uint8Array(MB).fill(97) });
+		await pushFromElsewhere(remote, { 'remote.md': 'remote\n' }, 'remote');
+		await commitFile(repo, 'local.md', 'local\n');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('merged');
+
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 2, behind: 0 });
+		expect(await repo.estimatePushBytes()).toBe('local\n'.length);
+		expect((await repo.push()).bytes).toBe('local\n'.length);
+	});
+
+	it('does the same after a conflict is resolved', async () => {
+		const { remote, repo } = await divergedRepo({ 'seed.bin': new Uint8Array(MB).fill(97) }, { 'remote.md': 'remote\n' });
+		await repo.pull({ author: AUTHOR });
+		await repo.writeFile('clash.md', 'resolved\n');
+		await repo.completeMerge({ author: AUTHOR });
+
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 2, behind: 0 });
+		expect(await repo.estimatePushBytes()).toBe('ours\n'.length + 'resolved\n'.length);
+		expect(await pushedTree(remote, repo)).toEqual(['clash.md', 'remote.md', 'seed.bin']);
+	});
+
+	it('keeps counting correctly over several merges', async () => {
+		const { remote, repo } = await clonedRepo({ 'seed.bin': new Uint8Array(MB).fill(97) });
+		for (const round of [1, 2]) {
+			await pushFromElsewhere(remote, { [`remote-${round}.md`]: 'r\n' }, `remote ${round}`);
+			await commitFile(repo, `local-${round}.md`, 'll\n');
+			await repo.pull({ author: AUTHOR });
+		}
+		// Two local commits and two merge commits, none of them pushed.
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 4, behind: 0 });
+		expect(await repo.estimatePushBytes()).toBe(3);
 	});
 });

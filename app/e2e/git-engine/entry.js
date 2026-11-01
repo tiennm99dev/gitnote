@@ -1,4 +1,4 @@
-import { openRepoFs, repoIdForUrl, requestPersistentStorage, getStorageUsage, wipeRepoFs } from '../../src/lib/git/fs.js';
+import { openRepoFs, repoIdForUrl, getStorageUsage, wipeRepoFs } from '../../src/lib/git/fs.js';
 import { createGitHttp } from '../../src/lib/git/http.js';
 import { createRepo } from '../../src/lib/git/repo.js';
 
@@ -7,20 +7,30 @@ import { createRepo } from '../../src/lib/git/repo.js';
 // is built for the browser tests only and never ships in the app.
 
 /**
+ * One long-lived repo object per page, as the app holds it, so its parsed-object
+ * cache lives as long as the tab and must stay right when another tab writes.
+ * @type {Map<string, import('../../src/lib/git/repo.js').Repo>}
+ */
+const repos = new Map();
+
+/**
  * @param {string} url
  * @returns {import('../../src/lib/git/repo.js').Repo}
  */
 function openRepo(url) {
 	const id = repoIdForUrl(url);
-	return createRepo({
+	const existing = repos.get(id);
+	if (existing) return existing;
+	const repo = createRepo({
 		id,
 		fs: /** @type {import('../../src/lib/git/repo.js').FsClient} */ (/** @type {unknown} */ (openRepoFs(id))),
 		http: createGitHttp(),
 		provider: 'github',
 		// The local git server's fixture credential, not a secret.
-		getCredential: () => ({ username: 'x-access-token', password: 'fixture-token' }),
-		storage: { persist: requestPersistentStorage }
+		getCredential: () => ({ username: 'x-access-token', password: 'fixture-token' })
 	});
+	repos.set(id, repo);
+	return repo;
 }
 
 Object.assign(globalThis, {

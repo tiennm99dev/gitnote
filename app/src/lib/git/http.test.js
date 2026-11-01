@@ -1,4 +1,5 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { ErrorCode } from './errors.js';
 import { authCallbacks, createGitHttp, toRelayUrl, withSignal } from './http.js';
 
 const RELAY = 'https://relay.example';
@@ -36,8 +37,37 @@ describe('toRelayUrl', () => {
 });
 
 describe('createGitHttp', () => {
+	afterEach(() => {
+		vi.unstubAllGlobals();
+	});
+
 	it('needs an origin outside a browser page', () => {
 		expect(() => createGitHttp()).toThrow(TypeError);
+	});
+
+	it('reports a failed fetch as a network error', async () => {
+		vi.stubGlobal('fetch', async () => {
+			throw new TypeError('Failed to fetch');
+		});
+		const http = createGitHttp({ relayOrigin: RELAY });
+		await expect(http.request({ url: 'https://github.com/o/r.git/info/refs' })).rejects.toMatchObject({ code: ErrorCode.NETWORK });
+	});
+
+	it('reports a connection lost while the body arrives as a network error', async () => {
+		const body = new ReadableStream({
+			pull(controller) {
+				controller.error(new TypeError('network error'));
+			}
+		});
+		vi.stubGlobal('fetch', async () => new Response(body));
+		const response = await createGitHttp({ relayOrigin: RELAY }).request({ url: 'https://github.com/o/r.git/info/refs' });
+		const read = /** @type {AsyncIterableIterator<Uint8Array>} */ (response.body).next();
+		await expect(read).rejects.toMatchObject({ code: ErrorCode.NETWORK });
+	});
+
+	it('keeps a bad URL a TypeError, not a network problem', async () => {
+		const http = createGitHttp({ relayOrigin: RELAY });
+		await expect(http.request({ url: 'ssh://github.com/o/r.git' })).rejects.toBeInstanceOf(TypeError);
 	});
 });
 

@@ -1,6 +1,6 @@
 import { memfs } from 'memfs';
 import { describe, expect, it } from 'vitest';
-import { createMergeDriver, isBinary, readMergeState, writeMergeState } from './merge.js';
+import { clearMergeState, createMergeDriver, hasConflictMarkers, isBinary, readMergeState, writeMergeState } from './merge.js';
 
 const BRANCHES = ['base', 'main', 'origin/main'];
 const OID = 'a'.repeat(40);
@@ -47,6 +47,14 @@ describe('createMergeDriver', () => {
 		});
 	});
 
+	it('starts every marker on its own line when a side has no final newline', async () => {
+		expect((await merge(['base', 'ours', 'theirs'])).mergedText).toBe('<<<<<<< main\nours\n=======\ntheirs\n>>>>>>> origin/main\n');
+	});
+
+	it('keeps text after a conflict below the closing marker', async () => {
+		expect((await merge(['a\nb\nend', 'A\nb\nend', 'Z\nb\nend'])).mergedText).toBe('<<<<<<< main\nA\n=======\nZ\n>>>>>>> origin/main\nb\nend');
+	});
+
 	it('keeps a file without a final newline intact', async () => {
 		expect(await merge(['a\nb', 'A\nb', 'a\nb'])).toEqual({ cleanMerge: true, mergedText: 'A\nb' });
 	});
@@ -65,13 +73,26 @@ describe('createMergeDriver', () => {
 	});
 });
 
+describe('hasConflictMarkers', () => {
+	it('finds markers the driver wrote', async () => {
+		expect(hasConflictMarkers((await merge(['base', 'ours', 'theirs'])).mergedText)).toBe(true);
+	});
+
+	it.each(['plain text\n', 'see <<<<<<< here\n', '<<<<<<< only one marker\n', '=======\nA heading underline\n'])('passes %j', (text) => {
+		expect(hasConflictMarkers(text)).toBe(false);
+	});
+});
+
 describe('merge state', () => {
+	/** @type {import('./merge.js').MergeState} */
 	const STATE = {
+		phase: 'conflicted',
 		branch: 'main',
 		oursOid: OID,
 		theirsOid: OID.replace(/a/g, 'b'),
 		conflictedPaths: ['a.md'],
 		binaryPaths: [],
+		conflicts: [{ path: 'a.md', kind: 'both_modified', binary: false }],
 		startedAt: '2026-11-01T00:00:00.000Z'
 	};
 
@@ -88,11 +109,22 @@ describe('merge state', () => {
 		expect(await readMergeState(fs, '/gitdir')).toEqual(STATE);
 	});
 
+	it('is gone once cleared, and clearing twice is fine', async () => {
+		const fs = emptyFs();
+		await fs.promises.mkdir('/gitdir');
+		await writeMergeState(fs, '/gitdir', STATE);
+		await clearMergeState(fs, '/gitdir');
+		await clearMergeState(fs, '/gitdir');
+		expect(await readMergeState(fs, '/gitdir')).toBeNull();
+	});
+
 	it.each([
 		['bad JSON', 'not json'],
 		['a missing field', JSON.stringify({ ...STATE, theirsOid: undefined })],
 		['a bad oid', JSON.stringify({ ...STATE, theirsOid: 'HEAD' })],
-		['a bad path list', JSON.stringify({ ...STATE, conflictedPaths: 'a.md' })]
+		['a bad path list', JSON.stringify({ ...STATE, conflictedPaths: 'a.md' })],
+		['a bad phase', JSON.stringify({ ...STATE, phase: 'done' })],
+		['a bad conflict kind', JSON.stringify({ ...STATE, conflicts: [{ path: 'a.md', kind: 'odd', binary: false }] })]
 	])('refuses a stored state with %s', async (_name, text) => {
 		const fs = emptyFs();
 		await fs.promises.mkdir('/gitdir');

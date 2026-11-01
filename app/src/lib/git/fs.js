@@ -4,6 +4,8 @@
  */
 
 import LightningFS from '@isomorphic-git/lightning-fs';
+import { ErrorCode, GitEngineError } from './errors.js';
+import { withRepoLock } from './lock.js';
 
 /** The working tree inside each repo's file system. */
 export const REPO_DIR = '/repo';
@@ -23,6 +25,7 @@ const instances = new Map();
  */
 export function repoIdForUrl(url) {
 	const parsed = new URL(url);
+	assertNoCredentials(parsed);
 	const path = parsed.pathname.replace(/\/+$/, '').replace(/\.git$/, '');
 	return assertRepoId(`${parsed.host.toLowerCase()}${path}`);
 }
@@ -50,15 +53,47 @@ export function openRepoFs(repoId) {
 }
 
 /**
+ * Refuses a remote URL that carries a credential: it would be stored in plain
+ * text in the repo's config, outside the credential source.
+ * @param {URL} url
+ * @returns {void}
+ */
+export function assertNoCredentials(url) {
+	if (url.username !== '' || url.password !== '') {
+		throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'Remove the username or token from the repository URL. Sign in to the git host instead.');
+	}
+}
+
+/**
  * Deletes everything stored for a repository on this device, including
- * unpushed commits.
+ * unpushed commits. Waits for the operation in progress, in any tab.
+ *
+ * Deletes file by file rather than with LightningFS's `wipe`: that clears the
+ * store under a tab still holding the old file tree in memory, which goes on
+ * seeing deleted files. Ordinary deletes reach other tabs like any other write.
  * @param {string} repoId
  * @returns {Promise<void>}
  */
-export async function wipeRepoFs(repoId) {
-	const fs = openRepoFs(repoId);
-	await fs.promises.init(repoFsName(repoId), { wipe: true });
-	await fs.promises.flush();
+export function wipeRepoFs(repoId) {
+	return withRepoLock(repoId, async () => {
+		const { promises } = openRepoFs(repoId);
+		/** @param {string} path */
+		const remove = async (path) => {
+			const stat = await promises.lstat(path);
+			if (!stat.isDirectory()) {
+				await promises.unlink(path);
+				return;
+			}
+			for (const name of await promises.readdir(path)) await remove(`${path}/${name}`);
+			await promises.rmdir(path);
+		};
+		try {
+			await remove(REPO_DIR);
+		} catch (error) {
+			if (/** @type {{ code?: string }} */ (error)?.code !== 'ENOENT') throw error;
+		}
+		await promises.flush();
+	});
 }
 
 /**

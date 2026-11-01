@@ -1,6 +1,6 @@
 import git from 'isomorphic-git';
 import { describe, expect, it } from 'vitest';
-import { ErrorCode, GitEngineError, toGitEngineError } from './errors.js';
+import { ErrorCode, GitEngineError, networkError, toGitEngineError } from './errors.js';
 
 const { HttpError, GitPushError, PushRejectedError, MergeNotSupportedError, UserCanceledError } = git.Errors;
 
@@ -70,6 +70,7 @@ describe('toGitEngineError', () => {
 		[401, '', ErrorCode.AUTH_REQUIRED],
 		[403, '', ErrorCode.FORBIDDEN],
 		[403, '{"error":"git_target_not_allowed","message":"no"}', ErrorCode.HOST_NOT_ALLOWED],
+		[403, '{"error":"origin_not_allowed","message":"no"}', ErrorCode.ORIGIN_NOT_ALLOWED],
 		[404, '', ErrorCode.REPO_NOT_FOUND],
 		[429, '', ErrorCode.RATE_LIMITED],
 		[502, '{"error":"repo_moved","message":"moved"}', ErrorCode.REPO_MOVED],
@@ -85,8 +86,22 @@ describe('toGitEngineError', () => {
 		expect(toGitEngineError(new DOMException('aborted', 'AbortError')).code).toBe(ErrorCode.CANCELLED);
 	});
 
-	it('maps a failed fetch to a network error', () => {
-		expect(toGitEngineError(new TypeError('Failed to fetch')).code).toBe(ErrorCode.NETWORK);
+	it('leaves a TypeError from anything but the HTTP client as a bug, with its message', () => {
+		const mapped = toGitEngineError(new TypeError('x is not a function'));
+		expect(mapped.code).toBe(ErrorCode.UNKNOWN);
+		expect(mapped.message).toContain('x is not a function');
+	});
+
+	it('keeps the network error from the HTTP client', () => {
+		const error = networkError(new TypeError('Failed to fetch'));
+		expect(toGitEngineError(error)).toBe(error);
+		expect(error.code).toBe(ErrorCode.NETWORK);
+	});
+
+	it('names the files in a checkout conflict', () => {
+		const mapped = toGitEngineError(new git.Errors.CheckoutConflictError(['drafts/x.md']));
+		expect(mapped.code).toBe(ErrorCode.CHECKOUT_CONFLICT);
+		expect(mapped.detail.files).toEqual(['drafts/x.md']);
 	});
 
 	it('maps an unsupported merge', () => {

@@ -22,6 +22,9 @@ export const ErrorCode = Object.freeze({
 	MERGE_IN_PROGRESS: 'merge_in_progress',
 	MERGE_CONFLICT: 'merge_conflict',
 	MERGE_NOT_SUPPORTED: 'merge_not_supported',
+	NO_OPEN_MERGE: 'no_open_merge',
+	CONFLICTS_UNRESOLVED: 'conflicts_unresolved',
+	CHECKOUT_CONFLICT: 'checkout_conflict',
 	FILE_TOO_LARGE: 'file_too_large',
 	PUSH_TOO_LARGE: 'push_too_large',
 	HOST_FILE_TOO_LARGE: 'host_file_too_large',
@@ -33,6 +36,7 @@ export const ErrorCode = Object.freeze({
 	REPO_NOT_FOUND: 'repo_not_found',
 	REPO_MOVED: 'repo_moved',
 	HOST_NOT_ALLOWED: 'host_not_allowed',
+	ORIGIN_NOT_ALLOWED: 'origin_not_allowed',
 	HOST_UNREACHABLE: 'host_unreachable',
 	RATE_LIMITED: 'rate_limited',
 	NETWORK: 'network',
@@ -84,7 +88,7 @@ const HOST_REJECTIONS = Object.freeze([
  * @property {unknown} [code]
  * @property {unknown} [name]
  * @property {unknown} [message]
- * @property {{ statusCode?: unknown, response?: unknown, reason?: unknown, result?: { refs?: Record<string, unknown> } }} [data]
+ * @property {{ statusCode?: unknown, response?: unknown, reason?: unknown, filepaths?: unknown, result?: { refs?: Record<string, unknown> } }} [data]
  */
 
 /**
@@ -133,6 +137,9 @@ function fromHttpStatus(status, response, cause) {
 	}
 	if (status === 403 && relay?.error?.startsWith('git_')) {
 		return make(ErrorCode.HOST_NOT_ALLOWED, 'The relay only reaches GitHub and GitLab repositories.');
+	}
+	if (status === 403 && relay?.error === 'origin_not_allowed') {
+		return make(ErrorCode.ORIGIN_NOT_ALLOWED, 'The relay does not accept requests from this address. Open gitnote from its own address.');
 	}
 	if (status === 403) {
 		return make(ErrorCode.FORBIDDEN, 'The git host refused access. Check that the token can read and write this repository.');
@@ -216,9 +223,21 @@ export function toGitEngineError(error, { remoteMessages = [] } = {}) {
 	if (code === 'NotFoundError' && /refs\/remotes|HEAD/.test(message)) {
 		return new GitEngineError(ErrorCode.NOT_CLONED, 'This repository has not been cloned on this device yet.', { cause: error });
 	}
-	// `fetch` rejects with a TypeError when the network or the relay is down.
-	if (error instanceof TypeError) {
-		return new GitEngineError(ErrorCode.NETWORK, 'Could not reach the relay. Check the connection and try again.', { cause: error });
+	if (code === 'CheckoutConflictError') {
+		return new GitEngineError(ErrorCode.CHECKOUT_CONFLICT, 'Pulling would overwrite files on this device that git does not track. Move them, then pull again.', {
+			cause: error,
+			detail: { files: error.data?.filepaths }
+		});
 	}
 	return new GitEngineError(ErrorCode.UNKNOWN, `Git failed: ${message || name || 'unknown error'}`, { cause: error });
+}
+
+/**
+ * The failure `fetch` reports when the network or the relay is down. Only the
+ * HTTP client can tell it from any other TypeError, so it wraps it here.
+ * @param {unknown} cause
+ * @returns {GitEngineError}
+ */
+export function networkError(cause) {
+	return new GitEngineError(ErrorCode.NETWORK, 'Could not reach the relay. Check the connection and try again.', { cause });
 }

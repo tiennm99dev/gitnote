@@ -1,4 +1,5 @@
 import { execFile } from 'node:child_process';
+import { createHash } from 'node:crypto';
 import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
@@ -117,6 +118,31 @@ export async function pushFromElsewhere(remote, files, message) {
 		await commitFiles(work, files, message);
 		await runGit(['push', '--quiet', 'origin', 'HEAD:main'], work);
 	});
+}
+
+/**
+ * Like `pushFromElsewhere`, with a callback for changes other than writing
+ * files, such as a delete or a symbolic link.
+ * @param {Remote} remote
+ * @param {Record<string, string | Uint8Array>} files
+ * @param {(work: string) => Promise<void>} [change] runs in the fresh clone before the commit
+ * @returns {Promise<void>}
+ */
+export async function changeElsewhere(remote, files, change) {
+	await withNativeClone(remote.bare, async (work) => {
+		await change?.(work);
+		await commitFiles(work, files, 'remote change');
+		await runGit(['push', '--quiet', 'origin', 'HEAD:main'], work);
+	});
+}
+
+/**
+ * @param {string | Uint8Array} content
+ * @returns {string} the blob id git gives this content
+ */
+export function nativeBlobHash(content) {
+	const bytes = Buffer.from(content);
+	return createHash('sha1').update(`blob ${bytes.length}\0`).update(bytes).digest('hex');
 }
 
 /**

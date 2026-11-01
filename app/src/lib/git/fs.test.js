@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
+import { ErrorCode } from './errors.js';
 import { getStorageUsage, repoFsName, repoIdForUrl, requestPersistentStorage } from './fs.js';
 
 describe('repo ids', () => {
@@ -9,6 +10,13 @@ describe('repo ids', () => {
 		['http://localhost:8175/owner/repo.git', 'localhost:8175/owner/repo']
 	])('derives an id from %s', (url, id) => {
 		expect(repoIdForUrl(url)).toBe(id);
+	});
+
+	it('refuses a URL that carries a credential', () => {
+		expect(() => repoIdForUrl('https://x-access-token:secret@github.com/owner/repo.git')).toThrow(
+			expect.objectContaining({ code: ErrorCode.INVALID_ARGUMENT })
+		);
+		expect(() => repoIdForUrl('https://user@github.com/owner/repo.git')).toThrow(expect.objectContaining({ code: ErrorCode.INVALID_ARGUMENT }));
 	});
 
 	it('names one file system per repo', () => {

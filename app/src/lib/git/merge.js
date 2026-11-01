@@ -1,8 +1,8 @@
 /**
  * Merge support for pull: a merge driver that never writes diff3 markers into
- * binary files, and the merge state kept on disk while a conflict is open.
- * isomorphic-git writes no MERGE_HEAD, so without this state a reload would
- * forget which commit is being merged.
+ * binary files, and the merge state kept on disk while a pull changes the
+ * working tree or a conflict is open. isomorphic-git writes no MERGE_HEAD, so
+ * without this state a reload would forget which commit is being merged.
  */
 
 import diff3Merge from 'diff3';
@@ -34,14 +34,18 @@ export function isBinary(content) {
  * Builds a merge driver for one merge. Text files merge line by line with
  * diff3 conflict markers, like isomorphic-git's default driver. A binary file
  * changed on both sides is always a conflict and its paths land in
- * `binaryPaths`, so the caller can restore our bytes and offer an ours/theirs
- * choice instead of markers.
+ * `binaryPaths`, so the caller can offer an ours/theirs choice instead of
+ * markers. Each text file's result lands in `mergedTexts`, for a caller that
+ * writes the working tree itself.
  * @param {Set<string>} binaryPaths filled with the paths of binary conflicts
+ * @param {Map<string, string>} [mergedTexts] filled with each text file's result
  * @returns {import('isomorphic-git').MergeDriverCallback}
  */
-export function createMergeDriver(binaryPaths) {
+export function createMergeDriver(binaryPaths, mergedTexts = new Map()) {
 	return ({ branches, contents, path }) => {
 		const [, ourName, theirName] = branches;
+		// A marker must start its line, even after content with no final newline.
+		const endLine = (/** @type {string} */ text) => (text === '' || text.endsWith('\n') ? text : `${text}\n`);
 		const [baseContent, ourContent, theirContent] = contents;
 		if (contents.some((content) => isBinary(content))) {
 			binaryPaths.add(path);
@@ -57,24 +61,54 @@ export function createMergeDriver(binaryPaths) {
 			if (item.ok) mergedText += item.ok.join('');
 			if (item.conflict) {
 				cleanMerge = false;
+				mergedText = endLine(mergedText);
 				mergedText += `${'<'.repeat(MARKER_SIZE)} ${ourName}\n`;
-				mergedText += item.conflict.a.join('');
+				mergedText = endLine(mergedText + item.conflict.a.join(''));
 				mergedText += `${'='.repeat(MARKER_SIZE)}\n`;
-				mergedText += item.conflict.b.join('');
+				mergedText = endLine(mergedText + item.conflict.b.join(''));
 				mergedText += `${'>'.repeat(MARKER_SIZE)} ${theirName}\n`;
 			}
 		}
+		mergedTexts.set(path, mergedText);
 		return { cleanMerge, mergedText };
 	};
 }
 
 /**
- * @typedef {object} MergeState an open merge, waiting for its merge commit
+ * Text with line-anchored conflict markers still in it.
+ * @param {string} text
+ * @returns {boolean}
+ */
+export function hasConflictMarkers(text) {
+	return /^<{7} /m.test(text) && /^={7}\r?$/m.test(text) && /^>{7} /m.test(text);
+}
+
+/**
+ * @typedef {'both_modified' | 'deleted_by_us' | 'deleted_by_theirs'} ConflictKind
+ */
+
+/**
+ * @typedef {object} Conflict
+ * @property {string} path
+ * @property {ConflictKind} kind what each side did. Only `both_modified` text
+ *   has markers; a deleted-by-one-side file holds the other side's content.
+ * @property {boolean} binary pick ours or theirs, never markers
+ */
+
+/**
+ * The record of a pull that is changing the working tree. It is written and
+ * flushed before anything moves, so an interrupted pull can always be undone:
+ * - `applying`: the pull is under way. Found by any later operation, it means
+ *   the pull died, and the branch and working tree go back to `oursOid`.
+ * - `conflicted`: an open merge, waiting for its merge commit.
+ * @typedef {object} MergeState
+ * @property {'applying' | 'conflicted'} phase
  * @property {string} branch the local branch being merged into
  * @property {string} oursOid HEAD when the merge started
  * @property {string} theirsOid the fetched remote commit being merged
  * @property {string[]} conflictedPaths every path with unmerged index entries
  * @property {string[]} binaryPaths conflicted binary files: pick ours or theirs, never markers
+ * @property {Conflict[]} conflicts the same paths, with what each side did
  * @property {string} startedAt ISO timestamp
  */
 
@@ -116,6 +150,33 @@ export async function writeMergeState(fs, gitdir, state) {
 }
 
 /**
+ * @param {import('isomorphic-git').PromiseFsClient} fs
+ * @param {string} gitdir
+ * @returns {Promise<void>}
+ */
+export async function clearMergeState(fs, gitdir) {
+	try {
+		await fs.promises.unlink(statePath(gitdir));
+	} catch (error) {
+		if (/** @type {{ code?: string }} */ (error)?.code !== 'ENOENT') throw error;
+	}
+}
+
+/**
+ * @param {unknown} value
+ * @returns {boolean}
+ */
+function isConflict(value) {
+	if (typeof value !== 'object' || value === null) return false;
+	const conflict = /** @type {Record<string, unknown>} */ (value);
+	return (
+		typeof conflict.path === 'string' &&
+		(conflict.kind === 'both_modified' || conflict.kind === 'deleted_by_us' || conflict.kind === 'deleted_by_theirs') &&
+		typeof conflict.binary === 'boolean'
+	);
+}
+
+/**
  * @param {unknown} value
  * @returns {value is MergeState}
  */
@@ -124,6 +185,7 @@ function isMergeState(value) {
 	const state = /** @type {Record<string, unknown>} */ (value);
 	const isStringList = (/** @type {unknown} */ list) => Array.isArray(list) && list.every((item) => typeof item === 'string');
 	return (
+		(state.phase === 'applying' || state.phase === 'conflicted') &&
 		typeof state.branch === 'string' &&
 		typeof state.oursOid === 'string' &&
 		OID.test(state.oursOid) &&
@@ -131,6 +193,8 @@ function isMergeState(value) {
 		OID.test(state.theirsOid) &&
 		isStringList(state.conflictedPaths) &&
 		isStringList(state.binaryPaths) &&
+		Array.isArray(state.conflicts) &&
+		state.conflicts.every(isConflict) &&
 		typeof state.startedAt === 'string'
 	);
 }

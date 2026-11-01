@@ -1,5 +1,5 @@
 import { expect, test } from '@playwright/test';
-import { createRemote, pushFromElsewhere, remoteHead, runGit, showRemote } from '../test/remote-repo.js';
+import { changeElsewhere, createRemote, pushFromElsewhere, remoteHead, runGit, showRemote } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT, E2E_RELAY_PORT } from './git-engine-ports.js';
 
 const PAGE_URL = `http://127.0.0.1:${E2E_RELAY_PORT}/`;
@@ -121,6 +121,55 @@ test.describe('git engine on LightningFS', () => {
 		expect(await run(page, remote.url, 'readText', ['clash.md'])).toContain('<<<<<<< main');
 	});
 
+	test('a resolved conflict keeps the remote edit, addition and deletion, read back with native git', async ({ page }) => {
+		const remote = await remoteWith({ 'clash.md': 'line\n', 'calm.md': 'calm\n', 'folder/gone.md': 'gone\n' });
+		await run(page, remote.url, 'clone', [{ url: remote.url }]);
+		await changeElsewhere(remote, { 'clash.md': 'theirs\n', 'calm.md': 'calm remote\n', 'added.md': 'added\n' }, async (work) => {
+			await runGit(['rm', '--quiet', 'folder/gone.md'], work);
+		});
+		await run(page, remote.url, 'writeFile', ['clash.md', 'ours\n']);
+		await run(page, remote.url, 'commit', [{ paths: ['clash.md'], message: 'ours', author: AUTHOR }]);
+		const theirs = await remoteHead(remote);
+
+		expect((await run(page, remote.url, 'pull', [{ author: AUTHOR }])).status).toBe('conflict');
+		expect((await run(page, remote.url, 'status')).files).toEqual([{ path: 'clash.md', change: 'modified' }]);
+
+		// The merge stays resumable, with its staged half, across a reload.
+		await page.reload();
+		await page.waitForFunction('typeof callRepo === "function"');
+		expect((await run(page, remote.url, 'status')).files).toEqual([{ path: 'clash.md', change: 'modified' }]);
+
+		await run(page, remote.url, 'writeFile', ['clash.md', 'resolved\n']);
+		const { parents } = await run(page, remote.url, 'completeMerge', [{ author: AUTHOR }]);
+		expect(parents[1]).toBe(theirs);
+		expect((await run(page, remote.url, 'status')).clean).toBe(true);
+		expect(await run(page, remote.url, 'aheadBehind')).toMatchObject({ ahead: 2, behind: 0 });
+		expect((await run(page, remote.url, 'push')).pushed).toBe(true);
+
+		await runGit(['fsck', '--no-dangling'], remote.bare);
+		expect((await runGit(['ls-tree', '-r', '--name-only', 'main'], remote.bare)).trim().split('\n')).toEqual(['added.md', 'calm.md', 'clash.md']);
+		expect(await showRemote(remote, 'main:clash.md')).toBe('resolved\n');
+		expect(await showRemote(remote, 'main:calm.md')).toBe('calm remote\n');
+	});
+
+	test('a tab closed in the middle of a clone leaves a clone that can be retried', async ({ page, context }) => {
+		const remote = await remoteWith({ 'README.md': 'seed\n' });
+		// The download never finishes, so the clone is still running when the tab goes.
+		const request = page.waitForRequest((candidate) => candidate.url().endsWith('/git-upload-pack'));
+		await page.route('**/git-upload-pack', () => {});
+		void run(page, remote.url, 'clone', [{ url: remote.url }]).catch(() => {});
+		await request;
+		await page.close({ runBeforeUnload: false });
+
+		const next = await context.newPage();
+		await next.goto(PAGE_URL);
+		await next.waitForFunction('typeof callRepo === "function"');
+		expect(await run(next, remote.url, 'isCloned')).toBe(false);
+		expect((await run(next, remote.url, 'clone', [{ url: remote.url }])).branch).toBe('main');
+		expect(await run(next, remote.url, 'readText', ['README.md'])).toBe('seed\n');
+		expect((await run(next, remote.url, 'status')).clean).toBe(true);
+	});
+
 	test('two tabs committing at once both land', async ({ page, context }) => {
 		const remote = await remoteWith({ 'README.md': 'seed\n' });
 		await run(page, remote.url, 'clone', [{ url: remote.url }]);
@@ -136,6 +185,62 @@ test.describe('git engine on LightningFS', () => {
 		]);
 
 		expect(await run(page, remote.url, 'aheadBehind')).toMatchObject({ ahead: 2 });
+		expect((await run(second, remote.url, 'status')).clean).toBe(true);
+	});
+
+	test('two long-lived tabs keep each other\'s same-size edits', async ({ page, context }) => {
+		const remote = await remoteWith({ 'a.md': 'aaaa\n', 'b.md': 'bbbb\n' });
+		await run(page, remote.url, 'clone', [{ url: remote.url }]);
+		const second = await context.newPage();
+		await second.goto(PAGE_URL);
+		await second.waitForFunction('typeof callRepo === "function"');
+		// Both tabs have read the index, so each has it parsed in its cache.
+		expect((await run(page, remote.url, 'status')).clean).toBe(true);
+		expect((await run(second, remote.url, 'status')).clean).toBe(true);
+
+		await run(page, remote.url, 'writeFile', ['a.md', 'AAAA\n']);
+		await run(page, remote.url, 'commit', [{ paths: ['a.md'], message: 'a', author: AUTHOR }]);
+		await run(second, remote.url, 'writeFile', ['b.md', 'BBBB\n']);
+		await run(second, remote.url, 'commit', [{ paths: ['b.md'], message: 'b', author: AUTHOR }]);
+
+		expect((await run(page, remote.url, 'status')).files).toEqual([]);
+		expect((await run(second, remote.url, 'status')).files).toEqual([]);
+		expect(await run(page, remote.url, 'aheadBehind')).toMatchObject({ ahead: 2 });
+		const pushed = await run(page, remote.url, 'push');
+		expect(pushed.pushed).toBe(true);
+		expect(await showRemote(remote, 'main:a.md')).toBe('AAAA\n');
+		expect(await showRemote(remote, 'main:b.md')).toBe('BBBB\n');
+	});
+
+	test('a wipe waits for the repo lock, reaches a second tab, and the repo can be cloned again', async ({ page, context }) => {
+		const remote = await remoteWith({ 'README.md': 'seed\n' });
+		await run(page, remote.url, 'clone', [{ url: remote.url }]);
+		await run(page, remote.url, 'writeFile', ['draft.md', 'draft\n']);
+		const second = await context.newPage();
+		await second.goto(PAGE_URL);
+		await second.waitForFunction('typeof callRepo === "function"');
+		expect((await run(second, remote.url, 'status')).files).toEqual([{ path: 'draft.md', change: 'added' }]);
+
+		const lockName = `gitnote:repo:${new URL(remote.url).host}${new URL(remote.url).pathname.replace(/\.git$/, '')}`;
+		const order = await page.evaluate(
+			`(async () => {
+				const order = [];
+				let release;
+				const held = new Promise((resolve) => { release = resolve; });
+				const lock = navigator.locks.request(${JSON.stringify(lockName)}, () => held);
+				const wipe = wipeRepo(${JSON.stringify(remote.url)}).then(() => order.push('wiped'));
+				await new Promise((resolve) => setTimeout(resolve, 200));
+				order.push('released');
+				release();
+				await Promise.all([lock, wipe]);
+				return order;
+			})()`
+		);
+		expect(order).toEqual(['released', 'wiped']);
+
+		expect(await run(second, remote.url, 'isCloned')).toBe(false);
+		expect((await run(page, remote.url, 'clone', [{ url: remote.url }])).branch).toBe('main');
+		expect((await run(page, remote.url, 'status')).clean).toBe(true);
 		expect((await run(second, remote.url, 'status')).clean).toBe(true);
 	});
 

@@ -6,6 +6,7 @@
  */
 
 import { request as webRequest } from 'isomorphic-git/http/web';
+import { networkError } from './errors.js';
 
 /** @typedef {import('isomorphic-git').HttpClient} HttpClient */
 /** @typedef {import('isomorphic-git').GitAuth} GitAuth */
@@ -37,10 +38,36 @@ export function createGitHttp({ relayOrigin = globalThis.location?.origin, signa
 	if (!relayOrigin) throw new TypeError('createGitHttp needs a relay origin outside a browser page');
 	const origin = relayOrigin;
 	return {
-		request(request) {
-			return webRequest({ ...request, url: toRelayUrl(request.url, origin), signal: request.signal ?? signal });
+		async request(request) {
+			const url = toRelayUrl(request.url, origin);
+			const activeSignal = request.signal ?? signal;
+			/**
+			 * @param {unknown} error
+			 * @returns {unknown}
+			 */
+			const translate = (error) => (error instanceof TypeError && !activeSignal?.aborted ? networkError(error) : error);
+			try {
+				const response = await webRequest({ ...request, url, signal: activeSignal });
+				return response.body ? { ...response, body: translateBody(response.body, translate) } : response;
+			} catch (error) {
+				throw translate(error);
+			}
 		}
 	};
+}
+
+/**
+ * A connection can also drop while the response body is arriving.
+ * @param {AsyncIterableIterator<Uint8Array> | Iterable<Uint8Array>} body
+ * @param {(error: unknown) => unknown} translate
+ * @yields {Uint8Array}
+ */
+async function* translateBody(body, translate) {
+	try {
+		yield* body;
+	} catch (error) {
+		throw translate(error);
+	}
 }
 
 /**
