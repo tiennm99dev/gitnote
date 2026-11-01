@@ -255,7 +255,10 @@
 <main class="mx-auto flex min-h-screen max-w-2xl flex-col gap-6 p-6">
 	<header class="flex items-baseline justify-between gap-4">
 		<h1 class="text-3xl font-bold">Repositories</h1>
-		<a class="underline" href={resolve('/connect')}>Accounts</a>
+		<span class="flex gap-4">
+			<a class="underline" href={resolve('/settings')}>Settings</a>
+			<a class="underline" href={resolve('/connect')}>Accounts</a>
+		</span>
 	</header>
 
 	{#if storageWarning}

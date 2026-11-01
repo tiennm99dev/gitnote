@@ -2,11 +2,18 @@
 	import { onMount, tick, untrack } from 'svelte';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
+	import { authSession } from '#lib/auth/index.js';
 	import { deviceDrafts, openDeviceRepo } from '#lib/git/device-repos.js';
 	import { dirName, encodePath, notePathFrom } from '#lib/notes/paths.js';
 	import { createNotes, isWithin, movedPath } from '#lib/stores/notes.js';
+	import { createAutosave } from '#lib/sync/autosave.js';
+	import { accountAuthor, isSettingsChange, loadSettings, resolveAuthor } from '#lib/sync/settings.js';
+	import { createSync } from '#lib/sync/sync.js';
+	import CommitPanel from './CommitPanel.svelte';
+	import ConflictView from './ConflictView.svelte';
 	import FileTree from './FileTree.svelte';
 	import NotePane from './NotePane.svelte';
+	import SyncStatus from './SyncStatus.svelte';
 
 	/**
 	 * @typedef {object} Props
@@ -20,6 +27,41 @@
 	const { engine, notes } = untrack(() => {
 		const opened = openDeviceRepo(repo);
 		return { engine: opened, notes: createNotes({ repoId: repo.id, provider: repo.provider, repo: opened, drafts: deviceDrafts }) };
+	});
+
+	let settings = $state(loadSettings());
+	/** @type {import('#lib/auth/session.js').AccountUser | null} */
+	let accountUser = $state(null);
+	const author = $derived(resolveAuthor(settings, accountAuthor(untrack(() => repo.provider), accountUser)));
+
+	const sync = createSync({ repoId: untrack(() => repo.id), repo: engine, notes, getAuthor: () => author });
+	const autosave = createAutosave({
+		ops: sync.autosaveOps,
+		isVisible: () => document.visibilityState === 'visible',
+		isOnline: () => navigator.onLine,
+		onError: sync.reportFailure
+	});
+
+	/**
+	 * What the main area shows besides the open note.
+	 * @type {'note' | 'changes' | 'conflicts'}
+	 */
+	let view = $state('note');
+
+	// A merge that opens comes to the front; the list goes away once it closes.
+	let mergeShown = false;
+	$effect(() => {
+		const open = $sync.merge !== null;
+		if (open === mergeShown) return;
+		mergeShown = open;
+		view = open ? 'conflicts' : 'note';
+	});
+
+	const conflictedPaths = $derived($sync.merge?.conflictedPaths ?? []);
+
+	// A new file list means a save, move, create or delete, any of which changes what can be committed.
+	$effect(() => {
+		if ($notes.treeLoaded && $notes.entries) void untrack(() => sync.refresh());
 	});
 
 	const otherUnkept = $derived($notes.unkeptPaths.filter((item) => item !== $notes.note?.path));
@@ -65,6 +107,7 @@
 		const target = path;
 		untrack(() => {
 			report = null;
+			if (view === 'changes') view = 'note';
 			if (target !== createdPath) createdPath = '';
 			notes.open(target).catch((/** @type {unknown} */ error) => {
 				report = messageOf(error);
@@ -88,14 +131,61 @@
 			});
 		};
 		const onVisible = () => {
-			if (document.visibilityState === 'visible') refresh();
+			if (document.visibilityState !== 'visible') {
+				void autosave.handleHidden();
+				return;
+			}
+			refresh();
+			void sync.refresh();
+			void sync.pushIfPending();
+			void autosave.handleVisible();
+		};
+		const onFocus = () => {
+			refresh();
+			void sync.refresh();
+		};
+		const onOnline = () => {
+			sync.setOnline(true);
+			void sync.pushIfPending();
+			void autosave.handleOnline();
+		};
+		const onOffline = () => sync.setOnline(false);
+		const applyAutosave = () => autosave.configure({ enabled: settings.autosave, intervalMinutes: settings.intervalMinutes });
+		/** @param {StorageEvent} event */
+		const onStorage = (event) => {
+			if (!isSettingsChange(event)) return;
+			settings = loadSettings();
+			void applyAutosave();
 		};
 		document.addEventListener('visibilitychange', onVisible);
 		// Two windows side by side stay visible, so only focus tells them apart.
-		window.addEventListener('focus', refresh);
+		window.addEventListener('focus', onFocus);
+		window.addEventListener('online', onOnline);
+		window.addEventListener('offline', onOffline);
+		window.addEventListener('storage', onStorage);
+
+		let alive = true;
+		(async () => {
+			try {
+				const accounts = await authSession.listAccounts();
+				accountUser = accounts.find((account) => account.provider === repo.provider)?.user ?? null;
+			} catch {
+				// With no account to read, only an author from the settings can commit.
+			}
+			await tick();
+			if (!alive) return;
+			await sync.open();
+			if (alive) await applyAutosave();
+		})().catch(sync.reportFailure);
+
 		return () => {
+			alive = false;
+			autosave.stop();
 			document.removeEventListener('visibilitychange', onVisible);
-			window.removeEventListener('focus', refresh);
+			window.removeEventListener('focus', onFocus);
+			window.removeEventListener('online', onOnline);
+			window.removeEventListener('offline', onOffline);
+			window.removeEventListener('storage', onStorage);
 		};
 	});
 
@@ -218,8 +308,18 @@
 	<header class="flex items-center gap-2 border-b border-gray-200 p-2">
 		<button type="button" class="min-h-11 rounded border border-gray-400 px-3 lg:hidden" aria-expanded={drawerOpen} aria-controls="file-drawer" onclick={() => (drawerOpen = !drawerOpen)} data-testid="drawer-toggle">Files</button>
 		<h1 class="min-w-0 flex-1 truncate font-bold" data-testid="repo-title">{repo.fullName}</h1>
+		<a class="underline" href={resolve('/settings')}>Settings</a>
 		<a class="underline" href={resolve('/repos')}>Repositories</a>
 	</header>
+
+	<SyncStatus
+		{sync}
+		autosave={$autosave}
+		unsavedNotes={$notes.draftPaths.length}
+		changesOpen={view === 'changes'}
+		onchanges={() => (view = view === 'changes' ? 'note' : 'changes')}
+		onconflicts={() => (view = view === 'conflicts' ? 'note' : 'conflicts')}
+	/>
 
 	{#if report}
 		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="workspace-report">{report}</p>
@@ -290,22 +390,31 @@
 			/>
 		</aside>
 
-		<main class="min-h-0 min-w-0 flex-1">
-			{#if $notes.note}
-				{#key `${$notes.note.path}:${$notes.note.kind === 'missing'}`}
-					<NotePane
-						note={$notes.note}
-						{notes}
-						readFile={engine.readFile}
-						linkFor={hrefFor}
-						startEditing={$notes.note.path === createdPath}
-						onreport={(text) => (report = text)}
-						onclearreport={() => (report = null)}
-						oncreatemissing={createMissing}
-					/>
-				{/key}
-			{:else if path === ''}
-				<p class="p-4 text-gray-600" data-testid="no-note">Pick a note from the file list.</p>
+		<main class="flex min-h-0 min-w-0 flex-1 flex-col">
+			{#if view === 'changes' && !$sync.merge}
+				<CommitPanel {sync} {engine} draftPaths={$notes.draftPaths} hasAuthor={author !== null} />
+			{:else}
+				{#if view === 'conflicts' && $sync.merge}
+					<ConflictView {sync} {notes} {hrefFor} current={path} onclose={() => (view = 'note')} />
+				{/if}
+				<div class="min-h-0 flex-1">
+					{#if $notes.note}
+						{#key `${$notes.note.path}:${$notes.note.kind === 'missing'}`}
+							<NotePane
+								note={$notes.note}
+								{notes}
+								readFile={engine.readFile}
+								linkFor={hrefFor}
+								startEditing={$notes.note.path === createdPath || conflictedPaths.includes($notes.note.path)}
+								onreport={(text) => (report = text)}
+								onclearreport={() => (report = null)}
+								oncreatemissing={createMissing}
+							/>
+						{/key}
+					{:else if path === ''}
+						<p class="p-4 text-gray-600" data-testid="no-note">Pick a note from the file list.</p>
+					{/if}
+				</div>
 			{/if}
 		</main>
 	</div>
