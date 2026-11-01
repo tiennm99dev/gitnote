@@ -3,8 +3,8 @@
 	import { resolve } from '$app/paths';
 	import { authSession } from '#lib/auth/index.js';
 	import { PROVIDER_IDS, PROVIDERS } from '#lib/auth/providers.js';
-	import { deleteDeviceRepo, openDeviceRepo } from '#lib/git/device-repos.js';
-	import { describeLocalWork, describeWorkCounts, isSameWork, listLocalRepos, removeLocalCopies } from '#lib/git/local-repos.js';
+	import { deleteDeviceRepo, describeDeviceWork } from '#lib/git/device-repos.js';
+	import { describeWorkCounts, isSameWork, listLocalRepos, removeLocalCopies } from '#lib/git/local-repos.js';
 
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
 
@@ -86,11 +86,7 @@
 	 * @param {ProviderId} provider
 	 * @returns {Promise<import('#lib/git/local-repos.js').LocalWork[]>}
 	 */
-	const countWork = (provider) =>
-		describeLocalWork(
-			listLocalRepos().filter((repo) => repo.provider === provider),
-			openDeviceRepo
-		);
+	const countWork = (provider) => describeDeviceWork(listLocalRepos().filter((repo) => repo.provider === provider));
 
 	/**
 	 * @param {ProviderId} provider

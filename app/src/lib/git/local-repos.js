@@ -87,15 +87,17 @@ function parseLocalRepo(text) {
  * @property {LocalRepo} repo
  * @property {number | null} unpushed commits only on this device; null when they could not be counted
  * @property {number | null} drafts changed files not yet committed; null likewise
+ * @property {number | null} [unsaved] editor buffers never saved to a file; null when they could not be counted
  */
 
 /**
- * @param {Pick<LocalWork, 'unpushed' | 'drafts'>} work
+ * @param {Pick<LocalWork, 'unpushed' | 'drafts' | 'unsaved'>} work
  * @returns {string} what deleting a copy would lose, for people
  */
-export function describeWorkCounts({ unpushed, drafts }) {
-	if (unpushed === null || drafts === null) return 'could not be read, so it may hold unpushed work';
-	return `${unpushed} unpushed ${unpushed === 1 ? 'commit' : 'commits'}, ${drafts} uncommitted ${drafts === 1 ? 'file' : 'files'}`;
+export function describeWorkCounts({ unpushed, drafts, unsaved = 0 }) {
+	if (unpushed === null || drafts === null || unsaved === null) return 'could not be read, so it may hold unpushed work';
+	const counts = `${unpushed} unpushed ${unpushed === 1 ? 'commit' : 'commits'}, ${drafts} uncommitted ${drafts === 1 ? 'file' : 'files'}`;
+	return unsaved > 0 ? `${counts}, ${unsaved} unsaved ${unsaved === 1 ? 'note' : 'notes'}` : counts;
 }
 
 /**
@@ -135,17 +137,22 @@ export async function removeLocalCopies(shown, remove) {
  * nulls rather than zero, so a warning never understates what is at risk.
  * @param {LocalRepo[]} repos
  * @param {(repo: LocalRepo) => Pick<import('./repo.js').Repo, 'countWork'>} open
+ * @param {(repo: LocalRepo) => Promise<number>} [countUnsaved] counts editor buffers kept outside the repo
  * @returns {Promise<LocalWork[]>}
  */
-export async function describeLocalWork(repos, open) {
+export async function describeLocalWork(repos, open, countUnsaved) {
 	/** @type {LocalWork[]} */
 	const work = [];
 	for (const repo of repos) {
+		/** @type {LocalWork} */
+		let item;
 		try {
-			work.push({ repo, ...(await open(repo).countWork()) });
+			item = { repo, ...(await open(repo).countWork()) };
 		} catch {
-			work.push({ repo, unpushed: null, drafts: null });
+			item = { repo, unpushed: null, drafts: null };
 		}
+		if (countUnsaved) item.unsaved = await countUnsaved(repo).catch(() => null);
+		work.push(item);
 	}
 	return work;
 }

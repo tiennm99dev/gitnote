@@ -4,10 +4,14 @@
  */
 
 import { authSession } from '../auth/index.js';
+import { createWebDraftStore } from '../stores/drafts.js';
 import { openRepoFs } from './fs.js';
 import { createGitHttp } from './http.js';
-import { forgetLocalRepo } from './local-repos.js';
+import { describeLocalWork, forgetLocalRepo } from './local-repos.js';
 import { createRepo } from './repo.js';
+
+/** Unsaved editor buffers for every repository on this device. */
+export const deviceDrafts = createWebDraftStore();
 
 /**
  * One long-lived engine object per repo, so its parsed-object cache lasts as
@@ -36,13 +40,38 @@ export function openDeviceRepo({ id, provider }) {
 }
 
 /**
- * Deletes a repository's copy on this device, including unpushed commits, if it
- * still holds what the user was shown.
+ * Counts what deleting each copy would lose, unsaved editor buffers included.
+ * @param {import('./local-repos.js').LocalRepo[]} repos
+ * @returns {Promise<import('./local-repos.js').LocalWork[]>}
+ */
+export function describeDeviceWork(repos) {
+	return describeLocalWork(repos, openDeviceRepo, countUnsaved);
+}
+
+/**
+ * @param {import('./local-repos.js').LocalRepo} repo
+ * @returns {Promise<number>}
+ */
+async function countUnsaved(repo) {
+	return (await deviceDrafts.listPaths(repo.id)).length;
+}
+
+/**
+ * Deletes a repository's copy on this device, including unpushed commits and
+ * unsaved editor buffers, if it still holds what the user was shown. The buffers
+ * go too, because they hold note text and a later clone must not revive them.
  * @param {import('./local-repos.js').LocalWork} work what the user was shown
  * @returns {Promise<boolean>} false when the copy changed and nothing was deleted
  */
-export async function deleteDeviceRepo({ repo, unpushed, drafts }) {
+export async function deleteDeviceRepo({ repo, unpushed, drafts, unsaved }) {
+	if (unsaved !== undefined && (await countUnsaved(repo).catch(() => null)) !== unsaved) return false;
 	const deleted = await openDeviceRepo(repo).wipeIfUnchanged({ unpushed, drafts });
-	if (deleted) forgetLocalRepo(repo.id);
-	return deleted;
+	if (!deleted) return false;
+	try {
+		await deviceDrafts.clear(repo.id);
+	} finally {
+		// The repo itself is gone; a failure above still surfaces to the caller.
+		forgetLocalRepo(repo.id);
+	}
+	return true;
 }

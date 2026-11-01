@@ -159,6 +159,9 @@ describe('describeWorkCounts', () => {
 	it('never understates a copy it could not read', () => {
 		expect(describeWorkCounts({ unpushed: null, drafts: null })).toContain('may hold unpushed work');
 		expect(describeWorkCounts({ unpushed: 1, drafts: 2 })).toBe('1 unpushed commit, 2 uncommitted files');
+		expect(describeWorkCounts({ unpushed: 1, drafts: 2, unsaved: 0 })).toBe('1 unpushed commit, 2 uncommitted files');
+		expect(describeWorkCounts({ unpushed: 0, drafts: 0, unsaved: 1 })).toBe('0 unpushed commits, 0 uncommitted files, 1 unsaved note');
+		expect(describeWorkCounts({ unpushed: 0, drafts: 0, unsaved: null })).toContain('may hold unpushed work');
 	});
 });
 
@@ -193,6 +196,13 @@ describe('describeLocalWork', () => {
 		const repo = openEngine(await createRemote({ 'README.md': 'seed\n' }));
 
 		expect(await describeLocalWork([ENTRY], () => repo)).toEqual([{ repo: ENTRY, unpushed: 0, drafts: 0 }]);
+	});
+
+	it('adds the editor buffers kept outside the repo, or says it could not count them', async () => {
+		const repo = openEngine(await createRemote({ 'README.md': 'seed\n' }));
+
+		expect(await describeLocalWork([ENTRY], () => repo, async () => 2)).toEqual([{ repo: ENTRY, unpushed: 0, drafts: 0, unsaved: 2 }]);
+		expect(await describeLocalWork([ENTRY], () => repo, () => Promise.reject(new Error('blocked')))).toEqual([{ repo: ENTRY, unpushed: 0, drafts: 0, unsaved: null }]);
 	});
 
 	it('says it does not know, rather than zero, when a copy cannot be read', async () => {
