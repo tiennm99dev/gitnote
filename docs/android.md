@@ -13,13 +13,17 @@ so they run on a PC with Android Studio or in GitHub Actions.
   `gitnote://oauth/callback`. PKCE and `state` make a code useless to another app
   claiming that scheme. Both ways Android delivers the link are handled:
   `appUrlOpen`, and `getLaunchUrl` when the callback starts the app. Any website or
-  app can fire that link, so one this device is not waiting for leaves the open page
-  and the Custom Tab alone, and only shows a notice. Android repeats the launch URL
+  app can fire that link. One this device is not waiting for keeps the open page and
+  the pending sign-in, makes no call to close the Custom Tab, and only shows a notice.
+  Android may still drop the tab, because the link brings the `singleTask` activity
+  forward, so the user may need to tap sign-in again. Android repeats the launch URL
   when it recreates the task from Recents, so an unawaited launch URL shows nothing.
 - **Tokens** are in `@aparajita/capacitor-secure-storage`, encrypted with an Android
   Keystore key. Its file is left out of backups by `backup_rules.xml` and
   `data_extraction_rules.xml`, because a new device does not get the key. Notes and
   clones in the WebView's storage are not excluded, so Android backups can hold them.
+  A record whose key is lost for good reads as signed out. Any other Keystore failure
+  shows as a storage error and leaves the record in place.
 - **Content Security Policy.** The build uses `CAP_BUILD=1`, which sets `script-src`
   to `'self' 'unsafe-inline'`, because Capacitor can inject its bridge as a nonce-less
   inline script. DOMPurify is therefore the only XSS defence on Android.
@@ -45,7 +49,8 @@ also runs `app/scripts/check-deployable-build.js` as its build command, so a bar
 
 ## Run it on a device
 
-On a PC with Android Studio, a JDK 21 and a device or emulator:
+The app needs the relay deployed at `gitnote.miti99.dev` for sign-in and git. On a PC
+with Android Studio, a JDK 21 and a device or emulator:
 
 ```sh
 npm ci
@@ -58,7 +63,8 @@ npx cap run android
 
 Then check on the device:
 
-1. Sign in with GitHub and with GitLab. The Custom Tab closes and the repo list shows.
+1. Sign in with GitHub and with GitLab. The Custom Tab closes and the repo list shows,
+   with no blank or frozen overlay left on top.
 2. Clone a repo, edit a note, commit, push and pull.
 3. Turn on autosave in Settings, edit a note, and leave the app. Open the repo on
    github.com: nothing new. Return to the app: the commit arrives.
@@ -70,6 +76,15 @@ Then check on the device:
    Return to the Android app: the repositories show up.
 6. Check the layout on Android 15 or newer, where the app draws edge to edge: no
    heading, button or editor line sits under the status bar or the navigation bar.
+7. Start a sign-in and, with the Custom Tab open, fire a link this device is not
+   waiting for:
+
+   ```sh
+   adb shell "am start -a android.intent.action.VIEW -d 'gitnote://oauth/callback?code=x&state=none'"
+   ```
+
+   The app keeps its page and shows the ignored-link notice, and no account is added.
+   Note whether the Custom Tab survives. If it closes, tapping sign-in again must work.
 
 ## Release signing
 
@@ -100,6 +115,9 @@ gh secret set ANDROID_KEYSTORE_PASSWORD -R tiennm99dev/gitnote --env android-rel
 gh secret set ANDROID_KEY_ALIAS -R tiennm99dev/gitnote --env android-release --body gitnote
 gh secret set ANDROID_KEY_PASSWORD -R tiennm99dev/gitnote --env android-release
 ```
+
+That `keytool` command makes a PKCS12 keystore, which has one password, so give
+`ANDROID_KEY_PASSWORD` the same value as `ANDROID_KEYSTORE_PASSWORD`.
 
 In PowerShell, replace the first secret line with:
 

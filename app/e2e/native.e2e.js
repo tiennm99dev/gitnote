@@ -171,7 +171,7 @@ test('an app link this device did not ask for stays on the page and says so, and
 	await expect(page.getByTestId('sign-in-link-ignored')).toBeHidden();
 });
 
-test('a forged app link during a sign-in leaves the real one to finish, and clears its code', async ({ page }) => {
+test('an unawaited app link during a sign-in makes no close call and keeps the sign-in pending', async ({ page }) => {
 	const device = await installNativeShell(page);
 	await serveApi(page, 'github', GOOD_TOKEN, { '/user/installations?per_page=100&page=1': { installations: [] } });
 	const exchange = await serveGithubExchange(page);

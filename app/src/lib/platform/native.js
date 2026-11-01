@@ -58,8 +58,9 @@ export function callbackQuery(url) {
  * the app is alive, `getLaunchUrl` when the callback launched it.
  *
  * Any website or app can fire this link, so one this device is not waiting for
- * stays out of the way: it must not leave the open page, and must not close the
- * Custom Tab of a real sign-in. An `appUrlOpen` like that is reported. A launch URL
+ * stays out of the way: it keeps the open page and the pending sign-in, and makes
+ * no close call. Android may still drop the Custom Tab, because the link brings the
+ * singleTask activity forward. An `appUrlOpen` like that is reported. A launch URL
  * like that is dropped quietly, because Android hands the original launch intent
  * back whenever the task is recreated from Recents, so it may be a sign-in that
  * finished days ago.
