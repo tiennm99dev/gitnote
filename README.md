@@ -6,8 +6,8 @@ its markdown as notes, and commits and pushes only when you say so. The server
 keeps nothing about users: a stateless Cloudflare Worker serves the app and
 relays git traffic the browser cannot send directly.
 
-Status: early development. You can connect an account and clone a repo; the
-notes UI is next.
+Status: early development. You can connect an account, clone a repo, and
+browse, edit and search its notes on the device; commit and sync are next.
 
 ## Layout
 
@@ -33,7 +33,7 @@ Run from the repo root:
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in and repo pages with the providers' APIs stood in for and real git behind the relay |
+| `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in, repo and notes pages with the providers' APIs stood in for and real git behind the relay |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 
@@ -101,6 +101,30 @@ GITHUB_CLIENT_SECRET=<GitHub App client secret>
 
 In production, set the credentials with `wrangler secret put GITHUB_CLIENT_ID`
 and `wrangler secret put GITHUB_CLIENT_SECRET`.
+
+## Notes
+
+`/repo/<id>/<path>` is the notes screen, with the repo id URL-encoded into one
+segment. `app/src/lib/stores/notes.js` holds its state.
+
+- **Where text lives.** The editor's buffer is copied to a draft in IndexedDB
+  (`gitnote-drafts`) on every change, so a reload loses nothing. Save writes it
+  to the working tree. Only a commit puts it in git, and nothing on this screen
+  commits. A draft remembers the file it started from: if the file changes
+  underneath it, the user chooses between the two, and neither is overwritten
+  until they do. Deleting a copy counts its drafts in the warning and removes
+  them with it.
+- **Bytes.** Line endings and a byte order mark survive open and save unchanged.
+  A file over 5 MB, or one that is not valid UTF-8, shows its size only.
+- **Rendering** (`app/src/lib/markdown/render.js`). markdown-it with raw HTML on,
+  then DOMPurify, then image and link rewriting. Raw HTML keeps its structure but
+  loses `style`, `class`, forms and media, so a note cannot pose as the app.
+  `blob:` URLs are made only for PNG, JPEG, GIF, WebP and SVG, and only land in an
+  `<img>`. Remote images become links, because the CSP blocks them. Relative links
+  open in the app.
+- **Images** go to `assets/` next to the note, under a name not in use, after the
+  per-file size check.
+- **Search** scans the working tree's markdown files in memory, ignoring case.
 
 ## Git engine
 
