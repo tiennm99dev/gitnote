@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">gitnote</string>
+    <string name="title_activity_main">gitnote</string>
+    <string name="package_name">com.miti99.gitnote</string>
+    <string name="custom_url_scheme">com.miti99.gitnote</string>
+</resources>

@@ -17,9 +17,11 @@
     "typecheck": "npm run check --workspaces",
     "test": "npm run test --workspaces",
     "build": "npm run build --workspaces",
-    "e2e": "npm run e2e -w app"
+    "e2e": "npm run e2e -w app",
+    "android:sync": "npm run build:native -w app && cap sync android"
   },
   "devDependencies": {
+    "@capacitor/cli": "^8.6.0",
     "@eslint/js": "^10.0.1",
     "eslint": "^10.13.0",
     "eslint-plugin-jsdoc": "^65.4.2",
@@ -30,5 +32,12 @@
     "esbuild": true,
     "fsevents": false,
     "workerd": true
+  },
+  "dependencies": {
+    "@aparajita/capacitor-secure-storage": "^8.0.1",
+    "@capacitor/android": "^8.6.0",
+    "@capacitor/app": "^8.1.2",
+    "@capacitor/browser": "^8.0.5",
+    "@capacitor/core": "^8.6.0"
   }
 }

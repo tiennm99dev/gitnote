@@ -3,6 +3,7 @@ node_modules/
 # Build output
 /app/build/
 /app/build-e2e/
+/app/build-native-e2e/
 /app/.svelte-kit/
 /relay/dist/
 .wrangler/
