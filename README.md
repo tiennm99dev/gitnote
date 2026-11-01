@@ -33,7 +33,7 @@ Run from the repo root:
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in and repo pages with the providers' APIs stood in for and real git behind the relay |
+| `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in and repo pages with the providers' APIs stood in for and real git behind the relay |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 
@@ -200,14 +200,19 @@ the gitlab.com application, and where their IDs go, is in
 - **Refresh.** Tokens refresh 5 minutes before expiry and on a 401. Both providers
   rotate refresh tokens, so every refresh holds a per-provider Web Lock and rereads
   the store inside it, and the new pair is stored in one write. A refresh that
-  cannot reach the provider keeps the sign-in, and a token still in date stays in
-  use. A refused one flags the sign-in as ended and never touches local clones.
+  cannot be answered keeps the sign-in, and a token still in date stays in use.
+  Only an explicit refusal of the refresh token (`bad_refresh_token`,
+  `invalid_grant`) flags the sign-in as ended, and that never touches local clones.
+  Any other answer, such as a blocked request or a wrong client secret, says nothing
+  about the token, so it is tried again.
 - **Where tokens go.** Only to the provider's API and, through the relay, its git
   host: `gitCredentials` refuses any other host, and clone URLs are built from the
   repo's path rather than taken from the API. The git username is `x-access-token`
   on GitHub and `oauth2` on GitLab.
-- **Sign-out** removes the token, and deletes the provider's local copies only if
-  asked, after showing each copy's unpushed commits and uncommitted files.
+- **Sign-out** deletes the provider's local copies only if asked, after showing
+  each copy's unpushed commits and uncommitted files and counting them again at
+  confirmation, then removes the token. A failed deletion keeps the sign-in so it can
+  be retried. `/repos` can delete any copy on its own, with or without an account.
 
 ## Tooling notes
 
