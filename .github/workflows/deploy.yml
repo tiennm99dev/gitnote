@@ -1,0 +1,100 @@
+name: Deploy
+
+# Publishes the commit CI just passed on `main`, then tests the live site. Starting
+# it by hand republishes `main`, for example after changing a sign-in ID below, which
+# is built into the app.
+#
+# `workflow_run` runs with this repository's secrets whatever started CI, and a fork's
+# pull request from a branch named `main` also matches the branch filter, so the event
+# and repository checks below are what keep such a run out.
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Never two at once: they would race to publish, and the live tests reset one branch.
+concurrency:
+  group: deploy
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    if: >-
+      github.repository == 'tiennm99dev/gitnote' && (
+        (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
+        (github.event.workflow_run.conclusion == 'success' &&
+         github.event.workflow_run.event == 'push' &&
+         github.event.workflow_run.head_repository.full_name == github.repository)
+      )
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      # The IDs are public, and blank ones turn that provider's sign-in button off.
+      - name: Build the web app
+        run: npm run build -w app
+        env:
+          VITE_GITHUB_CLIENT_ID: ${{ vars.VITE_GITHUB_CLIENT_ID }}
+          VITE_GITHUB_APP_SLUG: ${{ vars.VITE_GITHUB_APP_SLUG }}
+          VITE_GITLAB_CLIENT_ID: ${{ vars.VITE_GITLAB_CLIENT_ID }}
+
+      # The token appears in this step alone, so the build's packages never see it.
+      - name: Deploy the Worker
+        run: npm run deploy -w relay
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
+
+  # Skipped until the test repo is named. Its token reaches only the test step, and
+  # this job uploads nothing: a Playwright run with a token must publish no artifacts.
+  live-e2e:
+    needs: deploy
+    if: vars.GITNOTE_E2E_REPO != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          persist-credentials: false
+
+      - name: Setup Node
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Test the live site
+        run: |
+          if [ -z "$GITNOTE_E2E_TOKEN" ]; then
+            echo '::error::GITNOTE_E2E_REPO is set but the GITNOTE_E2E_TOKEN secret is not.'
+            exit 1
+          fi
+          npm run e2e:live
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+          GITNOTE_E2E_REPO: ${{ vars.GITNOTE_E2E_REPO }}
+          GITNOTE_E2E_TOKEN: ${{ secrets.GITNOTE_E2E_TOKEN }}

@@ -8,6 +8,7 @@
   // from the app's CSP connect-src.
   "workers_dev": false,
   "preview_urls": false,
+  "routes": [{ "pattern": "gitnote.miti99.dev", "custom_domain": true }],
   // `npm run android:sync` writes a build the web must never get into the assets
   // directory, so a deploy from there stops here, however it was started.
   "build": {
