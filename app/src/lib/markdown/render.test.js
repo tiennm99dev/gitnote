@@ -267,6 +267,17 @@ describe('links', () => {
 		expect(ids).toEqual(['user-content-same-one', 'user-content-same-one-1', 'user-content-tiếng-việt-code', null]);
 	});
 
+	it('makes a hyphen of each space, so a link from a git host still lands', async () => {
+		const { dom } = await render('# Foo & Bar\n\n[x](#foo--bar)');
+		expect(dom.querySelector('h1')?.id).toBe('user-content-foo--bar');
+		expect(dom.querySelector('a')?.getAttribute('href')).toBe('#user-content-foo--bar');
+	});
+
+	it('never repeats an id, even against a heading that looks like a numbered copy', async () => {
+		const { dom } = await render('# a\n\n# a\n\n# a-1\n\n# a\n');
+		expect([...dom.querySelectorAll('h1')].map((heading) => heading.id)).toEqual(['user-content-a', 'user-content-a-1', 'user-content-a-1-1', 'user-content-a-2']);
+	});
+
 	it('finds a heading through a link with an accented fragment', async () => {
 		const { dom } = await render('# Tiếng Việt\n\n[x](#tiếng-việt)');
 		const fragment = dom.querySelector('a')?.getAttribute('href')?.slice(1) ?? '';

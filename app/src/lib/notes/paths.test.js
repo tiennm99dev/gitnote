@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { imagePathFor, imageTypeFor, isMarkdownPath, relativeUrlFrom, resolveNoteUrl } from './paths.js';
+import { imagePathFor, imageTypeFor, isMarkdownPath, notePathFrom, relativeUrlFrom, resolveNoteUrl } from './paths.js';
 
 describe('file kinds', () => {
 	it('knows markdown and allowed images by extension, ignoring case', () => {
@@ -9,6 +9,27 @@ describe('file kinds', () => {
 		expect(imageTypeFor('a/b.JPG')).toBe('image/jpeg');
 		expect(imageTypeFor('a.svg')).toBe('image/svg+xml');
 		for (const path of ['a.html', 'a.htm', 'a.xml', 'a.js', 'png', 'constructor']) expect(imageTypeFor(path)).toBeNull();
+	});
+});
+
+describe('the path of a new note', () => {
+	it.each([
+		['idea', 'idea.md'],
+		['  ideas/first idea ', 'ideas/first idea.md'],
+		['meeting 11.01', 'meeting 11.01.md'],
+		['v1.2/release.notes', 'v1.2/release.notes.md'],
+		['a.md', 'a.md'],
+		['A.MARKDOWN', 'A.MARKDOWN'],
+		['todo.txt', 'todo.txt'],
+		['pic.png', 'pic.png'],
+		['.gitignore', '.gitignore']
+	])('turns %j into %j', (typed, path) => {
+		expect(notePathFrom(typed)).toBe(path);
+		if (path.endsWith('.md')) expect(isMarkdownPath(path)).toBe(true);
+	});
+
+	it.each(['', '   ', 'foo/', 'a/b/ '])('finds no file in %j', (typed) => {
+		expect(notePathFrom(typed)).toBeNull();
 	});
 });
 

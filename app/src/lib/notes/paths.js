@@ -16,6 +16,9 @@ const IMAGE_TYPES = Object.freeze({
 
 const MARKDOWN_EXTENSIONS = new Set(['md', 'markdown']);
 
+/** Other types a new note may name. Any other dotted ending is part of its name, as in `meeting 11.01`. */
+const NOTE_TEXT_EXTENSIONS = new Set(['txt', 'csv', 'json', 'yaml', 'yml', 'toml', 'html', 'xml']);
+
 const URL_SCHEME = /^[a-z][a-z0-9+.-]*:/i;
 
 /**
@@ -43,6 +46,21 @@ export function isMarkdownPath(path) {
 export function imageTypeFor(path) {
 	const extension = extensionOf(path);
 	return Object.hasOwn(IMAGE_TYPES, extension) ? IMAGE_TYPES[/** @type {keyof typeof IMAGE_TYPES} */ (extension)] : null;
+}
+
+/**
+ * @param {string} value what the user typed for a new note
+ * @returns {string | null} the path, as a markdown file unless it names a known
+ *   type or a dotfile; null when it names no file
+ */
+export function notePathFrom(value) {
+	const path = value.trim();
+	const name = baseName(path);
+	if (name === '') return null;
+	const extension = extensionOf(path);
+	const named = MARKDOWN_EXTENSIONS.has(extension) || NOTE_TEXT_EXTENSIONS.has(extension) || imageTypeFor(path) !== null;
+	const dotfile = name.startsWith('.') && extension === '';
+	return named || dotfile ? path : `${path}.md`;
 }
 
 /**

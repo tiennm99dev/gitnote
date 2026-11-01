@@ -1,9 +1,11 @@
+import { symlink } from 'node:fs/promises';
+import path from 'node:path';
 import { memfs } from 'memfs';
 import { get } from 'svelte/store';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { memoryDraftStore } from '../../../test/draft-doubles.js';
 import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
-import { createRemote, RELAY_PORT, showRemote } from '../../../test/remote-repo.js';
+import { changeElsewhere, createRemote, RELAY_PORT, runGit, showRemote } from '../../../test/remote-repo.js';
 import { ErrorCode } from '../git/errors.js';
 import { createGitHttp } from '../git/http.js';
 import { createRepo } from '../git/repo.js';
@@ -21,10 +23,12 @@ const SEED = {
 /**
  * A real clone on an in-memory file system, as the store sees it in the browser.
  * @param {Record<string, string>} [seed]
+ * @param {(remote: import('../../../test/remote-repo.js').Remote) => Promise<unknown>} [prepare] changes the remote before the clone
  * @returns {Promise<{ remote: import('../../../test/remote-repo.js').Remote, repo: import('../git/repo.js').Repo, drafts: ReturnType<typeof memoryDraftStore>, notes: import('./notes.js').Notes, open: () => import('./notes.js').Notes }>}
  */
-async function setUp(seed = SEED) {
+async function setUp(seed = SEED, prepare = async () => undefined) {
 	const remote = await createRemote(seed);
+	await prepare(remote);
 	const repo = createRepo({
 		id: remote.id,
 		fs: /** @type {import('../git/repo.js').FsClient} */ (/** @type {unknown} */ (memfs().fs)),
@@ -191,6 +195,99 @@ describe('unsaved buffers', () => {
 		expect(openNote(notes)).toMatchObject({ draftFailed: false, draftStored: true });
 	});
 
+	it('keeps text the browser refused when the user moves to another note and back', async () => {
+		const { notes, drafts } = context;
+		await notes.open('README.md');
+		drafts.failing.put = true;
+		notes.edit('precious\n');
+		await notes.open('notes/today.md');
+		expect(get(notes).unkeptPaths).toEqual(['README.md']);
+		expect(get(notes).draftPaths).toEqual(['README.md']);
+
+		await notes.open('README.md');
+		await notes.flushDrafts();
+		expect(openNote(notes)).toMatchObject({ text: 'precious\n', dirty: true, restored: true, draftFailed: true, draftStored: false });
+		expect(get(notes).unkeptPaths).toEqual(['README.md']);
+	});
+
+	it('stores refused text as soon as the browser has room again', async () => {
+		const { notes, drafts, open } = context;
+		await notes.open('README.md');
+		drafts.failing.put = true;
+		notes.edit('precious\n');
+		await notes.open('notes/today.md');
+		drafts.failing.put = false;
+
+		await notes.open('README.md');
+		await notes.flushDrafts();
+		expect(openNote(notes)).toMatchObject({ draftFailed: false, draftStored: true });
+		expect(get(notes).unkeptPaths).toEqual([]);
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded).text).toBe('precious\n');
+	});
+
+	it('carries refused text along when its note moves', async () => {
+		const { notes, drafts } = context;
+		await notes.open('README.md');
+		drafts.failing.put = true;
+		notes.edit('precious\n');
+		await notes.move('README.md', 'moved.md');
+		expect(get(notes).unkeptPaths).toEqual(['moved.md']);
+		expect(get(notes).draftPaths).toEqual(['moved.md']);
+
+		await notes.open('moved.md');
+		expect(openNote(notes)).toMatchObject({ text: 'precious\n', dirty: true });
+	});
+
+	it('forgets refused text once it is saved, discarded, undone or deleted', async () => {
+		const { notes, drafts, repo } = context;
+		drafts.failing.put = true;
+		const refuse = async (/** @type {string} */ path) => {
+			await notes.open(path);
+			notes.edit('precious\n');
+			await notes.flushDrafts();
+			expect(get(notes).unkeptPaths).toEqual([path]);
+		};
+
+		await refuse('README.md');
+		await notes.save();
+		await notes.flushDrafts();
+		expect(await repo.readText('README.md')).toBe('precious\n');
+		expect(get(notes).unkeptPaths).toEqual([]);
+
+		await refuse('notes/today.md');
+		await notes.discard();
+		expect(openNote(notes).text).toBe(SEED['notes/today.md']);
+		expect(get(notes).unkeptPaths).toEqual([]);
+
+		await refuse('notes/crlf.md');
+		notes.edit(SEED['notes/crlf.md']);
+		await notes.flushDrafts();
+		expect(get(notes).unkeptPaths).toEqual([]);
+
+		await refuse('notes/plain.txt');
+		await notes.remove('notes/plain.txt');
+		expect(get(notes).unkeptPaths).toEqual([]);
+		expect(get(notes).draftPaths).toEqual([]);
+	});
+
+	it('drops the restored notice when the buffer is edited back to the file', async () => {
+		const { notes, open } = context;
+		await notes.open('README.md');
+		notes.edit('x');
+		await notes.flushDrafts();
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded).restored).toBe(true);
+		reloaded.edit('xy');
+		expect(openNote(reloaded).restored).toBe(true);
+		reloaded.edit('# Readme\n');
+		expect(openNote(reloaded)).toMatchObject({ dirty: false, restored: false });
+	});
+
 	it('discard goes back to the file for good', async () => {
 		const { notes, open, drafts } = context;
 		await notes.open('README.md');
@@ -205,6 +302,109 @@ describe('unsaved buffers', () => {
 		const reloaded = open();
 		await reloaded.open('README.md');
 		expect(openNote(reloaded).dirty).toBe(false);
+	});
+});
+
+describe('a replacement character in a note', () => {
+	const TEXT = 'copied \uFFFD text\n';
+
+	it('saves again and reopens as markdown', async () => {
+		const { notes, open, repo } = await setUp();
+		await notes.open('README.md');
+		notes.edit(TEXT);
+		expect(await notes.save()).toBe(true);
+		notes.edit(`${TEXT}more\n`);
+		expect(await notes.save()).toBe(true);
+		expect(openNote(notes).diskChanged).toBe(false);
+		expect(await repo.readText('README.md')).toBe(`${TEXT}more\n`);
+
+		const reloaded = open();
+		await reloaded.open('README.md');
+		expect(openNote(reloaded)).toMatchObject({ kind: 'markdown', text: `${TEXT}more\n`, dirty: false });
+	});
+
+	it('opens and searches a note committed with one', async () => {
+		const { notes } = await setUp({ 'a.md': `needle ${TEXT}` });
+		await notes.open('a.md');
+		expect(openNote(notes)).toMatchObject({ kind: 'markdown', text: `needle ${TEXT}` });
+		expect((await notes.search('needle')).hits.map((hit) => hit.path)).toEqual(['a.md']);
+	});
+});
+
+describe('typing while a clean note reloads', () => {
+	it('keeps what was typed and asks the user to choose', async () => {
+		const { repo, drafts } = await setUp();
+		/** @type {() => void} */
+		let release = () => undefined;
+		const held = new Promise((resolve) => {
+			release = () => resolve(undefined);
+		});
+		let holding = false;
+		const notes = createNotes({
+			repoId: REPO_ID,
+			provider: 'github',
+			repo,
+			drafts: {
+				...drafts,
+				get: async (repoId, path) => {
+					const found = await drafts.get(repoId, path);
+					if (holding) await held;
+					return found;
+				}
+			}
+		});
+		await notes.open('README.md');
+		const { version } = openNote(notes);
+		await repo.writeFile('README.md', 'from another tab\n');
+
+		holding = true;
+		const refreshed = notes.refresh();
+		await expect.poll(() => holding && get(notes).treeLoaded).toBe(true);
+		// Let the refresh reach the reload, then type inside its window.
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		notes.edit('# Readme\ntyped words\n');
+		release();
+		await refreshed;
+		await notes.flushDrafts();
+
+		expect(openNote(notes)).toMatchObject({ version, text: '# Readme\ntyped words\n', savedText: '# Readme\n', dirty: true, diskChanged: true });
+		expect(await repo.readText('README.md')).toBe('from another tab\n');
+		expect((await drafts.get(REPO_ID, 'README.md'))?.text).toBe('# Readme\ntyped words\n');
+	});
+
+	it('still follows the file when nothing was typed', async () => {
+		const { notes, repo } = await setUp();
+		await notes.open('README.md');
+		await repo.writeFile('README.md', 'from another tab\n');
+		await notes.refresh();
+		expect(openNote(notes)).toMatchObject({ text: 'from another tab\n', dirty: false, diskChanged: false });
+	});
+});
+
+describe('a committed symbolic link', () => {
+	/** @returns {ReturnType<typeof setUp>} a repo holding link.md, which points at README.md */
+	const withLink = () =>
+		setUp(SEED, (remote) =>
+			changeElsewhere(remote, {}, async (work) => {
+				await symlink('README.md', path.join(work, 'link.md'));
+				await runGit(['add', 'link.md'], work);
+			})
+		);
+
+	it('is listed and opens as a link, without following it', async () => {
+		const { notes } = await withLink();
+		await notes.open('link.md');
+		expect(get(notes).entries.find((entry) => entry.path === 'link.md')?.symlink).toBe(true);
+		expect(openNote(notes)).toMatchObject({ kind: 'symlink', text: '', dirty: false });
+		notes.edit('x');
+		expect(openNote(notes).text).toBe('');
+		expect(await notes.save()).toBe(false);
+	});
+
+	it('is left out of search, and new files cannot take its path', async () => {
+		const { notes } = await withLink();
+		expect((await notes.search('Readme')).hits.map((hit) => hit.path)).toEqual(['README.md']);
+		await expect(notes.create('link.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
 	});
 });
 
@@ -339,6 +539,32 @@ describe('files and folders', () => {
 		await expect(notes.create('notes')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
 		await expect(notes.create('README.md/x.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
 		expect(await repo.readText('README.md')).toBe('# Readme\n');
+	});
+
+	it('counts a draft whose file is gone as that file', async () => {
+		const { notes, repo } = context;
+		await notes.open('README.md');
+		notes.edit('kept\n');
+		await notes.flushDrafts();
+		await repo.remove('README.md');
+
+		await expect(notes.create('README.md/x.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS, message: expect.stringContaining('README.md has unsaved text') });
+		await expect(notes.createFolder('README.md')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		expect(get(notes).entries.map((entry) => entry.path)).not.toContain('README.md/x.md');
+
+		// The draft may still get its own file back.
+		expect(await notes.create('README.md')).toBe('README.md');
+	});
+
+	it('counts a draft inside a folder that is gone', async () => {
+		const { notes, repo } = context;
+		await notes.open('notes/today.md');
+		notes.edit('kept\n');
+		await notes.flushDrafts();
+		await repo.remove('notes');
+
+		await expect(notes.create('notes')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
+		await expect(notes.createFolder('notes')).rejects.toMatchObject({ code: ErrorCode.PATH_EXISTS });
 	});
 
 	it('refuses bad paths', async () => {

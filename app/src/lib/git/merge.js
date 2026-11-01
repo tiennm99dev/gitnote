@@ -32,7 +32,15 @@ const OID = /^[0-9a-f]{40}$/;
  * @returns {boolean} whether a line merge could damage the file
  */
 export function isBinary(content) {
-	return content.slice(0, BINARY_SNIFF_LENGTH).includes('\0') || content.includes('\uFFFD');
+	return hasNulByte(content) || content.includes('\uFFFD');
+}
+
+/**
+ * @param {string} content a decoded file
+ * @returns {boolean} whether its start holds a NUL, which text files do not have
+ */
+export function hasNulByte(content) {
+	return content.slice(0, BINARY_SNIFF_LENGTH).includes('\0');
 }
 
 /**

@@ -1,9 +1,9 @@
 <script>
 	import { onMount, tick, untrack } from 'svelte';
-	import { goto } from '$app/navigation';
+	import { beforeNavigate, goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { deviceDrafts, openDeviceRepo } from '#lib/git/device-repos.js';
-	import { dirName, encodePath } from '#lib/notes/paths.js';
+	import { dirName, encodePath, notePathFrom } from '#lib/notes/paths.js';
 	import { createNotes, isWithin, movedPath } from '#lib/stores/notes.js';
 	import FileTree from './FileTree.svelte';
 	import NotePane from './NotePane.svelte';
@@ -21,6 +21,8 @@
 		const opened = openDeviceRepo(repo);
 		return { engine: opened, notes: createNotes({ repoId: repo.id, provider: repo.provider, repo: opened, drafts: deviceDrafts }) };
 	});
+
+	const otherUnkept = $derived($notes.unkeptPaths.filter((item) => item !== $notes.note?.path));
 
 	let drawerOpen = $state(untrack(() => path === ''));
 	/** @type {string | null} */
@@ -68,6 +70,15 @@
 				report = messageOf(error);
 			});
 		});
+	});
+
+	// Staying in this repository keeps the store, and with it any text storage refused.
+	beforeNavigate((navigation) => {
+		if (navigation.to?.params?.id === repo.id) return;
+		const { unkeptPaths, note } = $notes;
+		if (unkeptPaths.length === 0 && !(note?.dirty && !note.draftStored)) return;
+		// Leaving the page: cancelling makes the browser ask.
+		if (navigation.willUnload || !window.confirm('This browser could not keep some unsaved text, so leaving this repository loses it. Leave anyway?')) navigation.cancel();
 	});
 
 	onMount(() => {
@@ -124,15 +135,6 @@
 		});
 	};
 
-	/**
-	 * @param {string} value
-	 * @returns {string} the path, as a markdown file unless it names an extension
-	 */
-	const asNotePath = (value) => {
-		const trimmed = value.trim();
-		return /\.[^./]+$/.test(trimmed) ? trimmed : `${trimmed}.md`;
-	};
-
 	/** @param {SubmitEvent} event */
 	const submitAsk = async (event) => {
 		event.preventDefault();
@@ -159,7 +161,12 @@
 				await notes.createFolder(current.value.trim().replace(/\/+$/, ''));
 				closeAsk();
 			} else {
-				const created = await notes.create(asNotePath(current.value));
+				const target = notePathFrom(current.value);
+				if (target === null) {
+					askFailure = 'Give the note a name, not only a folder.';
+					return;
+				}
+				const created = await notes.create(target);
 				createdPath = created;
 				closeAsk();
 				drawerOpen = false;
@@ -216,6 +223,17 @@
 
 	{#if report}
 		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="workspace-report">{report}</p>
+	{/if}
+	{#if otherUnkept.length > 0}
+		<div role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="unkept-drafts">
+			<p>This browser refused to keep unsaved text in these notes. A reload or closing the tab would lose it, so open and save them now:</p>
+			<ul class="flex flex-wrap gap-x-3">
+				{#each otherUnkept as unkept (unkept)}
+					<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- hrefFor builds the route with resolve() -->
+					<li><a class="underline" href={hrefFor(unkept)}>{unkept}</a></li>
+				{/each}
+			</ul>
+		</div>
 	{/if}
 	{#if $notes.treeError}
 		<p role="alert" class="bg-red-50 p-2 text-red-700" data-testid="tree-error">The file list could not be read, so creating, moving and deleting are off: {$notes.treeError}</p>

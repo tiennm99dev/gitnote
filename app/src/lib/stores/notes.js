@@ -17,6 +17,10 @@
  * into view stores its buffer again if the draft no longer matches. So the last
  * tab to write or come back holds the draft; closing a tab with a dirty buffer
  * that had lost the draft, without returning to it, loses that buffer.
+ *
+ * When storage refuses a draft, the text stays in this store's memory instead,
+ * by path, so moving between notes loses nothing. Only leaving the repository or
+ * the page can then lose it, and `unkeptPaths` tells the screen to ask first.
  */
 
 import { writable } from 'svelte/store';
@@ -34,8 +38,9 @@ import { decodeText, MAX_TEXT_BYTES } from '../notes/text.js';
  * - `markdown`, `text`: `text` holds the buffer.
  * - `image`: shown from the file; `text` is empty.
  * - `binary`, `large`: only `size` is known.
+ * - `symlink`: a symbolic link, which is neither followed nor edited here.
  * - `missing`: no file there.
- * @typedef {'markdown' | 'text' | 'image' | 'binary' | 'large' | 'missing'} NoteKind
+ * @typedef {'markdown' | 'text' | 'image' | 'binary' | 'large' | 'symlink' | 'missing'} NoteKind
  */
 
 /**
@@ -57,6 +62,7 @@ import { decodeText, MAX_TEXT_BYTES } from '../notes/text.js';
  * @typedef {object} NotesState
  * @property {TreeEntry[]} entries
  * @property {string[]} draftPaths paths with an unsaved draft
+ * @property {string[]} unkeptPaths paths whose unsaved text storage refused, so only this store holds it
  * @property {boolean} treeLoaded
  * @property {string | null} treeError
  * @property {OpenNote | null} note
@@ -119,7 +125,7 @@ const overlaps = (a, b) => isWithin(a, b) || isWithin(b, a);
  */
 export function createNotes({ repoId, provider, repo, drafts }) {
 	/** @type {NotesState} */
-	let state = { entries: [], draftPaths: [], treeLoaded: false, treeError: null, note: null };
+	let state = { entries: [], draftPaths: [], unkeptPaths: [], treeLoaded: false, treeError: null, note: null };
 	const store = writable(state);
 
 	/** @param {Partial<NotesState>} change */
@@ -150,8 +156,17 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 	 * @type {Map<string, string>}
 	 */
 	const ownDrafts = new Map();
+	/**
+	 * Drafts storage refused, by path: newer than anything stored for that path.
+	 * @type {Map<string, Draft>}
+	 */
+	const unkeptDrafts = new Map();
+	const publishUnkept = () => set({ unkeptPaths: [...unkeptDrafts.keys()] });
 
 	const writePendingDrafts = async () => {
+		// Never finish before the caller has recorded this run: removing a draft this
+		// tab never stored awaits nothing, and `writing` would then stay set for good.
+		await null;
 		for (const [path, draft] of pendingDrafts) {
 			pendingDrafts.delete(path);
 			try {
@@ -165,6 +180,10 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				}
 				if (state.note?.path === path && !pendingDrafts.has(path)) setNote({ draftStored: true, draftFailed: false });
 			} catch {
+				if (draft && !pendingDrafts.has(path)) {
+					unkeptDrafts.set(path, draft);
+					publishUnkept();
+				}
 				if (state.note?.path === path) setNote({ draftStored: false, draftFailed: true });
 			}
 		}
@@ -180,6 +199,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 	 */
 	const queueDraft = (path, draft) => {
 		pendingDrafts.set(path, draft);
+		if (unkeptDrafts.delete(path)) publishUnkept();
 		const listed = state.draftPaths.includes(path);
 		if (draft && !listed) set({ draftPaths: [...state.draftPaths, path] });
 		else if (!draft && listed) set({ draftPaths: state.draftPaths.filter((item) => item !== path) });
@@ -206,6 +226,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				if (draft) merged.add(path);
 				else merged.delete(path);
 			}
+			for (const path of unkeptDrafts.keys()) merged.add(path);
 			set({ entries, draftPaths: [...merged], treeLoaded: true, treeError: null });
 		} catch (error) {
 			set({ treeLoaded: true, treeError: error instanceof Error ? error.message : 'The file list could not be read.' });
@@ -229,6 +250,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		if (!state.treeError) {
 			const entry = state.entries.find((item) => item.path === path);
 			if (!entry) return { kind: 'missing', size: 0, text: null };
+			if (entry.symlink) return { kind: 'symlink', size: entry.size, text: null };
 			if (imageTypeFor(path)) return { kind: 'image', size: entry.size, text: null };
 			if (entry.size > MAX_TEXT_BYTES) return { kind: 'large', size: entry.size, text: null };
 		}
@@ -265,24 +287,28 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 	/**
 	 * Loads a path and any draft kept for it into the open note.
 	 * @param {string} path
+	 * @param {number} [unlessEditedVersion] leaves the note alone if this version of it became dirty during the load
 	 * @returns {Promise<void>}
 	 */
-	const load = async (path) => {
+	const load = async (path, unlessEditedVersion) => {
 		openRequest += 1;
 		const request = openRequest;
 		await flushDrafts();
 		await loadTree();
 		let draftFailed = false;
-		const [disk, draft] = await Promise.all([
+		const [disk, stored] = await Promise.all([
 			readDisk(path),
 			drafts.get(repoId, path).catch(() => {
 				draftFailed = true;
 				return null;
 			})
 		]);
+		const kept = unkeptDrafts.get(path);
+		const draft = kept ?? stored;
 		const diskText = draft && disk.kind === 'large' ? await readDiskText(path) : disk.text;
 		if (request !== openRequest) return;
-		if (draft) ownDrafts.set(path, draft.text);
+		if (state.note?.version === unlessEditedVersion && state.note?.dirty) return;
+		if (stored) ownDrafts.set(path, stored.text);
 		else ownDrafts.delete(path);
 		versions += 1;
 		/** @type {OpenNote} */
@@ -314,9 +340,13 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 					savedText: draft.base,
 					dirty: true,
 					restored: true,
-					diskChanged: diskText !== draft.base
+					diskChanged: diskText !== draft.base,
+					draftStored: !kept,
+					draftFailed: draftFailed || Boolean(kept)
 				}
 			});
+			// Storage may have room again; a refusal puts it straight back.
+			if (kept) queueDraft(path, kept);
 		}
 	};
 
@@ -333,6 +363,9 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			if (isWithin(existing, target)) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} already exists.`);
 			if (isWithin(target, existing)) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${existing} is a file, not a folder.`);
 		}
+		// A draft whose file is gone counts as that file, but may get its file back.
+		const blocking = state.draftPaths.find((draft) => draft !== target && overlaps(draft, target));
+		if (blocking) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${blocking} has unsaved text. Save or discard it first.`);
 		await repo.createFile(target, text);
 		await loadTree();
 		return target;
@@ -390,8 +423,9 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			}
 			const onDisk = await readDiskText(note.path);
 			if (state.note?.version !== note.version || onDisk === state.note.savedText) return;
-			if (!state.note.dirty) await load(note.path);
-			else setNote({ diskChanged: onDisk !== state.note.text });
+			if (!state.note.dirty) await load(note.path, note.version);
+			// Dirty from the start, or from typing during that load, which then left it alone.
+			if (state.note?.version === note.version && state.note.dirty) setNote({ diskChanged: onDisk !== state.note.text });
 		},
 
 		/**
@@ -403,7 +437,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			const note = state.note;
 			if (!note || (note.kind !== 'markdown' && note.kind !== 'text') || text === note.text) return;
 			const dirty = text !== note.savedText;
-			setNote({ text, dirty, draftStored: !dirty });
+			setNote({ text, dirty, draftStored: !dirty, restored: note.restored && dirty });
 			queueDraft(note.path, dirty ? { repoId, path: note.path, text, base: note.savedText } : null);
 		},
 
@@ -465,7 +499,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 		async createFolder(path) {
 			const target = normalizePath(path);
 			await readTree();
-			if (state.entries.some((entry) => isWithin(entry.path, target))) {
+			if ([...state.entries.map((entry) => entry.path), ...state.draftPaths].some((existing) => isWithin(existing, target))) {
 				throw new GitEngineError(ErrorCode.PATH_EXISTS, `${target} already exists.`);
 			}
 			await create(`${target}/.gitkeep`);
@@ -504,8 +538,16 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				if (!(isNotFound(error) && carried.length > 0)) throw error;
 			}
 			for (const path of carried) {
-				const draft = await drafts.get(repoId, path);
-				if (draft) await drafts.put({ ...draft, path: movedPath(path, source, target) });
+				const next = movedPath(path, source, target);
+				const kept = unkeptDrafts.get(path);
+				if (kept) {
+					unkeptDrafts.delete(path);
+					unkeptDrafts.set(next, { ...kept, path: next });
+					publishUnkept();
+				} else {
+					const draft = await drafts.get(repoId, path);
+					if (draft) await drafts.put({ ...draft, path: next });
+				}
 				await drafts.remove(repoId, path);
 				ownDrafts.delete(path);
 			}
@@ -529,6 +571,7 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				if (!(isNotFound(error) && carried.length > 0)) throw error;
 			}
 			for (const item of carried) {
+				if (unkeptDrafts.delete(item)) publishUnkept();
 				await drafts.remove(repoId, item);
 				ownDrafts.delete(item);
 			}
@@ -574,9 +617,9 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			await readTree();
 			/** @type {SearchHit[]} */
 			const hits = [];
-			for (const { path, size } of state.entries) {
+			for (const { path, size, symlink } of state.entries) {
 				if (signal?.aborted) break;
-				if (!isMarkdownPath(path) || size > MAX_TEXT_BYTES) continue;
+				if (symlink || !isMarkdownPath(path) || size > MAX_TEXT_BYTES) continue;
 				/** @type {string | null} */
 				let text;
 				try {

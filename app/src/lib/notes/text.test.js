@@ -47,6 +47,10 @@ describe('decoding', () => {
 		expect(decodeText(new Uint8Array([0x61, 0xff, 0x62]))).toBeNull();
 	});
 
+	it('reads a replacement character that is really in the file', () => {
+		expect(decodeText(new TextEncoder().encode('a\uFFFDb\n'))).toBe('a\uFFFDb\n');
+	});
+
 	it('reads ordinary text', () => {
 		expect(decodeText(new TextEncoder().encode('Tiếng Việt\n'))).toBe('Tiếng Việt\n');
 	});

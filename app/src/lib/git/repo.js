@@ -94,6 +94,7 @@ globalThis.Buffer ??= Buffer;
  * @typedef {object} TreeEntry
  * @property {string} path
  * @property {number} size bytes
+ * @property {true} [symlink] a symbolic link, whose target must not be followed
  */
 
 /**
@@ -1064,7 +1065,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				return { ...cloned, persisted };
 			}, signal),
 
-		/** @returns {Promise<TreeEntry[]>} every file in the working tree, sorted by path */
+		/** @returns {Promise<TreeEntry[]>} every file and symbolic link in the working tree, sorted by path */
 		listTree: () =>
 			locked(async () => {
 				await assertCloned();
@@ -1079,6 +1080,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 						const stat = await fs.promises.lstat(abs(path));
 						if (stat.isDirectory()) await visit(path);
 						else if (stat.isFile()) entries.push({ path, size: stat.size });
+						else if (stat.isSymbolicLink()) entries.push({ path, size: stat.size, symlink: true });
 					}
 				};
 				await visit('');

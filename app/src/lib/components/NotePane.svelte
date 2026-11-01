@@ -1,5 +1,5 @@
 <script>
-	import { onDestroy, untrack } from 'svelte';
+	import { untrack } from 'svelte';
 	import { formatBytes } from '#lib/git/limits.js';
 	import { createImageUrls } from '#lib/markdown/render.js';
 	import { isMarkdownPath } from '#lib/notes/paths.js';
@@ -38,17 +38,19 @@
 	const isMarkdown = $derived(isMarkdownPath(note.path));
 	const canEdit = $derived(hasText);
 
-	const images = createImageUrls({ readFile: (path) => readFile(path) });
-	onDestroy(() => images.dispose());
+	/** A new version may be a new picture at the same path. */
+	const imageVersion = $derived(note.kind === 'image' ? note.version : null);
 
 	$effect(() => {
-		if (note.kind !== 'image') return;
+		if (imageVersion === null) return;
+		const images = createImageUrls({ readFile: (path) => readFile(path) });
 		let live = true;
-		images.urlFor(note.path).then((url) => {
+		images.urlFor(untrack(() => note.path)).then((url) => {
 			if (live) imageUrl = url;
 		});
 		return () => {
 			live = false;
+			images.dispose();
 		};
 	});
 
@@ -136,7 +138,7 @@
 	</div>
 
 	{#if note.draftFailed}
-		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="draft-failed">This browser refused to keep your unsaved text, so a reload would lose it. Save it now.</p>
+		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="draft-failed">This browser refused to keep your unsaved text. It stays while this tab is on this repository, but a reload or closing the tab would lose it. Save it now.</p>
 	{/if}
 	{#if note.restored && !note.diskChanged}
 		<p role="status" class="bg-gray-100 p-2 text-sm" data-testid="draft-restored">Your unsaved text is back. Save it, or discard it to return to the file.</p>
@@ -180,6 +182,8 @@
 			<p class="p-4" data-testid="binary-file">This is a binary file of {formatBytes(note.size)}, so it cannot be shown here.</p>
 		{:else if note.kind === 'large'}
 			<p class="p-4" data-testid="large-file">This file is {formatBytes(note.size)}, too large to show here.</p>
+		{:else if note.kind === 'symlink'}
+			<p class="p-4" data-testid="symlink-file">This is a symbolic link, so it cannot be shown or edited here. It stays a link in the repository.</p>
 		{:else}
 			<div class="flex flex-col items-start gap-3 p-4" data-testid="missing-file">
 				<p>There is no file at this path.</p>

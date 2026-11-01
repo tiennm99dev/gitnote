@@ -1,12 +1,17 @@
-/* global DataTransfer, ClipboardEvent, indexedDB, window, document */
+/* global DataTransfer, ClipboardEvent, IDBObjectStore, indexedDB, window, document */
+import { symlink } from 'node:fs/promises';
+import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { createRemote, pushFromElsewhere, remoteHead } from '../test/remote-repo.js';
+import { changeElsewhere, createRemote, pushFromElsewhere, remoteHead, runGit } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
 import { collectBreakage, GOOD_TOKEN, serveApi, serveGit } from './provider-fixtures.js';
 import { STATIC_SHELL_PORT } from './static-server.js';
 
 /** A real 1x1 PNG, so the browser's decoder proves a `blob:` URL really loaded. */
 const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+
+/** A real 2x1 PNG, told apart from {@link PIXEL} by its decoded width. */
+const WIDE_PIXELS = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAYAAAD0In+KAAAADklEQVR4nGP4z8DwHwQBEPgD/U6VwW8AAAAASUVORK5CYII=', 'base64');
 
 const WELCOME = `---
 title: hidden front matter
@@ -29,8 +34,13 @@ title: hidden front matter
 [raw file](./data.bin)
 
 <script>window.noteScriptRan = true</script>
-<img src="nope.png" onerror="window.noteScriptRan = true">
 `;
+
+/**
+ * Apart from this note, no test expects a policy complaint: some Chromium versions
+ * log one when sanitizing parses a handler, even though the handler never runs.
+ */
+const HOSTILE = '# Hostile\n\n<img src="nope.png" onerror="window.noteScriptRan = true">\n\n<a href="#x" onclick="window.noteScriptRan = true">click</a>\n';
 
 const SEED = {
 	'README.md': '# Top\n',
@@ -39,6 +49,7 @@ const SEED = {
 	'notes/page.html': '<script>window.noteScriptRan = true</script>',
 	'notes/raw.txt': 'plain text\n',
 	'notes/z-crlf.md': 'one\r\ntwo\r\n',
+	'notes/z-hostile.md': HOSTILE,
 	'notes/z-toc.md': `# Contents\n\n[jump](#far-away)\n\n<dialog open><a href="https://example.com/login">Session expired</a></dialog>\n\n${'filler\n\n'.repeat(200)}## Far away\n`,
 	'zzz.md': '# Last\n'
 };
@@ -52,6 +63,10 @@ const SEED = {
 async function cloneRepo(page) {
 	const remote = await createRemote(SEED, { root: E2E_GIT_ROOT, port: E2E_GIT_PORT });
 	await pushFromElsewhere(remote, { 'notes/assets/pixel.png': PIXEL, 'notes/data.bin': Buffer.from([0, 1, 2, 0, 3]) }, 'add binary files');
+	await changeElsewhere(remote, {}, async (work) => {
+		await symlink('other note.md', path.join(work, 'notes/z-link.md'));
+		await runGit(['add', 'notes/z-link.md'], work);
+	});
 	const fullName = new URL(remote.url).pathname.slice(1).replace(/\.git$/, '');
 	await serveApi(page, 'github', GOOD_TOKEN, {
 		'/user/repos?per_page=100&sort=updated&page=1': [{ id: 41, full_name: fullName, default_branch: 'main', size: 12, private: true }],
@@ -195,6 +210,114 @@ test('opens a note from the tree, rendered, safe, under the production CSP', asy
 	expect(problems).toEqual([]);
 });
 
+test('a note with event handlers runs nothing, and keeps none in its output', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'notes/z-hostile.md'));
+	const preview = page.getByTestId('note-preview');
+	await expect(preview.getByRole('heading', { name: 'Hostile' })).toBeVisible();
+	await preview.getByText('click').click();
+
+	expect(await page.evaluate(() => Reflect.get(globalThis, 'noteScriptRan'))).toBeUndefined();
+	expect(await preview.innerHTML()).not.toMatch(/onerror|onclick/);
+	expect(problems.filter((problem) => !/inline event handler/.test(problem))).toEqual([]);
+});
+
+test('text the browser refuses to store stays through moving between notes, and leaving asks first', async ({ page }) => {
+	const { id } = await cloneRepo(page);
+	await page.addInitScript(() => {
+		const put = IDBObjectStore.prototype.put;
+		/**
+		 * @this {IDBObjectStore}
+		 * @param {unknown} value
+		 * @param {IDBValidKey} [key]
+		 * @returns {IDBRequest<IDBValidKey>}
+		 */
+		IDBObjectStore.prototype.put = function refuseDrafts(value, key) {
+			if (this.name === 'drafts') throw new DOMException('The quota has been exceeded.', 'QuotaExceededError');
+			return put.call(this, value, key);
+		};
+	});
+	await page.goto(noteUrl(id, 'README.md'));
+	const drawer = page.getByTestId('file-drawer');
+	await typeNote(page, 'refused words');
+	await expect(page.getByTestId('draft-failed')).toBeVisible();
+
+	// Another note keeps saying so, and the text is there on the way back.
+	await drawer.getByRole('link', { name: 'zzz.md' }).click();
+	await expect(page.getByTestId('note-path')).toHaveText('zzz.md');
+	await expect(page.getByTestId('unkept-drafts')).toContainText('README.md');
+	await expect(drawer.getByTestId('tree-unsaved')).toHaveCount(1);
+	await page.getByTestId('unkept-drafts').getByRole('link', { name: 'README.md' }).click();
+	const content = page.getByTestId('note-editor').locator('.cm-content');
+	await expect(content).toContainText('refused words');
+	await expect(page.getByTestId('draft-failed')).toBeVisible();
+
+	// Leaving the repository asks, and staying keeps the text.
+	/** @type {string[]} */
+	const asked = [];
+	const refuseOnce = (/** @type {import('@playwright/test').Dialog} */ dialog) => {
+		asked.push(dialog.type());
+		void dialog.dismiss();
+	};
+	page.once('dialog', refuseOnce);
+	await page.getByRole('link', { name: 'Repositories' }).click();
+	await expect.poll(() => asked).toEqual(['confirm']);
+	await expect(content).toContainText('refused words');
+
+	// So does leaving the page.
+	const unload = page.waitForEvent('dialog');
+	void page.close({ runBeforeUnload: true });
+	const prompt = await unload;
+	expect(prompt.type()).toBe('beforeunload');
+	await prompt.dismiss();
+	await expect(content).toContainText('refused words');
+
+	// Saving ends all of it.
+	await page.getByTestId('save-note').click();
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Saved to the working tree');
+	await expect(page.getByTestId('draft-failed')).toHaveCount(0);
+	await page.getByRole('link', { name: 'Repositories' }).click();
+	await expect(page.getByTestId('local-copy')).toBeVisible();
+});
+
+test('the image viewer shows the new picture when the file at its path is replaced', async ({ page, context }) => {
+	const { id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'notes/assets/pixel.png'));
+	const image = page.getByTestId('image-preview');
+	await expect.poll(() => image.evaluate((node) => /** @type {HTMLImageElement} */ (node).naturalWidth)).toBe(1);
+
+	const other = await context.newPage();
+	await other.goto(noteUrl(id, 'notes/other note.md'));
+	await other.getByRole('button', { name: 'Edit', exact: true }).click();
+	await other.getByTestId('image-picker').setInputFiles({ name: 'wide.png', mimeType: 'image/png', buffer: WIDE_PIXELS });
+	await expect(other.getByTestId('note-editor').locator('.cm-content')).toContainText('wide.png');
+	const drawer = other.getByTestId('file-drawer');
+	const moveTo = async (/** @type {string} */ name, /** @type {string} */ to) => {
+		await drawer.getByRole('button', { name: `Actions for ${name}` }).click();
+		await drawer.getByRole('button', { name: 'Rename or move' }).click();
+		await other.getByTestId('dialog-path').fill(to);
+		await other.getByTestId('dialog-confirm').click();
+		await expect(other.getByTestId('notes-dialog')).not.toBeVisible();
+	};
+	await drawer.getByRole('button', { name: 'assets', exact: true }).click();
+	await moveTo('pixel.png', 'notes/assets/old.png');
+	await moveTo('wide.png', 'notes/assets/pixel.png');
+	await other.close();
+
+	await page.evaluate(() => window.dispatchEvent(new Event('focus')));
+	await expect.poll(() => image.evaluate((node) => /** @type {HTMLImageElement} */ (node).naturalWidth)).toBe(2);
+});
+
+test('a symbolic link says what it is, and is not followed', async ({ page }) => {
+	const { id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'notes/z-link.md'));
+	await expect(page.getByTestId('symlink-file')).toBeVisible();
+	await expect(page.getByTestId('file-drawer').getByRole('link', { name: 'z-link.md' })).toBeVisible();
+	await expect(page.getByTestId('missing-file')).toHaveCount(0);
+	await expect(page.getByTestId('note-preview')).toHaveCount(0);
+});
+
 test('an edited buffer survives a reload, saves to the working tree only, and can be discarded', async ({ page }) => {
 	const problems = collectBreakage(page);
 	const { remote, id } = await cloneRepo(page);
@@ -292,6 +415,8 @@ test('creates, renames, moves and deletes, with no commit made', async ({ page }
 
 	// It never overwrites an existing file, and git's folder is out of reach.
 	await page.getByTestId('new-note').click();
+	await answer('only/a/folder/');
+	await expect(page.getByTestId('dialog-error')).toContainText('Give the note a name');
 	await answer('README.md');
 	await expect(page.getByTestId('dialog-error')).toContainText('already exists');
 	await answer('.git/evil');
@@ -355,6 +480,12 @@ test('creates, renames, moves and deletes, with no commit made', async ({ page }
 	await expect(page.getByTestId('notes-dialog')).not.toBeVisible();
 	await expect(page.getByTestId('note-path')).toHaveText('later/soon.md');
 	await expect(drawer.getByRole('link', { name: 'soon.md' })).toBeVisible();
+
+	// A dot in a name does not stop it being a note.
+	await page.getByTestId('new-note').click();
+	await answer('meeting 11.01');
+	await expect(page.getByTestId('note-path')).toHaveText('meeting 11.01.md');
+	await expect(page.getByRole('button', { name: 'Split' })).toBeAttached();
 
 	expect(await remoteHead(remote)).toBe(headBefore);
 	expect(problems).toEqual([]);

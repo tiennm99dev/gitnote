@@ -51,29 +51,36 @@ markdown.core.ruler.push('table_align_attribute', (state) => {
 
 // Links to a heading need a target. Sanitizing adds the prefix to these ids.
 markdown.core.ruler.push('heading_ids', (state) => {
-	/** @type {Map<string, number>} */
+	/**
+	 * Every id handed out, with how many times it was asked for.
+	 * @type {Map<string, number>}
+	 */
 	const used = new Map();
 	state.tokens.forEach((token, index) => {
 		if (token.type !== 'heading_open') return;
 		const words = (state.tokens[index + 1].children ?? []).filter((child) => child.type === 'text' || child.type === 'code_inline').map((child) => child.content);
 		const slug = slugify(words.join(''));
 		if (slug === '') return;
-		const seen = used.get(slug) ?? 0;
-		used.set(slug, seen + 1);
-		token.attrSet('id', seen === 0 ? slug : `${slug}-${seen}`);
+		let id = slug;
+		for (let copy = used.get(slug) ?? 0; used.has(id); copy += 1) {
+			id = `${slug}-${copy + 1}`;
+			used.set(slug, copy + 1);
+		}
+		used.set(id, 0);
+		token.attrSet('id', id);
 	});
 });
 
 /**
  * @param {string} text a heading's text
- * @returns {string} lowercase words joined by hyphens, as git hosts make heading links
+ * @returns {string} lowercase, without punctuation, each space a hyphen, as git hosts make heading links
  */
 function slugify(text) {
 	return text
 		.trim()
 		.toLocaleLowerCase()
 		.replace(/[^\p{L}\p{M}\p{N}\s_-]/gu, '')
-		.replace(/\s+/g, '-');
+		.replace(/\s/g, '-');
 }
 
 /**

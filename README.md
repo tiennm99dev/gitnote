@@ -113,15 +113,21 @@ segment. `app/src/lib/stores/notes.js` holds its state.
   commits. A draft remembers the file it started from: if the file changes
   underneath it, the user chooses between the two, and neither is overwritten
   until they do. Deleting a copy counts its drafts in the warning and removes
-  them with it. A draft counts as a file when renaming: nothing moves onto one.
+  them with it. A draft counts as a file when renaming or creating: nothing moves
+  onto one, or makes a folder of it.
+- **When the browser refuses a draft.** The text then stays in memory, per path,
+  through moving between notes and renaming, and the screen keeps listing it.
+  Leaving the repository or the page asks first, since that would lose it.
 - **Two tabs on one note.** Each tab keeps its own buffer and they share one
   draft. A tab removes a draft only while it still holds the text that tab
   stored, and a tab that regains focus stores its buffer again if the draft no
   longer matches. Closing a tab whose draft another tab replaced, without going
   back to it, loses that tab's unsaved text.
 - **Bytes.** Line endings and a byte order mark survive open and save unchanged.
-  A file over 5 MB, or one that is not valid UTF-8, shows its size only. A note
-  edited past 5 MB stays editable until it is closed. Pasted text takes the
+  A file over 5 MB, or one that is not valid UTF-8, shows its size only; a U+FFFD
+  that is really in a note is ordinary text. A symbolic link is listed and says
+  what it is, and is never followed. A note edited past 5 MB stays editable until
+  it is closed. Pasted text takes the
   note's line ending; a note that mixes endings takes `\n`.
 - **Rendering** (`app/src/lib/markdown/render.js`). markdown-it with raw HTML on,
   then DOMPurify, then image and link rewriting. Raw HTML keeps its structure but

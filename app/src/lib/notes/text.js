@@ -3,7 +3,7 @@
  * user did not touch.
  */
 
-import { isBinary } from '../git/merge.js';
+import { hasNulByte } from '../git/merge.js';
 
 /** Above this, a file shows its size only: rendering or editing it would stall the page. */
 export const MAX_TEXT_BYTES = 5_000_000;
@@ -13,8 +13,15 @@ export const MAX_TEXT_BYTES = 5_000_000;
  * @returns {string | null} the text, keeping any byte order mark, or null for a binary file
  */
 export function decodeText(bytes) {
-	const text = new TextDecoder('utf-8', { ignoreBOM: true }).decode(bytes);
-	return isBinary(text) ? null : text;
+	/** @type {string} */
+	let text;
+	try {
+		// Only bytes tell invalid UTF-8 apart: a note may really hold U+FFFD.
+		text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+	} catch {
+		return null;
+	}
+	return hasNulByte(text) ? null : text;
 }
 
 /**
