@@ -869,6 +869,23 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		await fs.promises.rmdir(path);
 	};
 
+	/**
+	 * @param {string} url
+	 * @param {AbortSignal} [signal]
+	 * @returns {Promise<boolean>} true only when the remote answers with no branches; a failed check counts as false
+	 */
+	const remoteHasNoBranches = async (url, signal) => {
+		try {
+			// Version 1 reads the plain ref advertisement, the request a clone starts with.
+			const heads = await git.listServerRefs({ http: withSignal(http, signal), url, prefix: 'refs/heads/', protocolVersion: 1, ...authCallbacks(getCredential) });
+			return heads.length === 0;
+		} catch (error) {
+			signal?.throwIfAborted();
+			if (error instanceof GitEngineError && error.code === ErrorCode.AUTH_REQUIRED) throw error;
+			return false;
+		}
+	};
+
 	return {
 		id,
 		dir,
@@ -902,7 +919,8 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 						...base,
 						http: withSignal(http, signal),
 						url,
-						...(ref === undefined ? {} : { ref }),
+						// Fully qualified, because a tag of the same name would win otherwise.
+						...(ref === undefined ? {} : { ref: `refs/heads/${ref}` }),
 						remote: REMOTE,
 						singleBranch: true,
 						noTags: true,
@@ -925,8 +943,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				} catch (error) {
 					await removeRecursive(dir);
 					await flush();
-					// Asking for a branch the remote lacks fails in the fetch, naming the ref alone.
-					if (ref !== undefined && /** @type {{ code?: string }} */ (error ?? {}).code === 'NotFoundError') {
+					// A missing branch and an empty remote fail alike when a branch was
+					// asked for, so only the remote's own list can tell them apart.
+					if (ref !== undefined && /** @type {{ code?: string }} */ (error ?? {}).code === 'NotFoundError' && !(await remoteHasNoBranches(url, signal))) {
 						throw new GitEngineError(ErrorCode.BRANCH_NOT_FOUND, `The branch ${ref} is not on the remote. Pick another branch.`, { cause: error });
 					}
 					// With no refs on the remote, clone cannot find a branch to check out.

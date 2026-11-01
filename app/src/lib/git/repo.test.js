@@ -379,6 +379,31 @@ describe('clone', () => {
 		expect(await repo.isCloned()).toBe(false);
 	});
 
+	it('explains that an empty repository cannot be cloned when the picker names its default branch', async () => {
+		const remote = await createRemote({});
+		const repo = openRepo(remote);
+
+		const error = await rejection(repo.clone({ url: remote.url, ref: 'main' }));
+
+		expect(error.code).toBe(ErrorCode.EMPTY_REPO);
+		expect(await repo.isCloned()).toBe(false);
+	});
+
+	it('clones a branch that shares its name with a tag, and pushes to the branch', async () => {
+		const remote = await createRemote({ 'README.md': 'on main\n' });
+		await runGit(['tag', 'v1', 'main'], remote.bare);
+		await runGit(['branch', 'v1', 'main'], remote.bare);
+		await pushFromElsewhere(remote, { 'later.md': 'on main only\n' }, 'main moves on');
+		const repo = openRepo(remote);
+
+		expect((await repo.clone({ url: remote.url, ref: 'v1' })).branch).toBe('v1');
+		await commitFile(repo, 'new.md', 'on v1\n');
+		expect((await repo.push()).pushed).toBe(true);
+
+		expect(await showRemote(remote, 'refs/heads/v1:new.md')).toBe('on v1\n');
+		await expect(showRemote(remote, 'refs/tags/v1:new.md')).rejects.toThrow();
+	});
+
 	it('reports a missing repository', async () => {
 		const remote = await createRemote({ 'README.md': 'seed\n' });
 		const repo = openRepo(remote);
