@@ -392,6 +392,18 @@ test.describe('the GitHub App sign-in', () => {
 		expect(await dumpBrowserStorage(page)).not.toContain('attacker-code');
 	});
 
+	test("shows the relay's reason when sign-in is not set up, rather than calling it an outage", async ({ page }) => {
+		await serveAuthorizePage(page);
+		await page.route('**/api/oauth/github/token', (route) =>
+			route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'oauth_not_configured', message: 'GitHub sign-in is not configured on this relay.' }) })
+		);
+
+		await page.goto('/connect');
+		await page.getByRole('button', { name: 'Sign in with GitHub' }).click();
+
+		await expect(page.getByTestId('callback-error')).toContainText('GitHub sign-in is not configured on this relay.');
+	});
+
 	test('reports a declined sign-in', async ({ page }) => {
 		await page.route('https://github.com/login/oauth/authorize**', async (route) => {
 			const url = new URL(route.request().url());
@@ -445,6 +457,28 @@ async function cloneThroughPicker(page, fullName) {
 	await expect(page.getByTestId('branch-select').locator('option')).toHaveCount(2);
 	await page.getByTestId('clone-button').click();
 	await expect(page.getByTestId('local-copy').filter({ hasText: fullName })).toContainText('main, 3 files');
+}
+
+/**
+ * Holds a repo's lock from a page, as another tab's pull or push would.
+ * @param {import('@playwright/test').Page} page
+ * @param {string} fullName
+ * @returns {Promise<() => Promise<void>>} releases it
+ */
+async function holdRepoLock(page, fullName) {
+	await page.evaluate(
+		(name) =>
+			new Promise((held) => {
+				navigator.locks.request(name, () => {
+					held(undefined);
+					return new Promise((release) => {
+						/** @type {Record<string, unknown>} */ (/** @type {unknown} */ (window)).releaseRepoLock = release;
+					});
+				});
+			}),
+		`gitnote:repo:github.com/${fullName}`
+	);
+	return () => page.evaluate(() => /** @type {{ releaseRepoLock: () => void }} */ (/** @type {unknown} */ (window)).releaseRepoLock());
 }
 
 test('a dead sign-in still asks for a new one on the repo page after a reload, and the copies stay', async ({ page }) => {
@@ -543,6 +577,66 @@ test('a browser that refuses to record the clone reports it and lets the user tr
 	await expect(page.getByTestId('clone-button')).toBeEnabled();
 });
 
+test('a finished clone the browser refuses to mark ready stays listed, counted and deletable', async ({ page }) => {
+	const { id, fullName } = await repoWithBranches();
+	await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await pasteToken(page);
+	await page.goto('/repos');
+	await page.getByRole('button', { name: new RegExp(fullName) }).click();
+	await expect(page.getByTestId('branch-select').locator('option')).toHaveCount(2);
+
+	await page.evaluate(() => {
+		const original = Storage.prototype.setItem;
+		/**
+		 * @this {Storage}
+		 * @param {string} key
+		 * @param {string} value
+		 */
+		Storage.prototype.setItem = function (key, value) {
+			if (key.startsWith('gitnote.repo.') && value.includes('"ready":true')) throw new DOMException('quota', 'QuotaExceededError');
+			original.call(this, key, value);
+		};
+	});
+	await page.getByTestId('clone-button').click();
+
+	await expect(page.getByTestId('repos-error')).toContainText('quota');
+	await expect(page.getByTestId('local-copy')).toContainText(fullName);
+
+	await page.goto('/connect');
+	await page.getByTestId('account-github').getByRole('button', { name: 'Sign out' }).click();
+	await expect(page.getByTestId('sign-out-work')).toContainText(fullName);
+	await page.getByRole('button', { name: 'Keep signed in' }).click();
+
+	// Cloning again finds the copy and records it properly.
+	await page.goto('/repos');
+	await page.getByRole('button', { name: new RegExp(fullName) }).click();
+	await expect(page.getByTestId('branch-select').locator('option')).toHaveCount(2);
+	await page.getByTestId('clone-button').click();
+	await expect(page.getByTestId('local-copy')).toContainText('main, 3 files');
+});
+
+test('the repo page shows accounts and copies while another tab holds a repo lock', async ({ page, context }) => {
+	const { id, fullName } = await repoWithBranches();
+	const answers = githubAnswers([{ id, fullName }]);
+	await serveApi(page, 'github', GOOD_TOKEN, answers);
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await pasteToken(page);
+	await cloneThroughPicker(page, fullName);
+
+	const release = await holdRepoLock(page, fullName);
+	const other = await context.newPage();
+	await serveApi(other, 'github', GOOD_TOKEN, answers);
+	await other.goto('/repos');
+
+	await expect(other.getByTestId('repo-option')).toBeVisible();
+	await expect(other.getByTestId('local-copy')).toContainText(fullName);
+	await expect(other.getByTestId('local-copy-state')).toHaveText('main');
+
+	await release();
+	await expect(other.getByTestId('local-copy-state')).toHaveText('main, 3 files');
+});
+
 test('a copy another tab cloned first is recorded with the branch actually on the device', async ({ page, context }) => {
 	const { id, fullName } = await repoWithBranches();
 	const answers = githubAnswers([{ id, fullName }]);
@@ -608,6 +702,47 @@ test.describe('deleting copies', () => {
 		await github.getByRole('button', { name: 'Sign out and delete' }).click();
 		await expect(github.getByLabel('Or paste a token')).toBeVisible();
 		expect(await page.evaluate(() => Object.keys(localStorage).filter((key) => key.startsWith('gitnote.repo.')).length)).toBe(0);
+	});
+
+	test('the choice to stay signed in cannot be made once the deletion is running', async ({ page }) => {
+		const { id, fullName } = await repoWithBranches();
+		await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+		await serveGit(page, 'github', GOOD_TOKEN);
+		await pasteToken(page);
+		await cloneThroughPicker(page, fullName);
+
+		await page.goto('/connect');
+		const github = page.getByTestId('account-github');
+		await github.getByRole('button', { name: 'Sign out' }).click();
+		await page.getByTestId('sign-out-github').getByRole('checkbox').check();
+		const keep = github.getByRole('button', { name: 'Keep signed in' });
+		await expect(keep).toBeEnabled();
+
+		const release = await holdRepoLock(page, fullName);
+		await github.getByRole('button', { name: 'Sign out and delete' }).click();
+		await expect(keep).toBeDisabled();
+
+		await release();
+		await expect(github.getByLabel('Or paste a token')).toBeVisible();
+	});
+
+	test('keeping a copy cannot be chosen once its deletion is running', async ({ page }) => {
+		const { id, fullName } = await repoWithBranches();
+		await serveApi(page, 'github', GOOD_TOKEN, githubAnswers([{ id, fullName }]));
+		await serveGit(page, 'github', GOOD_TOKEN);
+		await pasteToken(page);
+		await cloneThroughPicker(page, fullName);
+
+		await page.getByRole('button', { name: 'Delete from this device' }).click();
+		const keep = page.getByRole('button', { name: 'Keep it' });
+		await expect(keep).toBeEnabled();
+
+		const release = await holdRepoLock(page, fullName);
+		await page.getByRole('button', { name: 'Delete this copy' }).click();
+		await expect(keep).toBeDisabled();
+
+		await release();
+		await expect(page.getByTestId('local-copy')).toHaveCount(0);
 	});
 
 	test('a wipe that fails keeps the sign-in and can be tried again', async ({ page }) => {

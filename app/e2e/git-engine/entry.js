@@ -1,4 +1,4 @@
-import { openRepoFs, repoIdForUrl, getStorageUsage, wipeRepoFs } from '../../src/lib/git/fs.js';
+import { openRepoFs, repoIdForUrl, getStorageUsage } from '../../src/lib/git/fs.js';
 import { createGitHttp } from '../../src/lib/git/http.js';
 import { createRepo } from '../../src/lib/git/repo.js';
 
@@ -47,7 +47,10 @@ Object.assign(globalThis, {
 	getStorageUsage: () => getStorageUsage(),
 	/**
 	 * @param {string} url
-	 * @returns {Promise<void>}
+	 * @returns {Promise<boolean>}
 	 */
-	wipeRepo: (url) => wipeRepoFs(repoIdForUrl(url))
+	wipeRepo: async (url) => {
+		const repo = openRepo(url);
+		return repo.wipeIfUnchanged(await repo.countWork());
+	}
 });

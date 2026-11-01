@@ -4,7 +4,7 @@ import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
 import { memoryStorage } from '../../../test/auth-doubles.js';
 import { createRemote, RELAY_PORT } from '../../../test/remote-repo.js';
 import { createGitHttp } from './http.js';
-import { describeLocalWork, describeWorkCounts, forgetLocalRepo, isSameWork, listLocalRepos, removeLocalCopies, saveLocalRepo } from './local-repos.js';
+import { describeLocalWork, describeWorkCounts, forgetLocalRepo, isSameWork, listLocalRepos, removeLocalCopies, saveLocalRepo, settleFailedClone } from './local-repos.js';
 import { createRepo } from './repo.js';
 
 /** @type {import('./local-repos.js').LocalRepo} */
@@ -34,18 +34,114 @@ describe('the list of local repos', () => {
 });
 
 describe('removeLocalCopies', () => {
-	it('tries every copy and returns the ones that failed', async () => {
-		const repos = ['a', 'b', 'c'].map((id) => ({ ...ENTRY, id }));
+	it('tries every copy and returns the ones still there', async () => {
+		const shown = ['a', 'b', 'c', 'd'].map((id) => ({ repo: { ...ENTRY, id }, unpushed: 0, drafts: 0 }));
 		/** @type {string[]} */
 		const tried = [];
 
-		const failed = await removeLocalCopies(repos, async (id) => {
-			tried.push(id);
-			if (id === 'a') throw new Error('storage refused');
+		const { failed, changed } = await removeLocalCopies(shown, async ({ repo }) => {
+			tried.push(repo.id);
+			if (repo.id === 'a') throw new Error('storage refused');
+			return repo.id !== 'b';
 		});
 
-		expect(tried).toEqual(['a', 'b', 'c']);
+		expect(tried).toEqual(['a', 'b', 'c', 'd']);
 		expect(failed.map((repo) => repo.id)).toEqual(['a']);
+		expect(changed.map((repo) => repo.id)).toEqual(['b']);
+	});
+
+	it('spares a copy committed to while an earlier copy was being deleted', async () => {
+		const first = await createRemote({ 'README.md': 'seed\n' });
+		const second = await createRemote({ 'README.md': 'seed\n' });
+		/** @type {Map<string, import('./repo.js').Repo>} */
+		const engines = new Map();
+		for (const remote of [first, second]) {
+			const repo = createRepo({
+				id: remote.id,
+				fs: /** @type {import('./repo.js').FsClient} */ (/** @type {unknown} */ (memfs().fs)),
+				http: createGitHttp({ relayOrigin: `http://127.0.0.1:${RELAY_PORT}` }),
+				provider: 'github',
+				getCredential: () => FIXTURE_CREDENTIAL
+			});
+			await repo.clone({ url: remote.url });
+			engines.set(remote.id, repo);
+		}
+		const firstEngine = /** @type {import('./repo.js').Repo} */ (engines.get(first.id));
+		const secondEngine = /** @type {import('./repo.js').Repo} */ (engines.get(second.id));
+		const shown = await describeLocalWork(
+			[first, second].map((remote) => ({ ...ENTRY, id: remote.id })),
+			(repo) => /** @type {import('./repo.js').Repo} */ (engines.get(repo.id))
+		);
+
+		const { changed } = await removeLocalCopies(shown, async ({ repo, unpushed, drafts }) => {
+			const engine = /** @type {import('./repo.js').Repo} */ (engines.get(repo.id));
+			const deleted = await engine.wipeIfUnchanged({ unpushed, drafts });
+			// Another tab commits to the other copy just after this one is gone.
+			if (engine === firstEngine) {
+				await secondEngine.writeFile('late.md', 'late\n');
+				await secondEngine.commit({ paths: ['late.md'], message: 'late', author: AUTHOR });
+			}
+			return deleted;
+		});
+
+		expect(changed.map((repo) => repo.id)).toEqual([second.id]);
+		expect(await firstEngine.isCloned()).toBe(false);
+		expect(await secondEngine.countWork()).toEqual({ unpushed: 1, drafts: 0 });
+	});
+});
+
+describe('settleFailedClone', () => {
+	const ATTEMPT = { ...ENTRY, ready: false };
+	const failedCheck = async () => {
+		throw new Error('storage failed');
+	};
+
+	it('forgets its own entry when no copy is there', async () => {
+		const storage = memoryStorage();
+		saveLocalRepo(ATTEMPT, storage);
+
+		await settleFailedClone({ entry: ATTEMPT, previous: undefined, isCloned: async () => false, storage });
+
+		expect(listLocalRepos(storage)).toEqual([]);
+	});
+
+	it('keeps its own entry when the clone finished but could not be marked ready', async () => {
+		const storage = memoryStorage();
+		saveLocalRepo(ATTEMPT, storage);
+
+		await settleFailedClone({ entry: ATTEMPT, previous: undefined, isCloned: async () => true, storage });
+
+		expect(listLocalRepos(storage)).toEqual([ATTEMPT]);
+	});
+
+	it('keeps its own entry when it cannot tell whether a copy is there', async () => {
+		const storage = memoryStorage();
+		saveLocalRepo(ATTEMPT, storage);
+
+		await settleFailedClone({ entry: ATTEMPT, previous: undefined, isCloned: failedCheck, storage });
+
+		expect(listLocalRepos(storage)).toEqual([ATTEMPT]);
+	});
+
+	it('restores the record of a copy another tab already made', async () => {
+		const storage = memoryStorage();
+		saveLocalRepo({ ...ATTEMPT, branch: 'asked-for' }, storage);
+
+		await settleFailedClone({ entry: { ...ATTEMPT, branch: 'asked-for' }, previous: ENTRY, isCloned: async () => false, storage });
+
+		expect(listLocalRepos(storage)).toEqual([ENTRY]);
+	});
+
+	it('leaves the new entry in place when the browser refuses the restore', async () => {
+		const storage = memoryStorage();
+		saveLocalRepo(ATTEMPT, storage);
+		storage.setItem = () => {
+			throw new DOMException('quota', 'QuotaExceededError');
+		};
+
+		await settleFailedClone({ entry: ATTEMPT, previous: ENTRY, isCloned: async () => false, storage });
+
+		expect(listLocalRepos(storage)).toEqual([ATTEMPT]);
 	});
 });
 

@@ -8,7 +8,7 @@
 	import { ErrorCode, GitEngineError } from '#lib/git/errors.js';
 	import { getStorageUsage, repoIdForUrl } from '#lib/git/fs.js';
 	import { checkRepoSize, formatBytes } from '#lib/git/limits.js';
-	import { describeLocalWork, describeWorkCounts, forgetLocalRepo, isSameWork, listLocalRepos, saveLocalRepo } from '#lib/git/local-repos.js';
+	import { describeLocalWork, describeWorkCounts, listLocalRepos, saveLocalRepo, settleFailedClone } from '#lib/git/local-repos.js';
 
 	/** @typedef {import('#lib/auth/session.js').RemoteRepo} RemoteRepo */
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
@@ -35,7 +35,7 @@
 	let signInNeeded = $state(false);
 	/** @type {string | null} */
 	let storageWarning = $state(null);
-	/** @type {{ repo: import('#lib/git/local-repos.js').LocalRepo, files: number | null }[]} */
+	/** @type {{ repo: import('#lib/git/local-repos.js').LocalRepo, files: number | null | undefined }[]} */
 	let copies = $state([]);
 	/**
 	 * The deletion being confirmed.
@@ -74,10 +74,21 @@
 		signInNeeded = false;
 	};
 
-	/** Lists what is on this device, which works with no account and no network. */
+	/** Tells a later read of the copies from one still waiting on a lock. */
+	let copiesRead = 0;
+
+	/**
+	 * Lists what is on this device, which works with no account and no network. The
+	 * list shows at once and the counts follow, as they wait for whatever another
+	 * tab is doing to the repo. `files` is undefined until then, null if unreadable.
+	 */
 	const loadCopies = async () => {
-		copies = await Promise.all(
-			listLocalRepos().map(async (repo) => {
+		copiesRead += 1;
+		const read = copiesRead;
+		const repos = listLocalRepos();
+		copies = repos.map((repo) => ({ repo, files: undefined }));
+		const counted = await Promise.all(
+			repos.map(async (repo) => {
 				if (!repo.ready) return { repo, files: null };
 				try {
 					return { repo, files: (await openDeviceRepo(repo).listTree()).length };
@@ -86,6 +97,19 @@
 				}
 			})
 		);
+		if (read === copiesRead) copies = counted;
+	};
+
+	/**
+	 * @param {import('#lib/git/local-repos.js').LocalRepo} repo
+	 * @param {number | null | undefined} files
+	 * @returns {string}
+	 */
+	const describeCopy = (repo, files) => {
+		if (!repo.ready) return ', clone not finished';
+		if (files === undefined) return '';
+		if (files === null) return ', could not be read';
+		return `, ${files} ${files === 1 ? 'file' : 'files'}`;
 	};
 
 	/** @param {ProviderId} id */
@@ -136,7 +160,10 @@
 		clearReport();
 		progress = 'Starting…';
 		let recorded = false;
+		/** @type {import('#lib/git/local-repos.js').LocalRepo | undefined} */
+		let previous;
 		try {
+			previous = listLocalRepos().find((item) => item.id === id);
 			// Recorded first, so a clone cut off by a closed tab can still be deleted.
 			saveLocalRepo(entry);
 			recorded = true;
@@ -161,8 +188,8 @@
 				saveLocalRepo({ ...entry, branch: onDevice, ready: true });
 			}
 		} catch (error) {
-			if (recorded) forgetLocalRepo(id);
 			report(error);
+			if (recorded) await settleFailedClone({ entry, previous, isCloned: async () => openDeviceRepo(entry).isCloned() });
 		} finally {
 			progress = null;
 		}
@@ -189,13 +216,8 @@
 		progress = 'Deleting…';
 		try {
 			// Another tab may have committed since the count was shown.
-			const current = await countCopy(work.repo);
-			if (isSameWork([work], [current])) {
-				await deleteDeviceRepo(work.repo.id);
-				removing = null;
-			} else {
-				removing = { work: current, changed: true };
-			}
+			if (await deleteDeviceRepo(work)) removing = null;
+			else removing = { work: await countCopy(work.repo), changed: true };
 		} catch (error) {
 			report(error);
 		} finally {
@@ -210,14 +232,19 @@
 		} catch (error) {
 			report(error);
 		}
-		await loadCopies();
-		const usage = await getStorageUsage().catch(() => null);
-		if (usage?.nearlyFull) {
-			storageWarning = `This site uses ${formatBytes(usage.usage)} of the ${formatBytes(usage.quota)} this browser allows it. Near the limit, the browser may refuse writes or clear data, and unpushed commits exist nowhere else. Push them.`;
-		}
 		loaded = true;
 		const first = accounts.find((item) => !item.needsSignIn) ?? accounts[0];
-		if (first) await loadRepos(first.provider);
+		await Promise.all([
+			first ? loadRepos(first.provider) : null,
+			loadCopies().catch(report),
+			getStorageUsage()
+				.catch(() => null)
+				.then((usage) => {
+					if (usage?.nearlyFull) {
+						storageWarning = `This site uses ${formatBytes(usage.usage)} of the ${formatBytes(usage.quota)} this browser allows it. Near the limit, the browser may refuse writes or clear data, and unpushed commits exist nowhere else. Push them.`;
+					}
+				})
+		]);
 	});
 </script>
 
@@ -334,7 +361,7 @@
 				{#each copies as { repo, files } (repo.id)}
 					<li class="rounded border border-gray-300 p-2" data-testid="local-copy">
 						<span class="font-medium">{repo.fullName}</span>
-						<span class="text-sm text-gray-600" data-testid="local-copy-state">{repo.branch}{!repo.ready ? ', clone not finished' : files === null ? ', could not be read' : `, ${files} ${files === 1 ? 'file' : 'files'}`}</span>
+						<span class="text-sm text-gray-600" data-testid="local-copy-state">{repo.branch}{describeCopy(repo, files)}</span>
 						{#if removing?.work.repo.id === repo.id}
 							<div class="mt-2 flex flex-col gap-2 rounded bg-gray-100 p-3" data-testid="remove-copy">
 								{#if removing.changed}
@@ -345,7 +372,8 @@
 									<button type="button" class="rounded bg-red-700 px-3 py-2 text-white disabled:opacity-50" disabled={progress !== null} onclick={finishRemove}>Delete this copy</button>
 									<button
 										type="button"
-										class="rounded border border-gray-900 px-3 py-2"
+										class="rounded border border-gray-900 px-3 py-2 disabled:opacity-50"
+										disabled={progress !== null}
 										onclick={() => {
 											removing = null;
 										}}>Keep it</button

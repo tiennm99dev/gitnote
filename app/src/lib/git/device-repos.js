@@ -4,7 +4,7 @@
  */
 
 import { authSession } from '../auth/index.js';
-import { openRepoFs, wipeRepoFs } from './fs.js';
+import { openRepoFs } from './fs.js';
 import { createGitHttp } from './http.js';
 import { forgetLocalRepo } from './local-repos.js';
 import { createRepo } from './repo.js';
@@ -36,11 +36,13 @@ export function openDeviceRepo({ id, provider }) {
 }
 
 /**
- * Deletes a repository's copy on this device, including unpushed commits.
- * @param {string} id
- * @returns {Promise<void>}
+ * Deletes a repository's copy on this device, including unpushed commits, if it
+ * still holds what the user was shown.
+ * @param {import('./local-repos.js').LocalWork} work what the user was shown
+ * @returns {Promise<boolean>} false when the copy changed and nothing was deleted
  */
-export async function deleteDeviceRepo(id) {
-	await wipeRepoFs(id);
-	forgetLocalRepo(id);
+export async function deleteDeviceRepo({ repo, unpushed, drafts }) {
+	const deleted = await openDeviceRepo(repo).wipeIfUnchanged({ unpushed, drafts });
+	if (deleted) forgetLocalRepo(repo.id);
+	return deleted;
 }

@@ -210,9 +210,15 @@ the gitlab.com application, and where their IDs go, is in
   repo's path rather than taken from the API. The git username is `x-access-token`
   on GitHub and `oauth2` on GitLab.
 - **Sign-out** deletes the provider's local copies only if asked, after showing
-  each copy's unpushed commits and uncommitted files and counting them again at
-  confirmation, then removes the token. A failed deletion keeps the sign-in so it can
-  be retried. `/repos` can delete any copy on its own, with or without an account.
+  each copy's unpushed commits and uncommitted files. Each copy is counted again
+  under its repo lock in the same step that deletes it, so a commit from another tab
+  can never be lost unseen: the confirmation asks again instead. Only then is the
+  token removed, and a failed deletion keeps the sign-in so it can be retried.
+  `/repos` can delete any copy on its own, with or without an account.
+- **What deletion leaves.** Files are deleted one by one, because LightningFS's
+  `wipe` breaks other open tabs, so the emptied IndexedDB database stays. Its name
+  holds the repo's host and path (`gitnote:github.com/owner/repo`), so a private
+  repo's name remains readable in the browser's storage until site data is cleared.
 
 ## Tooling notes
 

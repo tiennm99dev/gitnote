@@ -84,6 +84,13 @@ globalThis.Buffer ??= Buffer;
  */
 
 /**
+ * What deleting a copy would lose. Nulls mean it could not be read.
+ * @typedef {object} WorkCounts
+ * @property {number | null} unpushed commits only on this device
+ * @property {number | null} drafts changed files not yet committed
+ */
+
+/**
  * @typedef {object} TreeEntry
  * @property {string} path
  * @property {number} size bytes
@@ -870,6 +877,24 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
+	 * Never throws, because a copy too damaged to read must still be deletable.
+	 * A copy that cannot be read reports nulls rather than zero, so a warning
+	 * never understates what is at risk.
+	 * @returns {Promise<WorkCounts>}
+	 */
+	const countWorkUnlocked = async () => {
+		try {
+			await recoverInterruptedPull();
+			if (!(await isCloned())) return { unpushed: 0, drafts: 0 };
+			const { ahead } = await aheadBehindUnlocked();
+			const { files } = await statusUnlocked();
+			return { unpushed: ahead, drafts: files.length };
+		} catch {
+			return { unpushed: null, drafts: null };
+		}
+	};
+
+	/**
 	 * @param {string} url
 	 * @param {AbortSignal} [signal]
 	 * @returns {Promise<boolean>} true only when the remote answers with no branches; a failed check counts as false
@@ -892,6 +917,30 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 
 		/** @returns {Promise<boolean>} whether a clone is on this device */
 		isCloned: () => locked(isCloned),
+
+		/** @returns {Promise<WorkCounts>} what deleting this copy would lose now */
+		countWork: () => withLock(id, countWorkUnlocked),
+
+		/**
+		 * Deletes everything stored for this repository on this device, including
+		 * unpushed commits, but only if it still holds what the user agreed to lose.
+		 * The check and the deletion share one hold of the lock, so nothing written
+		 * in any tab can fall between them.
+		 *
+		 * Deletes file by file rather than with LightningFS's `wipe`: that clears the
+		 * store under a tab still holding the old file tree in memory, which goes on
+		 * seeing deleted files. Ordinary deletes reach other tabs like any other write.
+		 * @param {WorkCounts} expected
+		 * @returns {Promise<boolean>} false when the counts differ and nothing was deleted
+		 */
+		wipeIfUnchanged: (expected) =>
+			withLock(id, async () => {
+				const { unpushed, drafts } = await countWorkUnlocked();
+				if (unpushed !== expected.unpushed || drafts !== expected.drafts) return false;
+				await removeRecursive(dir);
+				await flush();
+				return true;
+			}),
 
 		/**
 		 * Shallow-clones one branch: `ref`, or the remote's default branch without

@@ -108,30 +108,33 @@ export function isSameWork(shown, current) {
 }
 
 /**
- * Deletes copies one by one. One that fails does not stop the others, and stays
- * recorded so that the deletion can be tried again.
- * @param {LocalRepo[]} repos
- * @param {(id: string) => Promise<void>} remove
- * @returns {Promise<LocalRepo[]>} the copies that could not be deleted
+ * Deletes copies one by one, each only if it still holds what the user was shown.
+ * One that fails or changed does not stop the others, and stays recorded so that
+ * the deletion can be tried again.
+ * @param {LocalWork[]} shown
+ * @param {(work: LocalWork) => Promise<boolean>} remove answers false when the copy changed
+ * @returns {Promise<{ failed: LocalRepo[], changed: LocalRepo[] }>} the copies still there
  */
-export async function removeLocalCopies(repos, remove) {
+export async function removeLocalCopies(shown, remove) {
 	/** @type {LocalRepo[]} */
 	const failed = [];
-	for (const repo of repos) {
+	/** @type {LocalRepo[]} */
+	const changed = [];
+	for (const work of shown) {
 		try {
-			await remove(repo.id);
+			if (!(await remove(work))) changed.push(work.repo);
 		} catch {
-			failed.push(repo);
+			failed.push(work.repo);
 		}
 	}
-	return failed;
+	return { failed, changed };
 }
 
 /**
- * Counts the unpushed work in local copies. A copy that cannot be read reports
+ * Counts the unpushed work in local copies. A copy that cannot be opened reports
  * nulls rather than zero, so a warning never understates what is at risk.
  * @param {LocalRepo[]} repos
- * @param {(repo: LocalRepo) => Pick<import('./repo.js').Repo, 'isCloned' | 'aheadBehind' | 'status'>} open
+ * @param {(repo: LocalRepo) => Pick<import('./repo.js').Repo, 'countWork'>} open
  * @returns {Promise<LocalWork[]>}
  */
 export async function describeLocalWork(repos, open) {
@@ -139,16 +142,33 @@ export async function describeLocalWork(repos, open) {
 	const work = [];
 	for (const repo of repos) {
 		try {
-			const handle = open(repo);
-			if (!(await handle.isCloned())) {
-				work.push({ repo, unpushed: 0, drafts: 0 });
-				continue;
-			}
-			const [{ ahead }, { files }] = [await handle.aheadBehind(), await handle.status()];
-			work.push({ repo, unpushed: ahead, drafts: files.length });
+			work.push({ repo, ...(await open(repo).countWork()) });
 		} catch {
 			work.push({ repo, unpushed: null, drafts: null });
 		}
 	}
 	return work;
+}
+
+/**
+ * Puts the list right after a clone failed, so a copy that is really there is
+ * never dropped from it: sign-out counts and deletes copies through this list.
+ * @param {object} options
+ * @param {LocalRepo} options.entry what this clone recorded
+ * @param {LocalRepo | undefined} options.previous what was recorded before it
+ * @param {() => Promise<boolean>} options.isCloned
+ * @param {Storage} [options.storage]
+ * @returns {Promise<void>}
+ */
+export async function settleFailedClone({ entry, previous, isCloned, storage = globalThis.localStorage }) {
+	if (previous) {
+		try {
+			saveLocalRepo(previous, storage);
+		} catch {
+			// The entry this clone recorded stays, which still lists the copy.
+		}
+		return;
+	}
+	// Not knowing counts as there: a stale entry costs far less than a lost one.
+	if (!(await isCloned().catch(() => true))) forgetLocalRepo(entry.id, storage);
 }

@@ -103,8 +103,10 @@
 
 	/**
 	 * Another tab may have committed or cloned since the list was shown, so the
-	 * choice stands only for what is there now. The sign-in goes last: with it
-	 * still here, a deletion that fails can simply be tried again.
+	 * choice stands only for what is there now: the recount stops before anything
+	 * is deleted, and each deletion checks its copy again under the repo's lock. The
+	 * sign-in goes last: with it still here, a deletion that fails can simply be
+	 * tried again.
 	 * @returns {Promise<void> | undefined}
 	 */
 	const finishSignOut = () => {
@@ -117,13 +119,11 @@
 				return;
 			}
 			if (wipe) {
-				const failed = await removeLocalCopies(
-					work.map(({ repo }) => repo),
-					deleteDeviceRepo
-				);
-				if (failed.length > 0) {
-					leaving = { provider, work: await countWork(provider), wipe, changed: false };
-					throw new Error(`Could not delete ${failed.map((repo) => repo.fullName).join(', ')}. You are still signed in, so you can try again.`);
+				const { failed, changed } = await removeLocalCopies(work, deleteDeviceRepo);
+				if (failed.length > 0 || changed.length > 0) {
+					leaving = { provider, work: await countWork(provider), wipe, changed: changed.length > 0 };
+					if (failed.length > 0) throw new Error(`Could not delete ${failed.map((repo) => repo.fullName).join(', ')}. You are still signed in, so you can try again.`);
+					return;
 				}
 			}
 			await authSession.signOut(provider);
@@ -210,7 +210,8 @@
 								</button>
 								<button
 									type="button"
-									class="rounded border border-gray-900 px-3 py-2"
+									class="rounded border border-gray-900 px-3 py-2 disabled:opacity-50"
+									disabled={busy !== null}
 									onclick={() => {
 										leaving = null;
 									}}>Keep signed in</button

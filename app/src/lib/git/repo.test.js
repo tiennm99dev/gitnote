@@ -1869,3 +1869,66 @@ describe('size limits', () => {
 		expect(await repo.estimatePushBytes()).toBe(3);
 	});
 });
+
+describe('deleting a copy', () => {
+	const NOTHING = { unpushed: 0, drafts: 0 };
+
+	it('counts what deleting would lose', async () => {
+		const { repo } = await clonedRepo();
+		await commitFile(repo, 'one.md', 'one\n');
+		await repo.writeFile('draft.md', 'draft\n');
+
+		expect(await repo.countWork()).toEqual({ unpushed: 1, drafts: 1 });
+	});
+
+	it('deletes everything when the copy holds what was shown', async () => {
+		const { repo, fs } = await clonedRepo();
+
+		expect(await repo.wipeIfUnchanged(NOTHING)).toBe(true);
+
+		expect(await repo.isCloned()).toBe(false);
+		await expect(fs.promises.lstat('/repo')).rejects.toMatchObject({ code: 'ENOENT' });
+	});
+
+	it('keeps a copy whose counts moved since they were shown', async () => {
+		const { repo } = await clonedRepo();
+		await commitFile(repo, 'late.md', 'late\n');
+
+		expect(await repo.wipeIfUnchanged(NOTHING)).toBe(false);
+
+		expect(await repo.countWork()).toEqual({ unpushed: 1, drafts: 0 });
+		expect(new TextDecoder().decode(await repo.readFile('late.md'))).toBe('late\n');
+	});
+
+	it('sees a write already waiting on the lock', async () => {
+		const { repo } = await clonedRepo();
+
+		const writing = repo.writeFile('late.md', 'late\n');
+		const wiping = repo.wipeIfUnchanged(NOTHING);
+		await writing;
+
+		expect(await wiping).toBe(false);
+		expect(await repo.countWork()).toEqual({ unpushed: 0, drafts: 1 });
+	});
+
+	it('lets no write in between the check and the deletion', async () => {
+		const { repo } = await clonedRepo();
+
+		const wiping = repo.wipeIfUnchanged(NOTHING);
+		const writing = repo.writeFile('late.md', 'late\n');
+
+		expect(await wiping).toBe(true);
+		expect((await rejection(writing)).code).toBe(ErrorCode.NOT_CLONED);
+	});
+
+	it('can still delete a copy too damaged to count, once that was shown', async () => {
+		const { repo, fs } = await clonedRepo();
+		await fs.promises.writeFile('/repo/.git/HEAD', 'not a ref');
+		const counts = await repo.countWork();
+		expect(counts).toEqual({ unpushed: null, drafts: null });
+
+		expect(await repo.wipeIfUnchanged(NOTHING)).toBe(false);
+		expect(await repo.wipeIfUnchanged(counts)).toBe(true);
+		expect(await repo.isCloned()).toBe(false);
+	});
+});
