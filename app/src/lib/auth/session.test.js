@@ -5,7 +5,7 @@ import { authCallbacks } from '../git/http.js';
 import { AuthErrorCode } from './errors.js';
 import { createGithubAdapter } from './github.js';
 import { createGitlabAdapter } from './gitlab.js';
-import { pkceChallenge } from './oauth.js';
+import { PENDING_TTL_MS, pkceChallenge } from './oauth.js';
 import { createAuthSession, REFRESH_MARGIN_MS } from './session.js';
 
 const RELAY = 'https://relay.example.com';
@@ -139,6 +139,27 @@ describe('finishing a sign-in', () => {
 	 * @returns {Promise<string>} the state
 	 */
 	const begin = async ({ session }, provider) => String(new URL(await session.beginSignIn(provider, { redirectUri: REDIRECT })).searchParams.get('state'));
+
+	it('says a callback is awaited only until it is used, and only for the state this device issued', async () => {
+		const context = setup((url) => (url.pathname === '/api/oauth/github/token' ? jsonResponse({ access_token: 'ghu_new' }) : undefined));
+		const state = await begin(context, 'github');
+		const callback = `gitnote://oauth/callback?code=the-code&state=${state}`;
+
+		expect(context.session.isAwaitedCallback('gitnote://oauth/callback?code=the-code&state=other')).toBe(false);
+		expect(context.session.isAwaitedCallback('gitnote://oauth/callback?code=the-code')).toBe(false);
+		expect(context.session.isAwaitedCallback(callback)).toBe(true);
+
+		await context.session.completeSignIn(callback);
+
+		expect(context.session.isAwaitedCallback(callback)).toBe(false);
+	});
+
+	it('stops awaiting a callback that took too long', async () => {
+		const context = setup();
+		const state = await begin(context, 'github');
+		context.clock.now += PENDING_TTL_MS + 1;
+		expect(context.session.isAwaitedCallback(`gitnote://oauth/callback?code=the-code&state=${state}`)).toBe(false);
+	});
 
 	it('trades a GitHub code through the relay and stores the pair', async () => {
 		const context = setup((url) => (url.pathname === '/api/oauth/github/token' ? jsonResponse({ access_token: 'ghu_new', refresh_token: 'ghr_new', expires_in: 28800, refresh_token_expires_in: 15897600 }) : undefined));

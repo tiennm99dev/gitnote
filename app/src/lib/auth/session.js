@@ -14,7 +14,7 @@
 import { ErrorCode, GitEngineError } from '../git/errors.js';
 import { withNamedLock } from '../git/lock.js';
 import { AuthError, AuthErrorCode } from './errors.js';
-import { isTokenText, pkceChallenge, randomToken, REQUEST_TIMEOUT_MS, savePending, takePending } from './oauth.js';
+import { hasPending, isTokenText, pkceChallenge, randomToken, REQUEST_TIMEOUT_MS, savePending, takePending } from './oauth.js';
 import { getProvider, isProviderGitUrl, PROVIDER_IDS, WEB_CALLBACK_PATH } from './providers.js';
 
 /** @typedef {import('../git/limits.js').ProviderId} ProviderId */
@@ -326,6 +326,14 @@ export function createAuthSession({ store, adapters, pendingStorage, fetch: fetc
 			const verifier = randomToken();
 			savePending(pending(), state, { provider, verifier, redirectUri, createdAt: now() }, now());
 			return adapter.authorizeUrl({ state, challenge: await pkceChallenge(verifier), redirectUri });
+		},
+
+		/**
+		 * @param {string} callbackUrl
+		 * @returns {boolean} whether `completeSignIn` would find the sign-in this URL belongs to
+		 */
+		isAwaitedCallback(callbackUrl) {
+			return hasPending(pending(), new URL(callbackUrl).searchParams.get('state') ?? '', now());
 		},
 
 		/**

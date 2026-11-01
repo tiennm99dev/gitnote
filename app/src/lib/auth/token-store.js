@@ -4,8 +4,14 @@
  * can use the key but cannot copy it out, and a copy of the database on disk is
  * useless without it. This is no defence against a script running in the page
  * while the user is signed in; the CSP and sanitized rendering cover that.
+ *
+ * The Android store keeps them in secure storage, encrypted with a key held by the
+ * Android Keystore. That key does not move to a new device, so `backup_rules.xml`
+ * and `data_extraction_rules.xml` leave this storage out of backups.
  */
 
+import { SecureStorage, StorageErrorType } from '@aparajita/capacitor-secure-storage';
+import { Capacitor } from '@capacitor/core';
 import { AuthError, AuthErrorCode } from './errors.js';
 
 /**
@@ -162,4 +168,53 @@ export function createWebTokenStore() {
 				await run(db, RECORD_STORE, 'readwrite', (store) => store.delete(name));
 			})
 	};
+}
+
+/**
+ * @template T
+ * @param {() => Promise<T>} operation
+ * @returns {Promise<T>}
+ */
+async function withSecureStorage(operation) {
+	try {
+		return await operation();
+	} catch (cause) {
+		throw new AuthError(AuthErrorCode.STORAGE, "This device's secure storage could not be used for sign-ins.", { cause });
+	}
+}
+
+/**
+ * The store for the Android build. A record the Keystore can no longer decrypt
+ * reads as absent, like one on the web, so a new sign-in can replace it.
+ * @template T
+ * @param {Pick<typeof SecureStorage, 'get' | 'set' | 'remove'>} [storage]
+ * @returns {TokenStore<T>}
+ */
+export function createNativeTokenStore(storage = SecureStorage) {
+	return {
+		get: (name) =>
+			withSecureStorage(async () => {
+				try {
+					const value = await storage.get(name, false);
+					return /** @type {T | null} */ (typeof value === 'object' ? value : null);
+				} catch (error) {
+					const code = /** @type {{ code?: unknown } | null} */ (error)?.code;
+					if (code === StorageErrorType.osError || code === StorageErrorType.invalidData) return null;
+					throw error;
+				}
+			}),
+		set: (name, value) => withSecureStorage(() => storage.set(name, /** @type {import('@aparajita/capacitor-secure-storage').DataType} */ (value), false)),
+		remove: (name) =>
+			withSecureStorage(async () => {
+				await storage.remove(name);
+			})
+	};
+}
+
+/**
+ * @template T
+ * @returns {TokenStore<T>} the store for wherever this build is running
+ */
+export function createDeviceTokenStore() {
+	return Capacitor.isNativePlatform() ? createNativeTokenStore() : createWebTokenStore();
 }

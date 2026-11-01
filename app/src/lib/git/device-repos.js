@@ -4,6 +4,7 @@
  */
 
 import { authSession } from '../auth/index.js';
+import { relayOrigin } from '../platform/native.js';
 import { createWebDraftStore } from '../stores/drafts.js';
 import { openRepoFs } from './fs.js';
 import { createGitHttp } from './http.js';
@@ -30,7 +31,7 @@ export function openDeviceRepo({ id, provider }) {
 		repo = createRepo({
 			id,
 			fs: /** @type {import('./repo.js').FsClient} */ (/** @type {unknown} */ (openRepoFs(id))),
-			http: createGitHttp(),
+			http: createGitHttp({ relayOrigin: relayOrigin() }),
 			provider,
 			getCredential: authSession.gitCredentials(provider)
 		});

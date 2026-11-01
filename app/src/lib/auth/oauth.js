@@ -99,6 +99,16 @@ export function takePending(storage, state, now) {
 }
 
 /**
+ * @param {Storage} storage
+ * @param {string} state
+ * @param {number} now
+ * @returns {boolean} whether a redirect with this `state` would find its sign-in
+ */
+export function hasPending(storage, state, now) {
+	return parsePending(storage.getItem(PENDING_PREFIX + state), now) !== null;
+}
+
+/**
  * @param {string | null} text
  * @param {number} now
  * @returns {PendingSignIn | null}

@@ -8,6 +8,9 @@ const RELAY_DEV_URL = 'http://localhost:8787';
 
 const BUILD_DIR = process.env.GITNOTE_BUILD_DIR || 'build';
 
+// The Android build: `npm run build:native`.
+const NATIVE_BUILD = process.env.CAP_BUILD === '1';
+
 export default defineConfig({
 	plugins: [
 		tailwindcss(),
@@ -30,11 +33,15 @@ export default defineConfig({
 			// no style hashes, which would make browsers ignore `'unsafe-inline'`).
 			// `connect-src` covers the CORS-enabled GitHub REST and GitLab token APIs.
 			// `frame-ancestors` cannot be set from a meta tag; `static/_headers` sends it.
+			// On older WebViews, Capacitor injects its bridge as a nonce-less inline
+			// script, so the native build needs `'unsafe-inline'` for scripts. SvelteKit
+			// then adds no script hash, which would make the WebView ignore it. DOMPurify
+			// is the only XSS defence there, and this policy must never reach the web.
 			csp: {
 				mode: 'hash',
 				directives: {
 					'default-src': ['self'],
-					'script-src': ['self'],
+					'script-src': NATIVE_BUILD ? ['self', 'unsafe-inline'] : ['self'],
 					'style-src': ['self', 'unsafe-inline'],
 					'img-src': ['self', 'blob:', 'data:'],
 					'connect-src': [

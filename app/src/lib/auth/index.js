@@ -4,15 +4,16 @@
  */
 
 import { authConfig } from './config.js';
+import { relayOrigin } from '../platform/native.js';
 import { createGithubAdapter } from './github.js';
 import { createGitlabAdapter } from './gitlab.js';
 import { createAuthSession } from './session.js';
-import { createWebTokenStore } from './token-store.js';
+import { createDeviceTokenStore } from './token-store.js';
 
 export const authSession = createAuthSession({
-	store: createWebTokenStore(),
+	store: createDeviceTokenStore(),
 	adapters: {
-		github: createGithubAdapter({ clientId: authConfig.githubClientId, appSlug: authConfig.githubAppSlug }),
+		github: createGithubAdapter({ clientId: authConfig.githubClientId, appSlug: authConfig.githubAppSlug, relayOrigin: relayOrigin() }),
 		gitlab: createGitlabAdapter({ clientId: authConfig.gitlabClientId })
 	}
 });

@@ -6,6 +6,7 @@
 	import { authSession } from '#lib/auth/index.js';
 	import { deviceDrafts, openDeviceRepo } from '#lib/git/device-repos.js';
 	import { dirName, encodePath, notePathFrom } from '#lib/notes/paths.js';
+	import { watchAppLifecycle } from '#lib/platform/native.js';
 	import { createNotes, isWithin, movedPath } from '#lib/stores/notes.js';
 	import { createAutosave } from '#lib/sync/autosave.js';
 	import { accountAuthor, isSettingsChange, loadSettings, resolveAuthor } from '#lib/sync/settings.js';
@@ -42,9 +43,12 @@
 	const sendQueuedPush = () => ($autosave.enabled ? autosave.handleOnline() : sync.pushIfPending());
 
 	const sync = createSync({ repoId: untrack(() => repo.id), repo: engine, notes, getAuthor: () => author, sendQueuedPush });
+	/** The Android app is in the background, whatever the WebView's own state says. */
+	let appPaused = false;
+
 	const autosave = createAutosave({
 		ops: sync.autosaveOps,
-		isVisible: () => document.visibilityState === 'visible',
+		isVisible: () => !appPaused && document.visibilityState === 'visible',
 		isOnline: () => navigator.onLine,
 		onError: sync.reportFailure
 	});
@@ -157,16 +161,28 @@
 				report = messageOf(error);
 			});
 		};
-		const onVisible = () => {
-			if (document.visibilityState !== 'visible') {
-				void autosave.handleHidden();
-				return;
-			}
+		const onShown = () => {
 			refresh();
 			void sync.refresh();
 			if (!$autosave.enabled) void sync.pushIfPending();
 			void autosave.handleVisible();
 		};
+		const onVisible = () => {
+			if (document.visibilityState === 'visible') onShown();
+			else void autosave.handleHidden();
+		};
+		// Android's events and `visibilitychange` may both fire, in either order. Both
+		// are safe to repeat: a second commit finds nothing and an upload runs once.
+		const stopLifecycle = watchAppLifecycle({
+			pause: () => {
+				appPaused = true;
+				void autosave.handleHidden();
+			},
+			resume: () => {
+				appPaused = false;
+				onShown();
+			}
+		});
 		const onFocus = () => {
 			refresh();
 			void sync.refresh();
@@ -210,6 +226,7 @@
 
 		return () => {
 			alive = false;
+			stopLifecycle();
 			autosave.stop();
 			sync.stop();
 			document.removeEventListener('visibilitychange', onVisible);

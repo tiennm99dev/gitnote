@@ -5,6 +5,7 @@
 	import { PROVIDER_IDS, PROVIDERS } from '#lib/auth/providers.js';
 	import { deleteDeviceRepo, describeDeviceWork } from '#lib/git/device-repos.js';
 	import { describeWorkCounts, isSameWork, listLocalRepos, removeLocalCopies } from '#lib/git/local-repos.js';
+	import { openSignInPage, signInRedirectUri } from '#lib/platform/native.js';
 
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
 
@@ -65,7 +66,7 @@
 	 */
 	const signIn = (provider) =>
 		run(provider, async () => {
-			location.assign(await authSession.beginSignIn(provider));
+			await openSignInPage(await authSession.beginSignIn(provider, { redirectUri: signInRedirectUri() }));
 		});
 
 	/**
