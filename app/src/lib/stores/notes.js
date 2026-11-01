@@ -489,6 +489,44 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			await load(note.path);
 		},
 
+		/**
+		 * Saves every note's unsaved text, as Save would. A draft whose file changed
+		 * underneath it stays a draft, because only the user can choose between the two.
+		 * @returns {Promise<{ saved: string[], skipped: string[] }>} `skipped` holds the paths left as drafts
+		 */
+		async saveDrafts() {
+			await flushDrafts();
+			/** @type {string[]} */
+			const saved = [];
+			/** @type {string[]} */
+			const skipped = [];
+			const paths = new Set([...(await drafts.listPaths(repoId)), ...unkeptDrafts.keys()]);
+			for (const path of paths) {
+				const open = state.note?.path === path ? state.note : null;
+				const draft = open ? { text: open.text, base: open.savedText } : (unkeptDrafts.get(path) ?? (await drafts.get(repoId, path)));
+				if (!draft) continue;
+				const onDisk = await readDiskText(path);
+				if (onDisk !== draft.base && onDisk !== draft.text) {
+					if (open) setNote({ diskChanged: true });
+					skipped.push(path);
+					continue;
+				}
+				if (onDisk !== draft.text) await repo.writeFile(path, draft.text);
+				saved.push(path);
+				if (open && state.note?.version === open.version) {
+					const stillSame = state.note.text === draft.text;
+					setNote({ savedText: draft.text, dirty: !stillSame, diskChanged: false, restored: false, size: new TextEncoder().encode(draft.text).byteLength, draftStored: stillSame });
+					queueDraft(path, stillSame ? null : { repoId, path, text: state.note.text, base: draft.text });
+				} else {
+					ownDrafts.set(path, draft.text);
+					queueDraft(path, null);
+				}
+			}
+			await flushDrafts();
+			await loadTree();
+			return { saved, skipped };
+		},
+
 		create,
 
 		/**

@@ -1086,3 +1086,76 @@ it('works against a repo a native git can read back', async () => {
 	await repo.push();
 	expect(await showRemote(remote, 'HEAD:README.md')).toBe('# From the app\n');
 });
+
+describe('saving every draft', () => {
+	beforeEach(async () => {
+		context = await setUp();
+	});
+
+	it('writes the open note and closed ones, and removes their drafts', async () => {
+		const { notes, repo, drafts } = context;
+		await notes.open('README.md');
+		notes.edit('closed draft\n');
+		await notes.flushDrafts();
+		await notes.open('notes/today.md');
+		notes.edit('open draft\n');
+
+		const { saved, skipped } = await notes.saveDrafts();
+
+		expect(saved.sort()).toEqual(['README.md', 'notes/today.md']);
+		expect(skipped).toEqual([]);
+		expect(await repo.readText('README.md')).toBe('closed draft\n');
+		expect(await repo.readText('notes/today.md')).toBe('open draft\n');
+		expect(openNote(notes)).toMatchObject({ dirty: false, savedText: 'open draft\n', draftStored: true });
+		expect(get(notes).draftPaths).toEqual([]);
+		expect(await drafts.listPaths(REPO_ID)).toEqual([]);
+	});
+
+	it('leaves a draft whose file changed underneath it, for the user to choose', async () => {
+		const { notes, repo, drafts } = context;
+		await notes.open('README.md');
+		notes.edit('closed draft\n');
+		await notes.flushDrafts();
+		await notes.open('notes/today.md');
+		notes.edit('open draft\n');
+		await notes.flushDrafts();
+		await repo.writeFile('README.md', 'changed\n');
+		await repo.writeFile('notes/today.md', 'changed\n');
+
+		const { saved, skipped } = await notes.saveDrafts();
+
+		expect(saved).toEqual([]);
+		expect(skipped.sort()).toEqual(['README.md', 'notes/today.md']);
+		expect(await repo.readText('README.md')).toBe('changed\n');
+		expect(openNote(notes)).toMatchObject({ dirty: true, diskChanged: true, text: 'open draft\n' });
+		expect((await drafts.listPaths(REPO_ID)).sort()).toEqual(['README.md', 'notes/today.md']);
+	});
+
+	it('saves text that storage refused to keep', async () => {
+		const { notes, repo, drafts } = context;
+		drafts.failing.put = true;
+		await notes.open('README.md');
+		notes.edit('only in memory\n');
+		await notes.flushDrafts();
+		await notes.open('notes/today.md');
+		expect(get(notes).unkeptPaths).toEqual(['README.md']);
+
+		await notes.saveDrafts();
+
+		expect(await repo.readText('README.md')).toBe('only in memory\n');
+		expect(get(notes).unkeptPaths).toEqual([]);
+	});
+
+	it('keeps what was typed while the save ran', async () => {
+		const { notes, repo } = context;
+		await notes.open('README.md');
+		notes.edit('first\n');
+		const saving = notes.saveDrafts();
+		notes.edit('second\n');
+		await saving;
+		const note = openNote(notes);
+		expect(note.text).toBe('second\n');
+		expect(note.dirty).toBe(note.savedText !== 'second\n');
+		expect(await repo.readText('README.md')).toBe(note.savedText);
+	});
+});
