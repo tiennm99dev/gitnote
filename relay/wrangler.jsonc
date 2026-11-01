@@ -2,5 +2,33 @@
   "$schema": "../node_modules/wrangler/config-schema.json",
   "name": "gitnote",
   "main": "src/index.js",
-  "compatibility_date": "2026-10-23"
+  "compatibility_date": "2026-10-23",
+  // The SPA build. Only /api/* reaches the Worker; every other path is served
+  // from the assets, and unknown paths fall back to index.html for the client
+  // router. Asset response headers come from app/static/_headers.
+  "assets": {
+    "directory": "../app/build",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "vars": {
+    // Git hosts the relay may reach, as host or host:port. Loopback hosts use
+    // http (local test fixtures only); every other host uses https.
+    "GIT_HOSTS": "github.com,gitlab.com",
+    // Cross-origin app shells allowed to call /api/*, in addition to the
+    // Worker's own origin. https://localhost is the Capacitor WebView.
+    "CORS_ORIGINS": "https://localhost"
+  },
+  // Per-location, approximate request limits keyed by client IP. The binding
+  // keeps counters only; it stores no request data.
+  "ratelimits": [
+    { "name": "API_LIMITER", "namespace_id": "4801", "simple": { "limit": 300, "period": 60 } },
+    { "name": "OAUTH_LIMITER", "namespace_id": "4802", "simple": { "limit": 10, "period": 60 } }
+  ],
+  // No Workers Logs, traces, Tail Worker or Logpush: no Cloudflare doc promises
+  // that captured logs redact request headers, and those carry tokens.
+  "observability": {
+    "enabled": false
+  }
 }
