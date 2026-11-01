@@ -1,0 +1,23 @@
+node_modules/
+
+# Build output
+/app/build/
+/app/.svelte-kit/
+/relay/dist/
+.wrangler/
+
+# Test output
+test-results/
+playwright-report/
+
+# Local secrets
+.env
+.env.*
+.dev.vars
+.dev.vars.*
+
+# Editors and OS
+.claude/settings.local.json
+.DS_Store
+Thumbs.db
+vite.config.js.timestamp-*

@@ -1,0 +1,33 @@
+{
+  "name": "gitnote",
+  "private": true,
+  "description": "Offline-first git-backed markdown notes for web and Android",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "workspaces": [
+    "app",
+    "relay"
+  ],
+  "scripts": {
+    "dev": "npm run dev -w app",
+    "dev:relay": "npm run dev -w relay",
+    "lint": "eslint . --max-warnings=0",
+    "typecheck": "npm run check -w app",
+    "test": "npm run test --workspaces",
+    "build": "npm run build --workspaces",
+    "e2e": "npm run e2e -w app"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.13.0",
+    "eslint-plugin-jsdoc": "^65.4.2",
+    "eslint-plugin-svelte": "^3.23.1",
+    "globals": "^17.13.0"
+  },
+  "allowScripts": {
+    "esbuild": true,
+    "workerd": true
+  }
+}

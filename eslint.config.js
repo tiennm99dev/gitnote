@@ -1,0 +1,35 @@
+import path from 'node:path';
+import js from '@eslint/js';
+import jsdoc from 'eslint-plugin-jsdoc';
+import svelte from 'eslint-plugin-svelte';
+import { defineConfig, includeIgnoreFile } from 'eslint/config';
+import globals from 'globals';
+
+const gitignorePath = path.resolve(import.meta.dirname, '.gitignore');
+
+export default defineConfig([
+	includeIgnoreFile(gitignorePath),
+	js.configs.recommended,
+	svelte.configs.recommended,
+	jsdoc.configs['flat/recommended-typescript-flavor'],
+	{
+		files: ['app/src/**/*.{js,svelte}'],
+		languageOptions: { globals: globals.browser }
+	},
+	{
+		files: ['relay/src/**/*.js', 'relay/test/**/*.js'],
+		languageOptions: { globals: globals.worker }
+	},
+	{
+		files: ['**/*.config.js', 'app/e2e/**/*.js'],
+		languageOptions: { globals: globals.node }
+	},
+	{
+		rules: {
+			'no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
+			'jsdoc/require-param-description': 'off',
+			'jsdoc/require-property-description': 'off',
+			'jsdoc/require-returns-description': 'off'
+		}
+	}
+]);

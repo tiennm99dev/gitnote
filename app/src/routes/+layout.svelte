@@ -1,0 +1,14 @@
+<script>
+	import './layout.css';
+	import favicon from '#lib/assets/favicon.svg';
+
+	/** @type {{children: import('svelte').Snippet}} */
+	let { children } = $props();
+</script>
+
+<svelte:head>
+	<title>gitnote</title>
+	<link rel="icon" href={favicon} />
+</svelte:head>
+
+{@render children()}
