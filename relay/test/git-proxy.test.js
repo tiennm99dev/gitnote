@@ -22,6 +22,23 @@ function gitResponse(body = '001e# service=git-upload-pack\n0000') {
 }
 
 /**
+ * @returns {Response} an upload-pack result as a git host sends it
+ */
+function packResult() {
+	return new Response('0008NAK\n', { headers: { 'Content-Type': 'application/x-git-upload-pack-result' } });
+}
+
+/**
+ * Reads the request bodies the loopback git host fixture saw for one repo path.
+ * @param {string} path
+ * @returns {Promise<import('./upstream-fixture.js').ReceivedBody[]>}
+ */
+async function fixtureReceived(path) {
+	const response = await fetch(`http://localhost:8174/__received?path=${encodeURIComponent(path)}`);
+	return response.json();
+}
+
+/**
  * Reads a git (binary) response body as text without the runtime's
  * non-text-body warning.
  * @param {Response} response
@@ -64,17 +81,20 @@ describe('git path allowlist', () => {
 		const at = (/** @type {string} */ path) => resolveGitTarget(new URL(path, 'https://gitnote.test'), hosts);
 		expect(at(REFS_PATH)).toEqual({
 			method: 'GET',
-			url: 'https://github.com/octo/notes.git/info/refs?service=git-upload-pack'
+			url: 'https://github.com/octo/notes.git/info/refs?service=git-upload-pack',
+			responseType: 'application/x-git-upload-pack-advertisement'
 		});
 		expect(at('/api/git/gitlab.com/group/sub/notes.git/git-receive-pack')).toEqual({
 			method: 'POST',
 			url: 'https://gitlab.com/group/sub/notes.git/git-receive-pack',
-			contentType: 'application/x-git-receive-pack-request'
+			contentType: 'application/x-git-receive-pack-request',
+			responseType: 'application/x-git-receive-pack-result'
 		});
 		expect(at('/api/git/localhost:8174/me/.github.git/git-upload-pack')).toEqual({
 			method: 'POST',
 			url: 'http://localhost:8174/me/.github.git/git-upload-pack',
-			contentType: UPLOAD_PACK
+			contentType: UPLOAD_PACK,
+			responseType: 'application/x-git-upload-pack-result'
 		});
 	});
 
@@ -92,6 +112,11 @@ describe('git path allowlist', () => {
 		['POST', '/api/git/github.com/octo/notes.git/info/refs?service=git-upload-pack'],
 		['POST', '/api/git/github.com/octo/notes.git/git-upload-pack?x=1'],
 		['GET', '/api/git/github.com/login/oauth/access_token'],
+		['GET', '/api/git/github.com/octocat/Hello-World/blob/master/x.git/info/refs?service=git-upload-pack'],
+		['GET', '/api/git/github.com/octo/notes/raw/x.git/info/refs?service=git-upload-pack'],
+		['POST', '/api/git/github.com/group/sub/notes.git/git-upload-pack'],
+		['GET', '/api/git/gitlab.com/group/notes/-/raw/main/x.git/info/refs?service=git-upload-pack'],
+		['GET', '/api/git/gitlab.com/group/-/notes.git/info/refs?service=git-upload-pack'],
 		['GET', '/api/git/']
 	])('answers 403 without any upstream call for %s %s', async (method, path) => {
 		const calls = stubUpstream(() => gitResponse());
@@ -200,7 +225,7 @@ describe('request body encoding', () => {
 	});
 
 	it('forwards an identity Content-Encoding', async () => {
-		const calls = stubUpstream(() => new Response('0008NAK\n'));
+		const calls = stubUpstream(() => packResult());
 		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
 			method: 'POST',
 			body: '0000',
@@ -212,7 +237,7 @@ describe('request body encoding', () => {
 	});
 
 	it('sends no Content-Encoding upstream when the client sent none', async () => {
-		const calls = stubUpstream(() => new Response('0008NAK\n'));
+		const calls = stubUpstream(() => packResult());
 		const response = await relay('/api/git/github.com/octo/notes.git/git-upload-pack', {
 			method: 'POST',
 			body: '0000',
@@ -295,23 +320,115 @@ describe('forwarded headers', () => {
 	});
 });
 
+describe('upstream response types', () => {
+	const page = '<!doctype html><script>alert(document.domain)</script>';
+
+	it('answers a JSON 502 instead of relaying an HTML page with a 200', async () => {
+		stubUpstream(() => new Response(page, { headers: { 'Content-Type': 'text/html; charset=utf-8' } }));
+		const response = await relay(REFS_PATH);
+		expect(response.status).toBe(502);
+		expect(response.headers.get('content-type')).toBe('application/json');
+		expect(await response.json()).toMatchObject({ error: 'unexpected_upstream_response' });
+	});
+
+	it('answers a JSON 502 for a 200 carrying the other git service type', async () => {
+		stubUpstream(() => new Response('0000', { headers: { 'Content-Type': 'application/x-git-receive-pack-advertisement' } }));
+		const response = await relay(REFS_PATH);
+		expect(response.status).toBe(502);
+		expect(await response.json()).toMatchObject({ error: 'unexpected_upstream_response' });
+	});
+
+	it('keeps the status but not the body of an HTML error page', async () => {
+		stubUpstream(() => new Response(page, { status: 404, headers: { 'Content-Type': 'text/html; charset=utf-8' } }));
+		const response = await relay(REFS_PATH);
+		expect(response.status).toBe(404);
+		expect(response.headers.get('content-type')).toBe('application/json');
+		const text = await response.text();
+		expect(text).not.toContain('<script>');
+		expect(JSON.parse(text)).toMatchObject({ error: 'upstream_error' });
+	});
+
+	it('relays a plain-text git host error as it came', async () => {
+		stubUpstream(() => new Response('HTTP Basic: Access denied', { status: 403, headers: { 'Content-Type': 'text/plain' } }));
+		const response = await relay(REFS_PATH);
+		expect(response.status).toBe(403);
+		expect(await response.text()).toBe('HTTP Basic: Access denied');
+	});
+
+	it('marks every relayed answer nosniff and sandboxed', async () => {
+		stubUpstream(() => gitResponse());
+		const response = await relay(REFS_PATH);
+		expect(response.status).toBe(200);
+		await bodyText(response);
+		expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+		expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox; frame-ancestors 'none'");
+	});
+});
+
+describe('request bodies on the wire', () => {
+	it('sends the upstream host a fixed Content-Length, not chunked encoding', async () => {
+		const path = '/me/fixed-length.git';
+		const payload = new Uint8Array(70_000).map((_, i) => i % 251);
+		// A native stream, so the relay cannot know the length from the body itself.
+		const { readable, writable } = new IdentityTransformStream();
+		const writer = writable.getWriter();
+		const written = writer.write(payload).then(() => writer.close());
+		const response = await relay(`/api/git/localhost:8174${path}/git-upload-pack`, {
+			method: 'POST',
+			body: readable,
+			headers: { 'Content-Type': UPLOAD_PACK, 'Content-Length': String(payload.length) }
+		});
+		await written;
+		expect(response.status).toBe(200);
+		expect(await bodyText(response)).toBe('0008NAK\n');
+		expect(await fixtureReceived(path)).toEqual([
+			{ contentLength: '70000', transferEncoding: null, bytes: 70_000, complete: true }
+		]);
+	});
+
+	it('aborts the upstream request when the client body ends short of its Content-Length', async () => {
+		const path = '/me/short-body.git';
+		const { readable, writable } = new IdentityTransformStream();
+		const writer = writable.getWriter();
+		const written = writer
+			.write(new Uint8Array(1000))
+			.then(() => writer.close())
+			.catch(() => {});
+		const response = await relay(`/api/git/localhost:8174${path}/git-upload-pack`, {
+			method: 'POST',
+			body: readable,
+			headers: { 'Content-Type': UPLOAD_PACK, 'Content-Length': '5000' }
+		});
+		await written;
+		expect(response.status).toBe(502);
+		expect(await response.json()).toMatchObject({ error: 'upstream_unreachable' });
+		// The host never saw a whole body, so it never handled a truncated pack.
+		const records = await fixtureReceived(path);
+		expect(records.every((record) => !record.complete && record.bytes < 5000)).toBe(true);
+	});
+});
+
 describe('upstream redirects and failures', () => {
-	it('turns an upstream 301 into a JSON 502 without following it', async () => {
+	it('turns an upstream 301 into a JSON 502 without following or logging it', async () => {
 		const location = 'https://github.com/octo/renamed.git/info/refs?service=git-upload-pack';
+		const logged = spyConsole();
 		const calls = stubUpstream(() => new Response(null, { status: 301, headers: { Location: location } }));
 		const response = await relay(REFS_PATH, { headers: { Authorization: 'Bearer secret' } });
 		expect(response.status).toBe(502);
 		expect(await response.json()).toMatchObject({ error: 'repo_moved', location });
 		expect(calls).toHaveLength(1);
 		expect(calls[0].init.redirect).toBe('manual');
+		expect(logged()).toEqual([]);
 	});
 
-	it('answers 502 when the git host cannot be reached', async () => {
+	it('answers 502 when the git host cannot be reached, logging nothing', async () => {
+		const logged = spyConsole();
 		stubUpstream(() => {
 			throw new TypeError('network down');
 		});
-		const response = await relay(REFS_PATH);
+		const response = await relay(REFS_PATH, { headers: { Authorization: 'Bearer secret' } });
 		expect(response.status).toBe(502);
 		expect(await response.json()).toMatchObject({ error: 'upstream_unreachable' });
+		expect(logged()).toEqual([]);
 	});
 });

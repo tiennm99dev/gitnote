@@ -59,6 +59,15 @@ domain is the only origin.
 - **Git hosts** come from the `GIT_HOSTS` var: `github.com,gitlab.com` over
   https. Loopback entries such as `localhost:8174` use http, for local test
   servers only. Other hosts, paths, methods and content types answer 403.
+  github.com repos must be exactly `<owner>/<repo>.git`, and no path segment
+  may be `-` (GitLab's web-route separator), so the relay never fetches a web
+  page.
+- **Responses.** A 2xx passes through only with the git content type for that
+  endpoint (otherwise a JSON 502 `unexpected_upstream_response`), and an error
+  status keeps its body only when it is `text/plain` (otherwise a JSON
+  `upstream_error` with the same status). Every `/api/*` answer carries
+  `X-Content-Type-Options: nosniff` and
+  `Content-Security-Policy: default-src 'none'; sandbox; frame-ancestors 'none'`.
 - **Headers.** Only `Authorization`, `Content-Type`, `Accept`, `Git-Protocol`
   and `User-Agent` go upstream, and a `User-Agent` that does not start with
   `git/` becomes `git/gitnote-relay`. Redirects are never followed: an

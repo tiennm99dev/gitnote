@@ -1,5 +1,6 @@
 import { exports } from 'cloudflare:workers';
 import { describe, expect, it } from 'vitest';
+import { relay } from './helpers.js';
 
 describe('GET /api/health', () => {
 	it('answers 200 with an ok status as JSON', async () => {
@@ -14,5 +15,20 @@ describe('GET /api/health', () => {
 			method: 'POST'
 		});
 		expect(response.status).toBe(404);
+	});
+});
+
+describe('/api/* response headers', () => {
+	it.each([
+		['the health probe', '/api/health', {}, 200],
+		['an unknown endpoint', '/api/nope', {}, 404],
+		['a refused origin', '/api/health', { headers: { Origin: 'https://evil.test' } }, 403],
+		['a refused git target', '/api/git/example.com/o/r.git/info/refs?service=git-upload-pack', {}, 403]
+	])('marks %s nosniff and sandboxed', async (_name, path, init, status) => {
+		const response = await relay(path, init);
+		expect(response.status).toBe(status);
+		expect(response.headers.get('x-content-type-options')).toBe('nosniff');
+		expect(response.headers.get('content-security-policy')).toBe("default-src 'none'; sandbox; frame-ancestors 'none'");
+		await response.arrayBuffer();
 	});
 });

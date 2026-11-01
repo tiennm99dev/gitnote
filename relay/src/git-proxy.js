@@ -39,10 +39,23 @@ const LOOPBACK_HOSTS = new Set(['localhost', '127.0.0.1']);
 const PATH_SEGMENT = /^[A-Za-z0-9_.-]+$/;
 
 /**
+ * Hosts whose repositories always sit at `<owner>/<repo>.git`. Any deeper path
+ * there is a web page (blob, raw, issues), never a repository.
+ */
+const FLAT_REPO_HOSTS = new Set(['github.com']);
+
+/**
+ * GitLab's route separator: `/-/` starts its web routes (`/-/raw/`,
+ * `/-/blob/`), and no group or project may be named `-`.
+ */
+const ROUTE_SEPARATOR = '-';
+
+/**
  * @typedef {object} GitTarget
  * @property {string} url upstream URL to fetch
  * @property {'GET' | 'POST'} method
  * @property {string} [contentType] the content type a POST must carry
+ * @property {string} responseType the content type a successful answer carries
  */
 
 /**
@@ -86,21 +99,32 @@ export function resolveGitTarget(url, hosts) {
 		if ([...url.searchParams.keys()].length !== 1 || service === null || !SERVICES.has(service)) {
 			return null;
 		}
-		target = { method: 'GET', endpoint: `info/refs?service=${service}` };
+		target = {
+			method: 'GET',
+			endpoint: `info/refs?service=${service}`,
+			responseType: `application/x-${service}-advertisement`
+		};
 		rest.splice(-2);
 	} else if (SERVICES.has(rest.at(-1) ?? '')) {
 		if (url.search !== '') return null;
 		const service = /** @type {string} */ (rest.pop());
-		target = { method: 'POST', endpoint: service, contentType: `application/x-${service}-request` };
+		target = {
+			method: 'POST',
+			endpoint: service,
+			contentType: `application/x-${service}-request`,
+			responseType: `application/x-${service}-result`
+		};
 	} else {
 		return null;
 	}
 
 	// `<owner>/<repo>.git`, or `<group>/<subgroup>/.../<repo>.git` on GitLab.
 	if (rest.length < 2 || !rest.at(-1)?.endsWith('.git')) return null;
-	if (!rest.every((segment) => PATH_SEGMENT.test(segment) && segment !== '.' && segment !== '..')) {
-		return null;
-	}
+	const hostname = host.toLowerCase().replace(/:\d+$/, '');
+	if (FLAT_REPO_HOSTS.has(hostname) && rest.length !== 2) return null;
+	const isRepoSegment = (/** @type {string} */ segment) =>
+		PATH_SEGMENT.test(segment) && segment !== '.' && segment !== '..' && segment !== ROUTE_SEPARATOR;
+	if (!rest.every(isRepoSegment)) return null;
 
 	const { endpoint, ...request } = target;
 	return { ...request, url: `${base}/${rest.join('/')}/${endpoint}` };
@@ -177,12 +201,33 @@ export async function gitProxy(c) {
 		);
 	}
 
+	// Only git protocol bytes, or a host's plain-text error, reach the app
+	// origin. Anything else (an HTML page, a JSON API answer) is not a git
+	// response and must not be served from the app's own origin.
+	const type = mediaType(upstream.headers.get('Content-Type'));
+	const ok = upstream.status >= 200 && upstream.status < 300;
+	if (ok ? type !== target.responseType : type !== 'text/plain') {
+		await upstream.body?.cancel();
+		if (ok) {
+			return jsonError(502, 'unexpected_upstream_response', 'The git host did not answer with git protocol data.');
+		}
+		return jsonError(upstream.status, 'upstream_error', `The git host answered with HTTP ${upstream.status}.`);
+	}
+
 	const responseHeaders = new Headers();
 	for (const name of FORWARD_RESPONSE_HEADERS) {
 		const value = upstream.headers.get(name);
 		if (value !== null) responseHeaders.set(name, value);
 	}
 	return new Response(upstream.body, { status: upstream.status, statusText: upstream.statusText, headers: responseHeaders });
+}
+
+/**
+ * @param {string | null} value a Content-Type header
+ * @returns {string} its lowercased media type without parameters
+ */
+function mediaType(value) {
+	return (value ?? '').split(';')[0].trim().toLowerCase();
 }
 
 /**
