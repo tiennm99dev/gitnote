@@ -15,16 +15,28 @@ import { imageTypeFor, resolveNoteUrl } from '../notes/paths.js';
  * Elements that could post a form, or restyle or cover the app. Raw HTML in a
  * note keeps its structure, not the power to look like part of the app. Media
  * would only fail against the CSP. `class` is out because the app's own utility
- * classes could otherwise position a note's content over its controls.
+ * classes could otherwise position a note's content over its controls. Inline
+ * SVG is out because its links and images would skip the rewriting below; an SVG
+ * file still shows through `<img>`.
  */
 const SANITIZE_CONFIG = Object.freeze({
 	RETURN_DOM_FRAGMENT: /** @type {const} */ (true),
 	SANITIZE_NAMED_PROPS: true,
-	FORBID_TAGS: ['style', 'form', 'button', 'select', 'option', 'optgroup', 'datalist', 'textarea', 'fieldset', 'legend', 'label', 'video', 'audio', 'source', 'track', 'picture', 'map', 'area'],
-	FORBID_ATTR: ['style', 'class', 'srcset', 'action', 'formaction']
+	FORBID_TAGS: ['style', 'form', 'button', 'select', 'option', 'optgroup', 'datalist', 'textarea', 'fieldset', 'legend', 'label', 'video', 'audio', 'source', 'track', 'picture', 'map', 'area', 'dialog', 'svg', 'image', 'feimage', 'use'],
+	FORBID_ATTR: ['style', 'class', 'srcset', 'action', 'formaction', 'background', 'popover', 'popovertarget', 'popovertargetaction', 'xlink:href']
 });
 
-const FRONT_MATTER = /^\uFEFF?---[ \t]*\r?\n(?:[^\n]*\n)*?---[ \t]*(?:\r?\n|$)/;
+/**
+ * Sanitizing renames every `id`, so a link to one must carry the same prefix.
+ * This is DOMPurify's `SANITIZE_NAMED_PROPS` prefix.
+ */
+const ID_PREFIX = 'user-content-';
+
+/**
+ * A closing `---` alone does not make front matter: two horizontal rules look the
+ * same. The block must start right away with a `key:` or a comment, or be empty.
+ */
+const FRONT_MATTER = /^\uFEFF?---[ \t]*\r?\n(?:(?:[ \t]*#|[^\s#:][^\n:]*:(?=[ \t\r\n]))[^\n]*\n(?:[^\n]*\n)*?)?---[ \t]*(?:\r?\n|$)/;
 
 const markdown = new MarkdownIt({ html: true, linkify: true });
 markdown.use(tasklist, { disabled: true, label: false });
@@ -36,6 +48,39 @@ markdown.core.ruler.push('table_align_attribute', (state) => {
 		token.attrs = align ? [['align', align]] : null;
 	}
 });
+
+// Links to a heading need a target. Sanitizing adds the prefix to these ids.
+markdown.core.ruler.push('heading_ids', (state) => {
+	/** @type {Map<string, number>} */
+	const used = new Map();
+	state.tokens.forEach((token, index) => {
+		if (token.type !== 'heading_open') return;
+		const words = (state.tokens[index + 1].children ?? []).filter((child) => child.type === 'text' || child.type === 'code_inline').map((child) => child.content);
+		const slug = slugify(words.join(''));
+		if (slug === '') return;
+		const seen = used.get(slug) ?? 0;
+		used.set(slug, seen + 1);
+		token.attrSet('id', seen === 0 ? slug : `${slug}-${seen}`);
+	});
+});
+
+/**
+ * @param {string} text a heading's text
+ * @returns {string} lowercase words joined by hyphens, as git hosts make heading links
+ */
+function slugify(text) {
+	return text
+		.trim()
+		.toLocaleLowerCase()
+		.replace(/[^\p{L}\p{M}\p{N}\s_-]/gu, '')
+		.replace(/\s+/g, '-');
+}
+
+/**
+ * @param {string} suffix a URL's query and fragment, if any
+ * @returns {string} the same, with the fragment naming a sanitized id
+ */
+const prefixFragment = (suffix) => suffix.replace(/#(?=.)/, `#${ID_PREFIX}`);
 
 /**
  * Lazily made `blob:` URLs for the images one open note shows. Each image is
@@ -145,7 +190,9 @@ function rewriteLink(link, notePath, linkFor) {
 	if (href === null) return;
 	const target = resolveNoteUrl(notePath, href);
 	if (target.kind === 'repo') {
-		link.setAttribute('href', `${linkFor(target.path)}${target.suffix}`);
+		link.setAttribute('href', `${linkFor(target.path)}${prefixFragment(target.suffix)}`);
+	} else if (target.kind === 'fragment') {
+		link.setAttribute('href', prefixFragment(href));
 	} else if (target.kind === 'invalid') {
 		link.removeAttribute('href');
 	} else if (target.kind === 'external') {

@@ -1,5 +1,5 @@
 <script>
-	import { onDestroy, untrack } from 'svelte';
+	import { onDestroy, tick, untrack } from 'svelte';
 	import { createImageUrls, renderMarkdown } from '#lib/markdown/render.js';
 
 	/**
@@ -25,6 +25,15 @@
 	let renders = 0;
 	let rendered = false;
 
+	/** A link's fragment had nothing to find until the first render. */
+	const showLinkedHeading = () => {
+		try {
+			document.getElementById(decodeURIComponent(location.hash.slice(1)))?.scrollIntoView();
+		} catch {
+			// A malformed fragment names nothing.
+		}
+	};
+
 	$effect(() => {
 		const text = source;
 		const render = async () => {
@@ -35,6 +44,10 @@
 				if (current !== renders) return;
 				html = next;
 				failure = null;
+				if (current === 1) {
+					await tick();
+					showLinkedHeading();
+				}
 			} catch (error) {
 				if (current === renders) failure = error instanceof Error ? error.message : 'This note could not be shown.';
 			}

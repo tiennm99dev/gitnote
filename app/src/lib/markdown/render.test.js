@@ -70,6 +70,24 @@ describe('sanitizing', () => {
 		expect(dom.textContent).toContain('z');
 	});
 
+	it('keeps a dialog or popover from floating over the app, leaving its text in the note', async () => {
+		const { dom } = await render('<dialog open><a href="https://example.com/login">Session expired</a></dialog>\n\n<div popover="manual">p</div>\n\n<a popovertarget="x" popovertargetaction="show">q</a>');
+		expect(dom.querySelector('dialog')).toBeNull();
+		expect(dom.querySelector('[popover], [popovertarget], [popovertargetaction]')).toBeNull();
+		expect(dom.textContent).toContain('Session expired');
+	});
+
+	it('takes inline SVG out, so its links and images never skip the rewriting', async () => {
+		const { dom, html } = await render('<svg><a xlink:href="https://example.com/"><text>x</text></a></svg>\n\n<svg><image href="/api/health"></image></svg>\n\n<svg width="9000"><use href="#a"></use><filter><feImage href="/api/x"></feImage></filter></svg>');
+		expect(dom.querySelector('svg, image, use, feImage')).toBeNull();
+		expect(html).not.toMatch(/api\/|example\.com|xlink/);
+	});
+
+	it('leaves no URL in a background attribute', async () => {
+		const { html } = await render('<table background="z.png"><tr><td background="/api/health">x</td></tr></table>');
+		expect(html).not.toContain('background');
+	});
+
 	it('cannot shadow document properties with a name', async () => {
 		const { dom } = await render('<img name="cookie" src="data:image/png;base64,AA">\n\n<a id="getElementById" href="#x">x</a>');
 		expect(dom.querySelector('img')?.getAttribute('name')).not.toBe('cookie');
@@ -105,6 +123,32 @@ describe('markdown', () => {
 		const { dom } = await render('---\n\nJust text\n');
 		expect(dom.querySelector('hr')).not.toBeNull();
 		expect(dom.textContent).toContain('Just text');
+	});
+
+	it('keeps the text between two rules that open a note', async () => {
+		const { dom } = await render('---\n\nFirst section\n\n---\n\nSecond section\n');
+		expect(dom.querySelectorAll('hr')).toHaveLength(2);
+		expect(dom.textContent).toContain('First section');
+		expect(dom.textContent).toContain('Second section');
+	});
+
+	it('keeps prose under a rule that does not read as YAML', async () => {
+		const { dom } = await render('---\nSee https://example.com for more\n---\nAfter\n');
+		expect(dom.textContent).toContain('See');
+	});
+
+	it.each([
+		['a key', '---\ntitle: x\n---\nBody\n'],
+		['a key with its value below', '---\ntags:\n  - x\n---\nBody\n'],
+		['a comment', '---\n# x\ntitle: x\n---\nBody\n'],
+		['nothing inside', '---\n---\nBody\n'],
+		['Windows line endings', '---\r\ntitle: x\r\n---\r\nBody\r\n'],
+		['a blank line further down', '---\ntitle: x\n\nmore: y\n---\nBody\n'],
+		['a byte order mark', '\uFEFF---\ntitle: x\n---\nBody\n']
+	])('leaves out front matter with %s', async (_name, source) => {
+		const { dom } = await render(source);
+		expect(dom.textContent?.trim()).toBe('Body');
+		expect(dom.querySelector('hr')).toBeNull();
 	});
 
 	it('ignores a byte order mark', async () => {
@@ -193,7 +237,7 @@ describe('links', () => {
 	it('opens other notes in the app, keeping a heading link', async () => {
 		const { dom } = await render('[next](./next.md)\n\n[up](../index.md#top)\n\n[spaced](my%20note.md)');
 		const hrefs = [...dom.querySelectorAll('a')].map((link) => link.getAttribute('href'));
-		expect(hrefs).toEqual(['/repo/x/notes/next.md', '/repo/x/index.md#top', '/repo/x/notes/my note.md']);
+		expect(hrefs).toEqual(['/repo/x/notes/next.md', '/repo/x/index.md#user-content-top', '/repo/x/notes/my note.md']);
 		expect(dom.querySelector('a')?.hasAttribute('target')).toBe(false);
 	});
 
@@ -205,10 +249,27 @@ describe('links', () => {
 		expect(link?.getAttribute('rel')).toBe('noopener noreferrer');
 	});
 
-	it('leaves in-page links alone and drops one that leaves the repository', async () => {
-		const { dom } = await render('[here](#section)\n\n[out](../../../etc.md)');
+	it('points an in-page link at its heading, and drops one that leaves the repository', async () => {
+		const { dom } = await render('## Section\n\n[here](#section)\n\n[out](../../../etc.md)');
 		const [here, out] = dom.querySelectorAll('a');
-		expect(here.getAttribute('href')).toBe('#section');
+		expect(dom.querySelector(here.getAttribute('href') ?? '')?.textContent).toBe('Section');
 		expect(out.hasAttribute('href')).toBe(false);
+	});
+
+	it('points an in-page link at raw HTML with that id', async () => {
+		const { dom } = await render('<h2 id="sec">Sec</h2>\n\n[toc](#sec)');
+		expect(dom.querySelector(dom.querySelector('a')?.getAttribute('href') ?? '')?.textContent).toBe('Sec');
+	});
+
+	it('gives every heading its own id, whatever its text', async () => {
+		const { dom } = await render('# Same *one*\n\n# Same one\n\n# Tiếng Việt `code`!\n\n# !!!\n');
+		const ids = [...dom.querySelectorAll('h1')].map((heading) => heading.getAttribute('id'));
+		expect(ids).toEqual(['user-content-same-one', 'user-content-same-one-1', 'user-content-tiếng-việt-code', null]);
+	});
+
+	it('finds a heading through a link with an accented fragment', async () => {
+		const { dom } = await render('# Tiếng Việt\n\n[x](#tiếng-việt)');
+		const fragment = dom.querySelector('a')?.getAttribute('href')?.slice(1) ?? '';
+		expect(dom.querySelector('h1')?.id).toBe(decodeURIComponent(fragment));
 	});
 });
