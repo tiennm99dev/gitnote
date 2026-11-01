@@ -1,6 +1,9 @@
 /* global document */
+import { symlink, unlink } from 'node:fs/promises';
+import path from 'node:path';
 import { expect, test } from '@playwright/test';
-import { changeElsewhere, createRemote, pushFromElsewhere, remoteHead, runGit, showRemote } from '../test/remote-repo.js';
+import { syncRecordKey } from '../src/lib/git/local-repos.js';
+import { changeElsewhere, createRemote, pushFromElsewhere, rejectPushes, remoteHead, runGit, showRemote } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
 import { collectBreakage, GOOD_TOKEN, serveApi, serveGit } from './provider-fixtures.js';
 
@@ -63,6 +66,40 @@ async function openDevice(browser, remote) {
 const remoteWith = (files = SEED) => createRemote(files, { root: E2E_GIT_ROOT, port: E2E_GIT_PORT });
 
 /**
+ * Tells the page it went to the background, or came back.
+ * @param {Page} page
+ * @param {'hidden' | 'visible'} state
+ * @returns {Promise<void>}
+ */
+const setVisibility = (page, state) =>
+	page.evaluate((value) => {
+		Object.defineProperty(document, 'visibilityState', { configurable: true, value });
+		document.dispatchEvent(new globalThis.Event('visibilitychange'));
+	}, state);
+
+/**
+ * Turns autosave on at its shortest interval, in a page showing no repository.
+ * @param {Page} page
+ * @returns {Promise<void>}
+ */
+async function turnOnAutosave(page) {
+	await page.goto('/settings');
+	await page.getByTestId('autosave-toggle').check();
+	await page.getByTestId('autosave-interval').selectOption('1');
+	await page.getByTestId('settings-save').click();
+	await expect(page.getByTestId('settings-saved')).toBeVisible();
+}
+
+/**
+ * @param {Remote} remote
+ * @param {string} from
+ * @returns {Promise<number>} the commits on `main` since `from`
+ */
+async function remoteCommitsSince(remote, from) {
+	return Number((await runGit(['rev-list', '--count', `${from}..main`], remote.bare)).trim());
+}
+
+/**
  * Replaces the open note's text by typing.
  * @param {Page} page
  * @param {string} text
@@ -72,6 +109,16 @@ async function typeNote(page, text) {
 	await page.getByTestId('note-editor').locator('.cm-content').click();
 	await page.keyboard.press('ControlOrMeta+A');
 	await page.keyboard.type(text);
+}
+
+/**
+ * Gets to the open note's editor, where a conflicted file may have opened already.
+ * @param {Page} page
+ * @returns {Promise<void>}
+ */
+async function openEditor(page) {
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await expect(page.getByTestId('note-editor').locator('.cm-content')).toBeVisible();
 }
 
 /**
@@ -146,9 +193,8 @@ test('two clones edit one line: the second pull shows the conflict, and its reso
 	await expect(second.page.getByTestId('conflict-file')).toContainText('notes/shared.md');
 
 	// The file holds markers; the note pane is where they get edited.
-	const editor = second.page.getByTestId('note-editor').locator('.cm-content');
-	if (!(await editor.isVisible())) await second.page.getByRole('button', { name: 'Edit', exact: true }).click();
-	await expect(editor).toContainText('<<<<<<<');
+	await openEditor(second.page);
+	await expect(second.page.getByTestId('note-editor').locator('.cm-content')).toContainText('<<<<<<<');
 
 	// Marking it resolved with the markers still in place is refused.
 	await second.page.getByTestId('mark-resolved').click();
@@ -185,7 +231,7 @@ test('two clones edit one line: the second pull shows the conflict, and its reso
 	await second.context.close();
 });
 
-test('abandoning a merge goes back to the local commit, and a binary or deleted file takes a side', async ({ browser }) => {
+test('abandoning a merge goes back to the local commit, and a deleted file takes a side', async ({ browser }) => {
 	const remote = await remoteWith({ 'clash.md': 'base\n', 'gone.md': 'keep me\n' });
 	const { page, context, problems, open } = await openDevice(browser, remote);
 	await open('clash.md');
@@ -215,6 +261,108 @@ test('abandoning a merge goes back to the local commit, and a binary or deleted 
 	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
 	await expect(page.getByTestId('open-changes')).toHaveText('Changes (0)');
 
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
+test('a binary file changed on both sides takes a side through the conflict view, and that side is what pushes', async ({ browser }) => {
+	const remote = await remoteWith({ 'data.md': 'base\n' });
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await open('data.md');
+	await editAndSave(page, 'mine\n');
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+	await pushFromElsewhere(remote, { 'data.md': 'bin\0ary\n' }, 'theirs');
+
+	await page.getByTestId('pull-button').click();
+	const file = page.getByTestId('conflict-file');
+	await expect(file).toContainText('A binary file changed on both sides');
+	await expect(file.getByTestId('conflict-state')).toHaveText('Not resolved');
+	await expect(file.getByTestId('mark-resolved')).toHaveCount(0);
+	await expect(page.getByTestId('complete-merge')).toBeDisabled();
+
+	await file.getByTestId('keep-theirs').click();
+	await expect(file.getByTestId('conflict-state')).toHaveText('Resolved');
+	await page.getByTestId('complete-merge').click();
+	await expect(page.getByTestId('conflict-view')).toHaveCount(0);
+	await page.getByTestId('push-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
+	expect(await showRemote(remote, 'main:data.md')).toBe('bin\0ary\n');
+	expect(await remoteParents(remote)).toHaveLength(2);
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
+test('a symbolic link with no target stays reachable through a conflict, and stays a link', async ({ browser }) => {
+	const remote = await remoteWith({ 'target.md': 'text\n' });
+	await changeElsewhere(remote, {}, async (work) => {
+		await symlink('target.md', path.join(work, 'link.md'));
+		await runGit(['add', 'link.md'], work);
+	});
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await open();
+	await page.getByRole('button', { name: 'Actions for link.md' }).click();
+	await page.getByTestId('file-drawer').getByRole('button', { name: 'Delete' }).click();
+	await page.getByTestId('dialog-confirm').click();
+	await expect(page.getByTestId('open-changes')).toHaveText('Changes (1)');
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+	await changeElsewhere(remote, {}, async (work) => {
+		await unlink(path.join(work, 'link.md'));
+		await symlink('nowhere.md', path.join(work, 'link.md'));
+		await runGit(['add', 'link.md'], work);
+	});
+
+	await page.getByTestId('pull-button').click();
+	const file = page.getByTestId('conflict-file');
+	await expect(file).toContainText('You deleted this file');
+	await expect(page.getByTestId('sync-report')).toHaveCount(0);
+	await file.getByTestId('keep-theirs').click();
+	await expect(file.getByTestId('conflict-state')).toHaveText('Resolved');
+	await page.getByTestId('complete-merge').click();
+	await expect(page.getByTestId('conflict-view')).toHaveCount(0);
+	await page.getByTestId('push-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
+	expect(await runGit(['ls-tree', 'main', 'link.md'], remote.bare)).toMatch(/^120000 /);
+	expect(await showRemote(remote, 'main:link.md')).toBe('nowhere.md');
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
+test('a push queued before a merge waits for it, quietly, and goes when the merge commit is made', async ({ browser }) => {
+	const remote = await remoteWith({ 'clash.md': 'base\n' });
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await open('clash.md');
+	await editAndSave(page, 'mine\n');
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+	await pushFromElsewhere(remote, { 'clash.md': 'theirs\n' }, 'theirs');
+
+	// As a push queued offline leaves it; the next opening's pull then conflicts.
+	await page.evaluate((key) => globalThis.localStorage.setItem(key, JSON.stringify({ lastSyncAt: null, pushPending: true })), syncRecordKey(`github.com/${fullNameOf(remote)}`));
+	await page.reload();
+	await expect(page.getByTestId('conflict-view')).toBeVisible();
+	await expect(page.getByTestId('push-pending')).toHaveText('Push waiting for the merge');
+	await expect(page.getByTestId('after-merge')).toContainText('waiting push');
+
+	// Coming back to the tab must neither send it, nor lose it, nor complain.
+	await setVisibility(page, 'hidden');
+	await setVisibility(page, 'visible');
+	await page.evaluate(() => globalThis.dispatchEvent(new globalThis.Event('online')));
+	await expect(page.getByTestId('push-pending')).toHaveText('Push waiting for the merge');
+	await expect(page.getByTestId('sync-report')).toHaveCount(0);
+
+	await openEditor(page);
+	await typeNote(page, 'both\n');
+	await page.getByTestId('mark-resolved').click();
+	await expect(page.getByTestId('conflict-state')).toHaveText('Resolved');
+	await page.getByTestId('complete-merge').click();
+	await expectOnRemote(remote, 'clash.md', 'both\n');
+	await expect(page.getByTestId('push-pending')).toHaveCount(0);
+	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
 	expect(problems).toEqual([]);
 	await context.close();
 });
@@ -279,9 +427,26 @@ test('a damaged merge record offers a reset, and the app works again', async ({ 
 	await expect(page.getByTestId('merge-damaged')).toBeVisible();
 	await page.getByTestId('reset-merge').click();
 	await expect(page.getByTestId('merge-damaged')).toHaveCount(0);
+	await expect(page.getByTestId('workspace-report')).toHaveCount(0);
 	await expect(page.getByTestId('open-changes')).toContainText('Changes (');
 	await page.getByTestId('open-changes').click();
 	await expect(page.getByTestId('changed-file').filter({ hasText: 'clash.md' })).toBeVisible();
+
+	// The way forward works: take the changes back, pull into the same merge, finish it.
+	await page.getByTestId('discard-changes').click();
+	await page.getByTestId('discard-confirm-changes').click();
+	await expect(page.getByTestId('no-changes')).toBeVisible();
+	await page.getByTestId('pull-button').click();
+	await expect(page.getByTestId('conflict-view')).toBeVisible();
+	await openEditor(page);
+	await typeNote(page, 'settled\n');
+	await page.getByTestId('mark-resolved').click();
+	await expect(page.getByTestId('conflict-state')).toHaveText('Resolved');
+	await page.getByTestId('complete-merge').click();
+	await expect(page.getByTestId('conflict-view')).toHaveCount(0);
+	await page.getByTestId('push-button').click();
+	await expectOnRemote(remote, 'clash.md', 'settled\n');
+	expect(await remoteParents(remote)).toHaveLength(2);
 	await context.close();
 });
 
@@ -439,11 +604,7 @@ test('an author git cannot record is refused, and with no author at all the pane
 test('autosave commits and pushes on its timer, commits locally when hidden and pushes on return', async ({ browser }) => {
 	const remote = await remoteWith();
 	const { page, context, problems, open } = await openDevice(browser, remote);
-	await page.goto('/settings');
-	await page.getByTestId('autosave-toggle').check();
-	await page.getByTestId('autosave-interval').selectOption('1');
-	await page.getByTestId('settings-save').click();
-	await expect(page.getByTestId('settings-saved')).toBeVisible();
+	await turnOnAutosave(page);
 
 	await page.clock.install();
 	await open('notes/shared.md');
@@ -458,39 +619,31 @@ test('autosave commits and pushes on its timer, commits locally when hidden and 
 	expect((await runGit(['log', '-1', '--format=%s', 'main'], remote.bare)).trim()).toBe('autosave: notes/shared.md');
 	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
 
-	// With nothing changed, a tick makes no commit.
+	// With nothing changed, a tick makes no commit. Nothing it would do shows on
+	// the network, so the count below, once the next commit is pushed, is the proof.
 	const quiet = await remoteHead(remote);
 	await page.clock.runFor(60_000);
 	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
-	expect(await remoteHead(remote)).toBe(quiet);
 
 	// Going hidden commits on the device and sends nothing.
 	await typeNote(page, 'typed before hiding\nsecond line\n');
 	await expect(page.getByTestId('unsaved-notes')).toBeVisible();
-	await page.evaluate(() => {
-		Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'hidden' });
-		document.dispatchEvent(new globalThis.Event('visibilitychange'));
-	});
+	await setVisibility(page, 'hidden');
 	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
 	expect(await remoteHead(remote)).toBe(quiet);
 
 	// Coming back pushes it.
-	await page.evaluate(() => {
-		Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
-		document.dispatchEvent(new globalThis.Event('visibilitychange'));
-	});
+	await setVisibility(page, 'visible');
 	await expect.poll(() => showRemote(remote, 'main:notes/shared.md'), { timeout: 20_000 }).toBe('typed before hiding\nsecond line\n');
+	expect(await remoteCommitsSince(remote, quiet)).toBe(1);
 	expect(problems).toEqual([]);
 	await context.close();
 });
 
-test('autosave stops at a conflict instead of committing over it', async ({ browser }) => {
+test('autosave stops at a conflict instead of committing over it, and takes the merge commit up after', async ({ browser }) => {
 	const remote = await remoteWith();
 	const { page, context, open } = await openDevice(browser, remote);
-	await page.goto('/settings');
-	await page.getByTestId('autosave-toggle').check();
-	await page.getByTestId('autosave-interval').selectOption('1');
-	await page.getByTestId('settings-save').click();
+	await turnOnAutosave(page);
 
 	await page.clock.install();
 	await open('notes/shared.md');
@@ -505,8 +658,77 @@ test('autosave stops at a conflict instead of committing over it', async ({ brow
 
 	await expect(page.getByTestId('conflict-view')).toBeVisible({ timeout: 20_000 });
 	await expect(page.getByTestId('autosave-badge')).toContainText('stopped until the merge is done');
+	await expect(page.getByTestId('after-merge')).toHaveText('Autosave pushes the merge commit on its next run.');
 	await page.clock.runFor(180_000);
-	expect(await remoteHead(remote)).toBe(head);
 	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+
+	// Finishing the merge lets a tick push. Only the first autosave and the merge
+	// commit arrive, so the ticks during the merge added nothing, however late.
+	await typeNote(page, 'first line settled\nsecond line\n');
+	await page.getByTestId('mark-resolved').click();
+	await expect(page.getByTestId('conflict-state')).toHaveText('Resolved');
+	await page.getByTestId('complete-merge').click();
+	await expect(page.getByTestId('conflict-view')).toHaveCount(0);
+	await page.clock.runFor(60_000);
+	await expectOnRemote(remote, 'notes/shared.md', 'first line settled\nsecond line\n');
+	expect(await remoteCommitsSince(remote, head)).toBe(2);
+	expect(await remoteParents(remote)).toHaveLength(2);
+	await context.close();
+});
+
+test('autosave commits on hiding even while the first pull is stalled, and pushes once it settles', async ({ browser }) => {
+	const remote = await remoteWith();
+	const { page, context, open } = await openDevice(browser, remote);
+	await turnOnAutosave(page);
+	const head = await remoteHead(remote);
+
+	/** @type {() => void} */
+	let release = () => {};
+	const released = new Promise((resolve) => {
+		release = () => resolve(undefined);
+	});
+	await page.route(/\/info\/refs/, async (route) => {
+		await released;
+		await route.fallback();
+	});
+
+	await open('notes/shared.md');
+	await expect(page.getByTestId('autosave-badge')).toContainText('Autosave on');
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await typeNote(page, 'typed during the pull\nsecond line\n');
+	await expect(page.getByTestId('unsaved-notes')).toBeVisible();
+	await setVisibility(page, 'hidden');
+	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+	expect(await remoteHead(remote)).toBe(head);
+
+	await setVisibility(page, 'visible');
+	release();
+	await expectOnRemote(remote, 'notes/shared.md', 'typed during the pull\nsecond line\n');
+	await context.close();
+});
+
+test('undo asks for autosave to be off first, because autosave would commit it all together again', async ({ browser }) => {
+	const remote = await remoteWith();
+	const { page, context, open } = await openDevice(browser, remote);
+	await turnOnAutosave(page);
+	await rejectPushes(remote, 'error: GH001: Large files detected.');
+
+	await page.clock.install();
+	await open('notes/shared.md');
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await typeNote(page, 'too big to push\nsecond line\n');
+	await expect(page.getByTestId('unsaved-notes')).toBeVisible();
+	await page.clock.runFor(60_000);
+	await expect(page.getByTestId('undo-needs-autosave-off')).toBeVisible({ timeout: 20_000 });
+	await expect(page.getByTestId('undo-unpushed')).toHaveCount(0);
+
+	await page.goto('/settings');
+	await page.getByTestId('autosave-toggle').uncheck();
+	await page.getByTestId('settings-save').click();
+	await expect(page.getByTestId('settings-saved')).toBeVisible();
+	await open('notes/shared.md');
+	await page.getByTestId('push-button').click();
+	await expect(page.getByTestId('undo-unpushed')).toBeVisible();
+	await expect(page.getByTestId('undo-needs-autosave-off')).toHaveCount(0);
 	await context.close();
 });
