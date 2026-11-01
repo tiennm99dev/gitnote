@@ -164,9 +164,13 @@
 								<p role="alert" class="text-red-700">{diffFailure}</p>
 							{:else if !diff}
 								<p class="text-gray-600">Reading…</p>
+							{:else if diff.kind === 'line_endings'}
+								<p class="text-gray-600" data-testid="diff-line-endings">Only the line endings changed.</p>
+							{:else if diff.kind === 'same_text'}
+								<p class="text-gray-600">The text is the same, so only the file's mode changed.</p>
 							{:else if diff.kind === 'text'}
 								{#if diff.lines.length === 0}
-									<p class="text-gray-600">Only the file's mode or line endings changed.</p>
+									<p class="text-gray-600">This file is empty.</p>
 								{/if}
 								{#each diff.lines as line, index (index)}
 									{#if line.type === 'folded'}

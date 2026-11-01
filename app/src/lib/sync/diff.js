@@ -17,8 +17,16 @@ const DIFF_TIMEOUT_MS = 2000;
  */
 
 /**
- * @typedef {{ kind: 'text', lines: DiffLine[] } | { kind: 'binary' | 'large' | 'too_different', before: number, after: number }} FileDiff
+ * `line_endings` means the two differ only in their line endings or final newline;
+ * `same_text` means they do not differ, so only the file's mode can have changed.
+ * @typedef {{ kind: 'text', lines: DiffLine[] } | { kind: 'line_endings' } | { kind: 'same_text' } | { kind: 'binary' | 'large' | 'too_different', before: number, after: number }} FileDiff
  */
+
+/**
+ * @param {string} text
+ * @returns {string} the text as it reads, whatever ends its lines
+ */
+const withoutLineEndings = (text) => text.replace(/\r\n/g, '\n').replace(/\n$/, '');
 
 /**
  * @param {Uint8Array | null} before the committed file; null when there is none
@@ -31,6 +39,8 @@ export function diffFile(before, after) {
 	const beforeText = before ? decodeText(before) : '';
 	const afterText = after ? decodeText(after) : '';
 	if (beforeText === null || afterText === null) return { kind: 'binary', ...sizes };
+	if (before && after && beforeText === afterText) return { kind: 'same_text' };
+	if (before && after && withoutLineEndings(beforeText) === withoutLineEndings(afterText)) return { kind: 'line_endings' };
 	const parts = diffLines(beforeText, afterText, { timeout: DIFF_TIMEOUT_MS });
 	if (!parts) return { kind: 'too_different', ...sizes };
 	/** @type {{ type: 'same' | 'added' | 'removed', text: string }[]} */

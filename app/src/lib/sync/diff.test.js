@@ -34,15 +34,25 @@ describe('diffFile', () => {
 		expect(diff.lines.filter((line) => line.type === 'same')).toHaveLength(6);
 	});
 
-	it('strips line endings from what it shows, but still sees a change of them', () => {
-		const diff = diffFile(encode('a\n'), encode('a\r\n'));
-		expect(diff).toEqual({
-			kind: 'text',
-			lines: [
-				{ type: 'removed', text: 'a' },
-				{ type: 'added', text: 'a' }
-			]
-		});
+	it('says so when only the line endings changed, rather than listing identical lines', () => {
+		expect(diffFile(encode('a\r\nb\r\n'), encode('a\nb\n'))).toEqual({ kind: 'line_endings' });
+		expect(diffFile(encode('a\nb\n'), encode('a\r\nb\r\n'))).toEqual({ kind: 'line_endings' });
+	});
+
+	it('counts a final newline, added or removed, as a line ending', () => {
+		expect(diffFile(encode('a'), encode('a\n'))).toEqual({ kind: 'line_endings' });
+		expect(diffFile(encode('a\nb\n'), encode('a\nb'))).toEqual({ kind: 'line_endings' });
+	});
+
+	it('still shows a blank line added at the end, and a real edit among changed line endings', () => {
+		expect(diffFile(encode('a\n'), encode('a\n\n'))).toMatchObject({ kind: 'text', lines: [{ type: 'same', text: 'a' }, { type: 'added', text: '' }] });
+		expect(diffFile(encode('a\r\n'), encode('b\n'))).toMatchObject({ kind: 'text', lines: [{ type: 'removed', text: 'a' }, { type: 'added', text: 'b' }] });
+	});
+
+	it('tells identical text from a new empty file, neither of which is a line ending', () => {
+		expect(diffFile(encode('a\n'), encode('a\n'))).toEqual({ kind: 'same_text' });
+		expect(diffFile(null, encode(''))).toEqual({ kind: 'text', lines: [] });
+		expect(diffFile(null, encode('\n'))).toMatchObject({ kind: 'text' });
 	});
 
 	it('does not read binary or oversized files as lines', () => {
