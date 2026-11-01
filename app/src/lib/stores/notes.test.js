@@ -5,7 +5,7 @@ import { get } from 'svelte/store';
 import { beforeEach, describe, expect, it } from 'vitest';
 import { memoryDraftStore } from '../../../test/draft-doubles.js';
 import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
-import { changeElsewhere, createRemote, RELAY_PORT, runGit, showRemote } from '../../../test/remote-repo.js';
+import { changeElsewhere, createRemote, pushFromElsewhere, RELAY_PORT, runGit, showRemote } from '../../../test/remote-repo.js';
 import { ErrorCode } from '../git/errors.js';
 import { createGitHttp } from '../git/http.js';
 import { createRepo } from '../git/repo.js';
@@ -1129,6 +1129,53 @@ describe('saving every draft', () => {
 		expect(await repo.readText('README.md')).toBe('changed\n');
 		expect(openNote(notes)).toMatchObject({ dirty: true, diskChanged: true, text: 'open draft\n' });
 		expect((await drafts.listPaths(REPO_ID)).sort()).toEqual(['README.md', 'notes/today.md']);
+	});
+
+	it.each([
+		['saveDrafts', async (/** @type {import('./notes.js').Notes} */ notes) => (await notes.saveDrafts()).saved.length > 0],
+		['save', (/** @type {import('./notes.js').Notes} */ notes) => notes.save()]
+	])('%s never writes over a pull that lands while it is saving', async (_name, saving) => {
+		const remote = await createRemote({ 'n.md': 'base\n' });
+		const repo = createRepo({
+			id: remote.id,
+			fs: /** @type {import('../git/repo.js').FsClient} */ (/** @type {unknown} */ (memfs().fs)),
+			http: createGitHttp({ relayOrigin: `http://127.0.0.1:${RELAY_PORT}` }),
+			provider: 'github',
+			getCredential: () => FIXTURE_CREDENTIAL
+		});
+		await repo.clone({ url: remote.url });
+		let armed = false;
+		const pullOnce = async () => {
+			if (!armed) return;
+			armed = false;
+			await repo.pull({ author: { name: 'Elsewhere', email: 'elsewhere@example.com' } });
+		};
+		// The pull lands as soon as the save has read the file, or just before it
+		// asks to write, whichever the save does first: never inside one lock.
+		const racing = {
+			...repo,
+			readFile: async (/** @type {string} */ path) => {
+				const bytes = await repo.readFile(path);
+				await pullOnce();
+				return bytes;
+			},
+			writeFileIfUnchanged: async (/** @type {string} */ path, /** @type {string} */ text, /** @type {string | null} */ base) => {
+				await pullOnce();
+				return repo.writeFileIfUnchanged(path, text, base);
+			}
+		};
+		const notes = createNotes({ repoId: remote.id, provider: 'github', repo: racing, drafts: memoryDraftStore() });
+		await notes.open('n.md');
+		notes.edit('base\ndraft line\n');
+		await pushFromElsewhere(remote, { 'n.md': 'remote rewrite\n' }, 'remote edit');
+		armed = true;
+
+		expect(await saving(notes)).toBe(false);
+
+		expect(armed).toBe(false);
+		expect(await repo.readText('n.md')).toBe('remote rewrite\n');
+		expect((await repo.status()).files).toEqual([]);
+		expect(openNote(notes)).toMatchObject({ dirty: true, diskChanged: true, text: 'base\ndraft line\n' });
 	});
 
 	it('saves text that storage refused to keep', async () => {

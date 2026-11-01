@@ -41,10 +41,17 @@ import { syncRecordKey } from '../git/local-repos.js';
  * @property {boolean} pushPending a push is waiting for the network
  * @property {'pull' | 'push' | null} syncing
  * @property {boolean} pullHeldBack local changes stopped a pull, and the user has to commit or discard them
- * @property {boolean} needsAuthor a pull or commit needs an author nobody has set
+ * @property {boolean} needsAuthor a merge or commit needs an author nobody has set
  * @property {SyncReport | null} report the last failure
  * @property {import('../git/limits.js').SizeFinding[]} commitWarnings size warnings from the last commit or merge commit
  */
+
+/**
+ * How long to wait before each retry of a push that could not reach the host while
+ * the device reports a network, which no `online` event will announce the end of.
+ * The last delay repeats.
+ */
+export const PUSH_RETRY_DELAYS_MS = [15_000, 30_000, 60_000, 120_000, 300_000];
 
 /**
  * A failed network call that is worth repeating when the connection returns.
@@ -88,14 +95,28 @@ export function commitMessageFor(paths) {
 /**
  * @param {object} options
  * @param {string} options.repoId
- * @param {Pick<Repo, 'status' | 'aheadBehind' | 'describeConflicts' | 'pull' | 'fetchRemote' | 'push' | 'checkCommit' | 'commit' | 'discardChanges' | 'resolveConflict' | 'completeMerge' | 'abortMerge' | 'undoUnpushedCommits' | 'resetDamagedMerge'>} options.repo
+ * @param {Pick<Repo, 'status' | 'aheadBehind' | 'describeConflicts' | 'pull' | 'fetchRemote' | 'push' | 'checkCommit' | 'pathsWithMarkers' | 'commit' | 'discardChanges' | 'resolveConflict' | 'completeMerge' | 'abortMerge' | 'undoUnpushedCommits' | 'resetDamagedMerge'>} options.repo
  * @param {{ refresh: () => Promise<void>, saveDrafts: () => Promise<{ saved: string[], skipped: string[] }> }} options.notes told when files changed underneath it
  * @param {() => Author | null} options.getAuthor
  * @param {Storage} [options.storage]
  * @param {() => boolean} [options.isOnline]
+ * @param {() => boolean} [options.isVisible] a hidden page leaves retrying to its return
+ * @param {() => Promise<unknown>} [options.sendQueuedPush] how a retry sends the queued push, when something else owns it
+ * @param {number[]} [options.pushRetryDelaysMs]
  * @param {() => Date} [options.now]
  */
-export function createSync({ repoId, repo, notes, getAuthor, storage = globalThis.localStorage, isOnline = () => globalThis.navigator?.onLine !== false, now = () => new Date() }) {
+export function createSync({
+	repoId,
+	repo,
+	notes,
+	getAuthor,
+	storage = globalThis.localStorage,
+	isOnline = () => globalThis.navigator?.onLine !== false,
+	isVisible = () => globalThis.document?.visibilityState !== 'hidden',
+	sendQueuedPush,
+	pushRetryDelaysMs = PUSH_RETRY_DELAYS_MS,
+	now = () => new Date()
+}) {
 	const record = readRecord(storage, repoId);
 
 	/** @type {SyncState} */
@@ -127,6 +148,38 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		if ('lastSyncAt' in change || 'pushPending' in change) {
 			writeRecord(storage, repoId, { lastSyncAt: state.lastSyncAt, pushPending: state.pushPending });
 		}
+		if (!state.pushPending) cancelPushRetry();
+	};
+
+	/** @type {ReturnType<typeof setTimeout> | undefined} */
+	let retryTimer;
+	let retries = 0;
+	let stopped = false;
+
+	const cancelPushRetry = () => {
+		clearTimeout(retryTimer);
+		retryTimer = undefined;
+		retries = 0;
+	};
+
+	/**
+	 * Tries a queued push again later, as long as that could help. Offline, hidden
+	 * and an open merge each have an event of their own that sends it.
+	 * @returns {void}
+	 */
+	const schedulePushRetry = () => {
+		if (stopped || retryTimer !== undefined || !state.pushPending || state.merge || state.mergeDamaged || !isOnline() || !isVisible()) return;
+		const delay = pushRetryDelaysMs[Math.min(retries, pushRetryDelaysMs.length - 1)];
+		retries += 1;
+		retryTimer = setTimeout(async () => {
+			retryTimer = undefined;
+			try {
+				if (isOnline() && isVisible()) await (sendQueuedPush ?? pushIfPending)();
+			} catch (error) {
+				set({ report: toReport(error) });
+			}
+			schedulePushRetry();
+		}, delay);
 	};
 
 	/** @returns {Promise<void>} */
@@ -218,13 +271,10 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 				return { ok: false, code: 'offline' };
 			}
 			const author = getAuthor();
-			if (!author) {
-				set({ needsAuthor: true });
-				return { ok: false, code: ErrorCode.INVALID_ARGUMENT };
-			}
 			try {
 				const result = await repo.pull({ author });
-				set({ report: null, needsAuthor: false, pullHeldBack: false, lastSyncAt: now().toISOString() });
+				// A conflict has integrated nothing yet; the merge commit and its push do that.
+				set({ report: null, needsAuthor: !author && state.needsAuthor, pullHeldBack: false, ...(result.status === 'conflict' ? {} : { lastSyncAt: now().toISOString() }) });
 				await refreshFiles();
 				await refresh();
 				return { ok: true, status: result.status };
@@ -233,10 +283,13 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 					set({ pullHeldBack: true });
 					// Only the counts depend on this, so a failure here changes nothing.
 					await repo.fetchRemote().catch(() => undefined);
+				} else if (!author && error instanceof GitEngineError && error.code === ErrorCode.INVALID_ARGUMENT) {
+					set({ needsAuthor: true });
 				} else if (!(quiet && isConnectionFailure(error))) {
 					set({ report: toReport(error) });
 				}
 				await refresh();
+				if (isConnectionFailure(error)) schedulePushRetry();
 				return { ok: false, code: error instanceof GitEngineError ? error.code : ErrorCode.UNKNOWN };
 			}
 		});
@@ -261,6 +314,7 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 				// An open merge only delays a push asked for earlier; the merge's end sends it.
 				set({ pushPending: queued || (state.pushPending && isMergeRefusal(error)), report: toReport(error) });
 				await refresh();
+				if (queued) schedulePushRetry();
 				return { ok: false, queued, code: error instanceof GitEngineError ? error.code : ErrorCode.UNKNOWN };
 			}
 		});
@@ -335,6 +389,18 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		await push();
 	};
 
+	/**
+	 * Runs an engine call that closes a merge. A push the merge was holding goes
+	 * now, and if the host refuses it the report offers a pull.
+	 * @param {() => Promise<unknown>} operation
+	 * @returns {Promise<{ ok: boolean }>}
+	 */
+	const closingMerge = async (operation) => {
+		const result = await changingFiles(operation);
+		if (result.ok) await pushIfPending();
+		return result;
+	};
+
 	return {
 		subscribe: store.subscribe,
 		refresh,
@@ -376,9 +442,10 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 			saveDrafts,
 			readWork: async () => {
 				await refresh();
-				return { merge: state.merge !== null || state.mergeDamaged, paths: state.files.map((file) => file.path), ahead: state.ahead };
+				return { merge: state.merge !== null || state.mergeDamaged, paths: state.files.map((file) => file.path), ahead: state.ahead, pushPending: state.pushPending };
 			},
 			checkCommit: (paths) => repo.checkCommit(paths),
+			findMarkers: (paths) => repo.pathsWithMarkers(paths),
 			commit: (paths, message) => commit({ paths, message }),
 			pull: () => pull(),
 			push,
@@ -426,13 +493,22 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		},
 
 		/** @returns {Promise<{ ok: boolean }>} */
-		abortMerge: () => changingFiles(() => repo.abortMerge()),
+		abortMerge: () => closingMerge(() => repo.abortMerge()),
 
 		/** @returns {Promise<{ ok: boolean }>} */
 		undoUnpushed: () => changingFiles(() => repo.undoUnpushedCommits()),
 
 		/** @returns {Promise<{ ok: boolean }>} */
-		resetDamagedMerge: () => changingFiles(() => repo.resetDamagedMerge())
+		resetDamagedMerge: () => closingMerge(() => repo.resetDamagedMerge()),
+
+		/**
+		 * The screen is going away: no more retries from this instance.
+		 * @returns {void}
+		 */
+		stop() {
+			stopped = true;
+			cancelPushRetry();
+		}
 	};
 }
 

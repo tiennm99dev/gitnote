@@ -1,5 +1,6 @@
 <script>
 	import { onMount, tick, untrack } from 'svelte';
+	import { SvelteSet } from 'svelte/reactivity';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
 	import { authSession } from '#lib/auth/index.js';
@@ -34,7 +35,13 @@
 	let accountUser = $state(null);
 	const author = $derived(resolveAuthor(settings, accountAuthor(untrack(() => repo.provider), accountUser)));
 
-	const sync = createSync({ repoId: untrack(() => repo.id), repo: engine, notes, getAuthor: () => author });
+	/**
+	 * Sends a queued push. With autosave on it goes through autosave, which pulls first.
+	 * @returns {Promise<unknown>}
+	 */
+	const sendQueuedPush = () => ($autosave.enabled ? autosave.handleOnline() : sync.pushIfPending());
+
+	const sync = createSync({ repoId: untrack(() => repo.id), repo: engine, notes, getAuthor: () => author, sendQueuedPush });
 	const autosave = createAutosave({
 		ops: sync.autosaveOps,
 		isVisible: () => document.visibilityState === 'visible',
@@ -59,9 +66,16 @@
 
 	const conflictedPaths = $derived($sync.merge?.conflictedPaths ?? []);
 
-	// A new file list means a save, move, create or delete, any of which changes what can be committed.
+	/** What the commit panel selected and typed, kept while the user looks at a note. */
+	const uncheckedPaths = new SvelteSet();
+	/** @type {string | null} */
+	let commitMessage = $state(null);
+
+	// A new file list means a save, move, create or delete, any of which changes what
+	// can be committed. Typing changes the store too, but must not reach the repo lock.
+	const fileList = $derived($notes.treeLoaded ? $notes.entries : null);
 	$effect(() => {
-		if ($notes.treeLoaded && $notes.entries) void untrack(() => sync.refresh());
+		if (fileList) void untrack(() => sync.refresh());
 	});
 
 	const otherUnkept = $derived($notes.unkeptPaths.filter((item) => item !== $notes.note?.path));
@@ -150,16 +164,17 @@
 			}
 			refresh();
 			void sync.refresh();
-			void sync.pushIfPending();
+			if (!$autosave.enabled) void sync.pushIfPending();
 			void autosave.handleVisible();
 		};
 		const onFocus = () => {
 			refresh();
 			void sync.refresh();
+			if ($sync.pushPending) void sendQueuedPush();
 		};
 		const onOnline = () => {
 			sync.setOnline(true);
-			void sync.pushIfPending();
+			if (!$autosave.enabled) void sync.pushIfPending();
 			void autosave.handleOnline();
 		};
 		const onOffline = () => sync.setOnline(false);
@@ -196,6 +211,7 @@
 		return () => {
 			alive = false;
 			autosave.stop();
+			sync.stop();
 			document.removeEventListener('visibilitychange', onVisible);
 			window.removeEventListener('focus', onFocus);
 			window.removeEventListener('online', onOnline);
@@ -331,6 +347,7 @@
 		{sync}
 		autosave={$autosave}
 		unsavedNotes={$notes.draftPaths.length}
+		hasAuthor={author !== null}
 		changesOpen={view === 'changes'}
 		onchanges={() => (view = view === 'changes' ? 'note' : 'changes')}
 		onconflicts={() => (view = view === 'conflicts' ? 'note' : 'conflicts')}
@@ -407,7 +424,7 @@
 
 		<main class="flex min-h-0 min-w-0 flex-1 flex-col">
 			{#if view === 'changes' && !$sync.merge}
-				<CommitPanel {sync} {engine} draftPaths={$notes.draftPaths} hasAuthor={author !== null} />
+				<CommitPanel {sync} {engine} draftPaths={$notes.draftPaths} hasAuthor={author !== null} unchecked={uncheckedPaths} bind:typedMessage={commitMessage} />
 			{:else}
 				{#if view === 'conflicts' && $sync.merge}
 					<ConflictView {sync} {notes} {hrefFor} current={path} autosaveOn={$autosave.enabled} onclose={() => (view = 'note')} />

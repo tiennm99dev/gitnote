@@ -6,7 +6,9 @@
  * further, and coming back, launching or regaining the network does the push.
  *
  * A file over a size limit stays out of the commit and is named, so one such file
- * does not hold every other note back.
+ * does not hold every other note back. So does a file with conflict markers in it,
+ * which only a damaged merge's reset or the user's own typing leaves behind:
+ * committing that unread would push the markers, and only the user can say they belong.
  *
  * It never commits while a merge is open and never resolves a conflict: a pull
  * that conflicts leaves the merge open for the user, and every later run stands
@@ -35,8 +37,9 @@ export function autosaveMessage(paths) {
  * What autosave needs from the app.
  * @typedef {object} AutosaveOps
  * @property {() => Promise<{ saved: string[], skipped: string[] }>} saveDrafts
- * @property {() => Promise<{ merge: boolean, paths: string[], ahead: number }>} readWork
+ * @property {() => Promise<{ merge: boolean, paths: string[], ahead: number, pushPending: boolean }>} readWork
  * @property {(paths: string[]) => Promise<import('../git/limits.js').SizeFinding[]>} checkCommit
+ * @property {(paths: string[]) => Promise<string[]>} findMarkers
  * @property {(paths: string[], message: string) => Promise<{ ok: boolean }>} commit
  * @property {() => Promise<{ ok: boolean, status?: string, code?: string }>} pull
  * @property {() => Promise<{ ok: boolean }>} push
@@ -47,7 +50,7 @@ export function autosaveMessage(paths) {
  * @typedef {object} AutosaveState
  * @property {boolean} enabled
  * @property {string[]} skipped notes left out because their file changed underneath them
- * @property {string[]} refused why files were left out of the last commit: each is over a size limit
+ * @property {string[]} refused why files were left out of the last commit: over a size limit, or holding conflict markers
  */
 
 // The scheduler's methods are inferred; `Autosave` below names them.
@@ -97,8 +100,10 @@ export function createAutosave({ ops, isVisible, isOnline, onError }) {
 		}
 		const blocked = (await ops.checkCommit(work.paths)).filter((finding) => finding.level === 'block');
 		const left = new Set(blocked.map((finding) => finding.path));
-		const paths = work.paths.filter((path) => !left.has(path));
-		set({ refused: blocked.map((finding) => finding.message) });
+		const sizable = work.paths.filter((path) => !left.has(path));
+		const marked = sizable.length > 0 ? await ops.findMarkers(sizable) : [];
+		const paths = sizable.filter((path) => !marked.includes(path));
+		set({ refused: [...blocked.map((finding) => finding.message), ...marked.map((path) => `${path} holds conflict markers. Remove them, or commit it yourself if they belong there.`)] });
 		if (paths.length === 0) return { blocked: false, ahead: work.ahead };
 		const committed = await ops.commit(paths, autosaveMessage(paths));
 		return { blocked: false, ahead: work.ahead + (committed.ok ? 1 : 0) };
@@ -161,7 +166,7 @@ export function createAutosave({ ops, isVisible, isOnline, onError }) {
 	const pushWhatIsThere = async () => {
 		await commitTail;
 		const work = await ops.readWork();
-		if (!work.merge && work.ahead > 0) await upload();
+		if (!work.merge && (work.ahead > 0 || work.pushPending)) await upload();
 	};
 
 	const stopTimer = () => {

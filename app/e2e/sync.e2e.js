@@ -500,6 +500,70 @@ test('the commit panel stages per file, shows the diff, prefills the message and
 	await context.close();
 });
 
+test('what the commit panel holds survives a look at a note, and discarding names the files', async ({ browser }) => {
+	const remote = await remoteWith();
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await open('notes/shared.md');
+	await editAndSave(page, 'first line changed\nsecond line\n');
+	await page.goto(page.url().replace(/shared\.md$/, 'other.md'));
+	await editAndSave(page, 'other changed\n');
+
+	await page.getByTestId('open-changes').click();
+	const files = page.getByTestId('changed-file');
+	await files.filter({ hasText: 'notes/other.md' }).getByRole('checkbox').uncheck();
+	await page.getByTestId('commit-message').fill('my own message');
+
+	// Opening a file from the list closes the panel, and coming back restores it.
+	await page.getByTestId('file-drawer').getByRole('link', { name: 'shared.md' }).click();
+	await expect(page.getByTestId('commit-panel')).toHaveCount(0);
+	await page.getByTestId('open-changes').click();
+	await expect(files.filter({ hasText: 'notes/other.md' }).getByRole('checkbox')).not.toBeChecked();
+	await expect(files.filter({ hasText: 'notes/shared.md' }).getByRole('checkbox')).toBeChecked();
+	await expect(page.getByTestId('commit-message')).toHaveValue('my own message');
+
+	await page.getByTestId('discard-changes').click();
+	await expect(page.getByTestId('discard-files')).toContainText('notes/shared.md');
+	await expect(page.getByTestId('discard-files')).not.toContainText('notes/other.md');
+	await page.getByTestId('discard-confirm-changes').click();
+	await expect(files).toHaveCount(1);
+	await expect(files).toContainText('notes/other.md');
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
+test('unsaved text on a file that takes a side says why it stays unresolved', async ({ browser }) => {
+	const remote = await remoteWith({ 'gone.md': 'keep me\n', 'clash.md': 'base\n' });
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await open('gone.md');
+	await editAndSave(page, 'mine\n');
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-button').click();
+	await expect(page.getByTestId('sync-ahead')).toHaveText('1 unpushed commit');
+	await page.getByTestId('open-changes').click();
+	await openEditor(page);
+	await typeNote(page, 'unsaved on top\n');
+	await expect(page.getByTestId('unsaved-notes')).toBeVisible();
+
+	await changeElsewhere(remote, {}, async (work) => {
+		await runGit(['rm', '--quiet', 'gone.md'], work);
+	});
+	await page.getByTestId('pull-button').click();
+	await expect(page.getByTestId('conflict-view')).toBeVisible();
+
+	const row = page.getByTestId('conflict-file').filter({ hasText: 'gone.md' });
+	await row.getByTestId('keep-ours').click();
+	await expect(row.getByTestId('conflict-state')).toHaveText('Not resolved');
+	await expect(row.getByTestId('conflict-draft')).toContainText('unsaved text');
+	await expect(page.getByTestId('complete-merge')).toBeDisabled();
+
+	// Looking at another note offers the way back to this one.
+	await page.getByTestId('file-drawer').getByRole('link', { name: 'clash.md' }).click();
+	await row.getByTestId('conflict-draft-link').click();
+	await expect(page).toHaveURL(/gone\.md$/);
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
 test('unsaved text is called out, and Save all brings it into the commit', async ({ browser }) => {
 	const remote = await remoteWith();
 	const { page, context, open } = await openDevice(browser, remote);
@@ -538,6 +602,85 @@ test('a push made offline waits, says so, and goes when the network returns', as
 	await expect(page.getByTestId('push-pending')).toHaveCount(0);
 	await expect(page.getByTestId('sync-ahead')).toHaveText('0 unpushed commits');
 	await expect(page.getByTestId('offline-badge')).toHaveCount(0);
+	expect(problems).toEqual([]);
+	await context.close();
+});
+
+test('a push that cannot reach the host, with the device online, tries again by itself and on focus', async ({ browser }) => {
+	const remote = await remoteWith();
+	const { page, context, open } = await openDevice(browser, remote);
+	const outage = /\/api\/git\//;
+	const refuse = (/** @type {import('@playwright/test').Route} */ route) => route.abort();
+	await open('notes/shared.md');
+	await editAndSave(page, 'during an outage\nsecond line\n');
+
+	await page.route(outage, refuse);
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-push-button').click();
+	await expect(page.getByTestId('push-pending')).toContainText('Could not reach the host');
+	await expect(page.getByTestId('offline-badge')).toHaveCount(0);
+
+	// No network event comes when only the host was down, so the timer has to notice.
+	await page.unroute(outage, refuse);
+	await expectOnRemote(remote, 'notes/shared.md', 'during an outage\nsecond line\n');
+	await expect(page.getByTestId('push-pending')).toHaveCount(0);
+
+	await page.getByTestId('open-changes').click();
+	await openEditor(page);
+	await typeNote(page, 'second outage\nsecond line\n');
+	await page.getByTestId('save-note').click();
+	await expect(page.getByTestId('open-changes')).toHaveText('Changes (1)');
+	await page.route(outage, refuse);
+	await page.getByTestId('open-changes').click();
+	await page.getByTestId('commit-push-button').click();
+	await expect(page.getByTestId('push-pending')).toBeVisible();
+	await page.unroute(outage, refuse);
+	await page.evaluate(() => globalThis.dispatchEvent(new globalThis.Event('focus')));
+	await expect.poll(() => showRemote(remote, 'main:notes/shared.md'), { timeout: 5_000 }).toBe('second outage\nsecond line\n');
+	await context.close();
+});
+
+test('typing in a note never asks for the repository lock', async ({ browser }) => {
+	const remote = await remoteWith();
+	const { page, context, problems, open } = await openDevice(browser, remote);
+	await context.addInitScript(() => {
+		const counter = /** @type {{ repoLockRequests: number }} */ (/** @type {unknown} */ (globalThis));
+		const manager = globalThis.LockManager.prototype;
+		const request = manager.request;
+		counter.repoLockRequests = 0;
+		manager.request = function (/** @type {string} */ name, /** @type {unknown[]} */ ...rest) {
+			if (name.startsWith('gitnote:repo:')) counter.repoLockRequests += 1;
+			return Reflect.apply(request, this, [name, ...rest]);
+		};
+	});
+	await open('notes/shared.md');
+	await openEditor(page);
+	await page.getByTestId('note-editor').locator('.cm-content').click();
+
+	const requests = () => page.evaluate(() => /** @type {{ repoLockRequests: number }} */ (/** @type {unknown} */ (globalThis)).repoLockRequests);
+	// Opening reads, pulls and rereads; typing starts once all of that has settled.
+	let settled = -1;
+	await expect
+		.poll(
+			async () => {
+				const now = await requests();
+				const quiet = now === settled;
+				settled = now;
+				return quiet;
+			},
+			{ intervals: [1_000], timeout: 20_000 }
+		)
+		.toBe(true);
+	expect(settled).toBeGreaterThan(0);
+
+	await page.keyboard.type('thirty characters of typing...', { delay: 20 });
+	await expect(page.getByTestId('unsaved-notes')).toBeVisible();
+	await page.waitForTimeout(500);
+	expect(await requests()).toBe(settled);
+
+	// The saved file does reach the commit list, so the list still follows the disk.
+	await page.getByTestId('save-note').click();
+	await expect(page.getByTestId('open-changes')).toHaveText('Changes (1)');
 	expect(problems).toEqual([]);
 	await context.close();
 });

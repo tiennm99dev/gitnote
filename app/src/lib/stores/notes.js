@@ -120,7 +120,7 @@ const overlaps = (a, b) => isWithin(a, b) || isWithin(b, a);
  * @param {object} options
  * @param {string} options.repoId
  * @param {import('../git/limits.js').ProviderId} options.provider
- * @param {Pick<import('../git/repo.js').Repo, 'listTree' | 'readFile' | 'writeFile' | 'createFile' | 'rename' | 'remove'>} options.repo
+ * @param {Pick<import('../git/repo.js').Repo, 'listTree' | 'readFile' | 'writeFileIfUnchanged' | 'createFile' | 'rename' | 'remove'>} options.repo
  * @param {DraftStore} options.drafts
  */
 export function createNotes({ repoId, provider, repo, drafts }) {
@@ -450,12 +450,10 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 			const note = state.note;
 			if (!note || (note.kind !== 'markdown' && note.kind !== 'text')) return false;
 			const { path, text, version } = note;
-			const onDisk = await readDiskText(path);
-			if (onDisk !== note.savedText && onDisk !== text) {
+			if (!(await repo.writeFileIfUnchanged(path, text, note.savedText))) {
 				setNote({ diskChanged: true });
 				return false;
 			}
-			await repo.writeFile(path, text);
 			await loadTree();
 			if (state.note?.version !== version) return true;
 			const stillSame = state.note.text === text;
@@ -505,13 +503,11 @@ export function createNotes({ repoId, provider, repo, drafts }) {
 				const open = state.note?.path === path ? state.note : null;
 				const draft = open ? { text: open.text, base: open.savedText } : (unkeptDrafts.get(path) ?? (await drafts.get(repoId, path)));
 				if (!draft) continue;
-				const onDisk = await readDiskText(path);
-				if (onDisk !== draft.base && onDisk !== draft.text) {
+				if (!(await repo.writeFileIfUnchanged(path, draft.text, draft.base))) {
 					if (open) setNote({ diskChanged: true });
 					skipped.push(path);
 					continue;
 				}
-				if (onDisk !== draft.text) await repo.writeFile(path, draft.text);
 				saved.push(path);
 				if (open && state.note?.version === open.version) {
 					const stillSame = state.note.text === draft.text;

@@ -859,6 +859,23 @@ describe('push', () => {
 });
 
 describe('pull', () => {
+	it('fast-forwards with no author, because it commits nothing', async () => {
+		const { remote, repo } = await clonedRepo();
+		await pushFromElsewhere(remote, { 'README.md': 'theirs\n' }, 'theirs');
+		expect((await repo.pull({ author: null })).status).toBe('fast_forward');
+		expect(await repo.readText('README.md')).toBe('theirs\n');
+	});
+
+	it('fetches and then refuses a merge with no author, changing nothing', async () => {
+		const { remote, repo } = await clonedRepo();
+		await commitFile(repo, 'README.md', 'ours\n');
+		await pushFromElsewhere(remote, { 'other.md': 'theirs\n' }, 'theirs');
+		expect((await rejection(repo.pull({ author: null }))).code).toBe(ErrorCode.INVALID_ARGUMENT);
+		expect(await repo.aheadBehind()).toMatchObject({ ahead: 1, behind: 1 });
+		expect((await repo.status()).merge).toBeNull();
+		expect(await repo.readText('README.md')).toBe('ours\n');
+	});
+
 	it('fast-forwards a clean tree', async () => {
 		const { remote, repo } = await clonedRepo();
 		await pushFromElsewhere(remote, { 'README.md': 'updated\n', 'new.md': 'new\n' }, 'elsewhere');
@@ -2312,5 +2329,72 @@ describe('resetDamagedMerge', () => {
 		const { repo } = await conflictedRepo();
 		expect(await repo.resetDamagedMerge()).toBe(false);
 		expect((await repo.status()).merge?.conflictedPaths).toEqual(['clash.md']);
+	});
+});
+
+describe('a byte order mark through a conflicted merge', () => {
+	const BOM = '\uFEFF';
+	const body = (/** @type {string} */ first, /** @type {string} */ last) => `${BOM}${first}\nb\nc\nd\ne\nf\ng\n${last}\n`;
+
+	it('stays on a file that merged cleanly beside the conflict, through to the remote', async () => {
+		const { remote, repo } = await clonedRepo({ 'bom.md': body('a', 'h'), 'clash.md': 'base\n' });
+		await repo.writeFile('bom.md', body('A', 'h'));
+		await repo.writeFile('clash.md', 'mine\n');
+		await repo.commit({ paths: ['bom.md', 'clash.md'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'bom.md': body('a', 'H'), 'clash.md': 'theirs\n' }, 'theirs');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		await repo.writeFile('clash.md', 'settled\n');
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+
+		expect(await showRemote(remote, 'main:bom.md')).toBe(body('A', 'H'));
+	});
+
+	it('stays on a conflicted file', async () => {
+		const { remote, repo } = await clonedRepo({ 'clash.md': `${BOM}keep\nbase\n` });
+		await repo.writeFile('clash.md', `${BOM}keep\nmine\n`);
+		await repo.commit({ paths: ['clash.md'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'clash.md': `${BOM}keep\ntheirs\n` }, 'theirs');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		expect([...(await repo.readFile('clash.md')).slice(0, 3)]).toEqual([0xef, 0xbb, 0xbf]);
+	});
+});
+
+describe('writeFileIfUnchanged', () => {
+	it('writes over the text it was told to expect', async () => {
+		const { repo } = await clonedRepo();
+		expect(await repo.writeFileIfUnchanged('README.md', 'new\n', 'hello\n')).toBe(true);
+		expect(await repo.readText('README.md')).toBe('new\n');
+	});
+
+	it('writes nothing and reports false when the file holds something else', async () => {
+		const { repo } = await clonedRepo();
+		await repo.writeFile('README.md', 'changed\n');
+		expect(await repo.writeFileIfUnchanged('README.md', 'new\n', 'hello\n')).toBe(false);
+		expect(await repo.readText('README.md')).toBe('changed\n');
+	});
+
+	it('counts a file already holding the text as written', async () => {
+		const { repo } = await clonedRepo();
+		await repo.writeFile('README.md', 'new\n');
+		expect(await repo.writeFileIfUnchanged('README.md', 'new\n', 'hello\n')).toBe(true);
+	});
+
+	it('creates a missing file only when the note expected none', async () => {
+		const { repo } = await clonedRepo();
+		expect(await repo.writeFileIfUnchanged('gone.md', 'new\n', 'it was here\n')).toBe(false);
+		expect(await repo.writeFileIfUnchanged('fresh/note.md', 'new\n', null)).toBe(true);
+		expect(await repo.readText('fresh/note.md')).toBe('new\n');
+	});
+});
+
+describe('pathsWithMarkers', () => {
+	it('names the files holding a full set of markers, and skips what is not there', async () => {
+		const { repo } = await clonedRepo();
+		await repo.writeFile('marked.md', '<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n');
+		await repo.writeFile('plain.md', '======= not a conflict\n');
+		expect(await repo.pathsWithMarkers(['marked.md', 'plain.md', 'missing.md'])).toEqual(['marked.md']);
 	});
 });

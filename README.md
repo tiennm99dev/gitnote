@@ -116,7 +116,8 @@ failures in its state instead of throwing.
   delete a folder holding files that are not selected.
 - **Author.** Settings (`/settings`) first, then the account's profile, then for
   GitHub `<login>@users.noreply.github.com`. With none of those, committing and
-  merging ask for one, and a pull on opening is skipped.
+  merging ask for one. A pull still fetches and fast-forwards, which commits
+  nothing, and stops only if it needs a merge.
 - **Pull** runs on opening and on request, only on a clean tree. Local changes hold
   it back with a prompt to commit or discard; `fetchRemote` still updates the
   behind count. Drafts do not hold it back: if a pull changes such a file, the
@@ -130,9 +131,12 @@ failures in its state instead of throwing.
   also takes an ours/theirs choice, and stays a link. If a conflict's details cannot
   be read, the list still shows it, unresolved, so the merge can be abandoned.
 - **Push.** There is no force push. Offline, or on a connection failure, the push
-  is queued in localStorage and goes on `online`, on coming back and on opening.
-  An open merge holds a queued push, and completing the merge sends it. Any other
-  refusal is shown and not retried. A push over a size limit offers
+  is queued in localStorage and goes on `online`, on coming back, on focus and on
+  opening. A connection failure while the device reports a network gets no `online`
+  event, so a visible page also retries, every 15 seconds at first and every 5
+  minutes at most. An open merge holds a queued push, and completing, abandoning or
+  resetting the merge sends it. With autosave on, autosave sends it and pulls first.
+  Any other refusal is shown and not retried. A push over a size limit offers
   `undoUnpushedCommits`, which asks to turn autosave off first, because autosave
   would commit those files together again.
 - **A damaged merge record** makes every engine call fail with
@@ -143,7 +147,8 @@ failures in its state instead of throwing.
   `autosave: <paths>`, pulls, then pushes. Going hidden commits on the device only;
   coming back, launching and regaining the network push. It stands aside while a
   merge is open and resumes by itself after. A draft whose file changed underneath
-  it is left out and named, and so is a file over a size limit, so the other notes
+  it is left out and named, and so is a file over a size limit or with conflict
+  markers in it (which a commit from the panel can still take), so the other notes
   still get committed. It is armed before the pull on opening, which can stall.
   Timers run reliably only in the foreground, so it does nothing while the app is
   in the background.

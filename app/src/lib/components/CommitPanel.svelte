@@ -1,5 +1,4 @@
 <script>
-	import { SvelteSet } from 'svelte/reactivity';
 	import { resolve } from '$app/paths';
 	import { ErrorCode, GitEngineError } from '#lib/git/errors.js';
 	import { formatBytes } from '#lib/git/limits.js';
@@ -12,15 +11,13 @@
 	 * @property {Pick<import('#lib/git/repo.js').Repo, 'checkCommit' | 'readCommitted' | 'readFile'>} engine
 	 * @property {string[]} draftPaths notes with unsaved text
 	 * @property {boolean} hasAuthor
+	 * @property {import('svelte/reactivity').SvelteSet<string>} unchecked files left out, kept by the caller so they outlast this panel; everything else is selected, so a new change is never left out unseen
+	 * @property {string | null} typedMessage the message the user wrote, kept the same way
 	 */
 
 	/** @type {Props} */
-	let { sync, engine, draftPaths, hasAuthor } = $props();
+	let { sync, engine, draftPaths, hasAuthor, unchecked, typedMessage = $bindable() } = $props();
 
-	/** Everything is selected unless unchecked, so a new change is never left out unseen. */
-	const unchecked = new SvelteSet();
-	/** @type {string | null} */
-	let typedMessage = $state(null);
 	/** @type {import('#lib/git/limits.js').SizeFinding[]} */
 	let findings = $state([]);
 	/** @type {string | null} */
@@ -210,6 +207,7 @@
 			<button type="button" class="min-h-11 rounded bg-gray-900 px-3 text-white disabled:opacity-50" disabled={!canCommit} onclick={() => commit(false)} data-testid="commit-button">Commit</button>
 			<button type="button" class="min-h-11 rounded bg-gray-900 px-3 text-white disabled:opacity-50" disabled={!canCommit} onclick={() => commit(true)} data-testid="commit-push-button">Commit &amp; Push</button>
 			{#if confirmingDiscard}
+				<p class="basis-full text-red-700" data-testid="discard-files">Discarding takes these back to their last commit, and deletes any git does not track yet: {selected.join(', ')}.</p>
 				<button type="button" class="min-h-11 rounded bg-red-700 px-3 text-white" onclick={discard} data-testid="discard-confirm-changes">Discard {selected.length} {selected.length === 1 ? 'file' : 'files'}; this cannot be undone</button>
 				<button type="button" class="min-h-11 rounded border border-gray-400 px-3" onclick={() => (confirmingDiscard = false)}>Keep them</button>
 			{:else}

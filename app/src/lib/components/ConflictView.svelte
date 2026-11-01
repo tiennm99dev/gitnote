@@ -140,6 +140,17 @@
 						<button type="button" class="min-h-11 rounded border border-gray-900 px-3 disabled:opacity-50" disabled={busy} onclick={() => markResolved(conflict.path)} data-testid="mark-resolved">Mark resolved</button>
 					{/if}
 				</div>
+				{#if $notes.draftPaths.includes(conflict.path) && (needsChoice(conflict) || current !== conflict.path)}
+					<p class="text-sm text-amber-800" data-testid="conflict-draft">
+						This file has unsaved text, so it cannot count as resolved.
+						{#if current === conflict.path}
+							Save it or discard it in the note below first.
+						{:else}
+							<!-- eslint-disable-next-line svelte/no-navigation-without-resolve -- hrefFor builds the route with resolve() -->
+							<a class="underline" href={hrefFor(conflict.path)} data-testid="conflict-draft-link">Open it</a> and save it, or discard it, first.
+						{/if}
+					</p>
+				{/if}
 				{#if stillMarked === conflict.path}
 					<div role="alert" class="flex flex-wrap items-center gap-2 text-amber-800" data-testid="still-marked">
 						<p class="min-w-0 flex-1 text-sm">This file still has conflict markers.</p>

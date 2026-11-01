@@ -9,10 +9,10 @@ const MINUTE = 60_000;
 // eslint-disable-next-line jsdoc/require-returns
 /**
  * A record of what autosave asked for, in order, over a repo described by `work`.
- * @param {{ merge?: boolean, paths?: string[], ahead?: number, pull?: { ok: boolean, status?: string, code?: string }, skipped?: string[], draftPaths?: string[], tooBig?: string[] }} [scene]
+ * @param {{ merge?: boolean, paths?: string[], ahead?: number, pushPending?: boolean, pull?: { ok: boolean, status?: string, code?: string }, skipped?: string[], draftPaths?: string[], tooBig?: string[], marked?: string[] }} [scene]
  */
 function setUp(scene = {}) {
-	const work = { merge: scene.merge ?? false, paths: scene.paths ?? [], ahead: scene.ahead ?? 0 };
+	const work = { merge: scene.merge ?? false, paths: scene.paths ?? [], ahead: scene.ahead ?? 0, pushPending: scene.pushPending ?? false };
 	const environment = { visible: true, online: true };
 	/** @type {string[]} */
 	const calls = [];
@@ -22,6 +22,7 @@ function setUp(scene = {}) {
 	const failures = [];
 	const ops = {
 		checkCommit: vi.fn(async (/** @type {string[]} */ paths) => paths.filter((path) => (scene.tooBig ?? []).includes(path)).map((path) => ({ level: /** @type {const} */ ('block'), path, size: 2, limit: 1, message: `${path} is too big` }))),
+		findMarkers: vi.fn(async (/** @type {string[]} */ paths) => paths.filter((path) => (scene.marked ?? []).includes(path))),
 		saveDrafts: vi.fn(async () => {
 			calls.push('saveDrafts');
 			work.paths = [...work.paths, ...(scene.draftPaths ?? [])];
@@ -44,6 +45,7 @@ function setUp(scene = {}) {
 		push: vi.fn(async () => {
 			calls.push('push');
 			work.ahead = 0;
+			work.pushPending = false;
 			return { ok: true };
 		}),
 		queuePush: vi.fn(() => void calls.push('queuePush'))
@@ -178,6 +180,25 @@ describe('a file over a size limit', () => {
 		await turnOn(context);
 		await context.autosave.handleHidden();
 		expect(context.ops.commit).toHaveBeenCalledWith(['note.md'], 'autosave: note.md');
+	});
+});
+
+describe('a file with conflict markers', () => {
+	it('stays out of the commit, is named, and the rest still goes', async () => {
+		const context = setUp({ paths: ['marked.md', 'clean.md'], marked: ['marked.md'] });
+		await turnOn(context);
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		expect(context.messages).toEqual(['autosave: clean.md']);
+		expect(context.calls).toEqual(['saveDrafts', 'commit', 'pull', 'push']);
+		expect(get(context.autosave).refused).toEqual([expect.stringContaining('marked.md holds conflict markers')]);
+	});
+
+	it('commits nothing when it is the only change', async () => {
+		const context = setUp({ paths: ['marked.md'], marked: ['marked.md'] });
+		await turnOn(context);
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		expect(context.ops.commit).not.toHaveBeenCalled();
+		expect(get(context.autosave).refused).toHaveLength(1);
 	});
 });
 
@@ -322,6 +343,17 @@ describe('arming before the first pull', () => {
 		context.autosave.arm({ enabled: false, intervalMinutes: 1 });
 		await context.autosave.pushOnLaunch();
 		expect(context.calls).toEqual([]);
+	});
+});
+
+describe('a queued push', () => {
+	it('pulls before it pushes, even with no commit ahead', async () => {
+		const context = setUp({ pushPending: true });
+		await turnOn(context);
+		context.calls.length = 0;
+		context.work.pushPending = true;
+		await context.autosave.handleOnline();
+		expect(context.calls).toEqual(['pull', 'push']);
 	});
 });
 

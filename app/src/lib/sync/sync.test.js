@@ -2,7 +2,7 @@ import { symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { memfs } from 'memfs';
 import { get } from 'svelte/store';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { memoryDraftStore } from '../../../test/draft-doubles.js';
 import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
 import { changeElsewhere, createRemote, pushFromElsewhere, rejectPushes, RELAY_PORT, remoteHead, runGit, showRemote } from '../../../test/remote-repo.js';
@@ -29,21 +29,36 @@ function memoryStorage() {
 	);
 }
 
+/**
+ * Every sync a test opened, whose push retries must not outlive it.
+ * @type {Array<{ stop: () => void }>}
+ */
+const opened = [];
+
+afterEach(() => {
+	for (const sync of opened.splice(0)) sync.stop();
+});
+
 // The result's shape is inferred, and the tests read it by name.
 // eslint-disable-next-line jsdoc/require-returns
 /**
  * A real clone on its own memory file system, behind the store the screen uses.
  * @param {import('../../../test/remote-repo.js').Remote} remote
- * @param {{ storage?: Storage, author?: typeof AUTHOR | null }} [options]
+ * @param {{ storage?: Storage, author?: typeof AUTHOR | null, retry?: { isVisible?: () => boolean, sendQueuedPush?: () => Promise<unknown>, pushRetryDelaysMs?: number[] } }} [options]
  */
-async function openDevice(remote, { storage = memoryStorage(), author = AUTHOR } = {}) {
+async function openDevice(remote, { storage = memoryStorage(), author = AUTHOR, retry = {} } = {}) {
 	const fs = /** @type {import('../git/repo.js').FsClient} */ (/** @type {unknown} */ (memfs().fs));
 	const repo = createRepo({ id: remote.id, fs, http: createGitHttp({ relayOrigin: `http://127.0.0.1:${RELAY_PORT}` }), provider: 'github', getCredential: () => FIXTURE_CREDENTIAL });
 	await repo.clone({ url: remote.url });
 	const network = { online: true };
 	const notes = createNotes({ repoId: remote.id, provider: 'github', repo, drafts: memoryDraftStore() });
-	const options = { repoId: remote.id, repo, notes, storage, isOnline: () => network.online, getAuthor: () => author };
-	return { repo, fs, notes, network, storage, sync: createSync(options), reopen: () => createSync(options) };
+	const options = { repoId: remote.id, repo, notes, storage, isOnline: () => network.online, getAuthor: () => author, ...retry };
+	const start = () => {
+		const sync = createSync(options);
+		opened.push(sync);
+		return sync;
+	};
+	return { repo, fs, notes, network, storage, sync: start(), reopen: start };
 }
 
 // The result's shape is inferred, and the tests read it by name.
@@ -132,6 +147,16 @@ describe('pull', () => {
 		expect(get(sync).lastSyncAt).not.toBeNull();
 	});
 
+	it('does not count a pull that opened a merge as a sync, until the merge is pushed', async () => {
+		const { repo, sync } = await setUpConflict();
+		expect(get(sync).lastSyncAt).toBeNull();
+		await repo.writeFile('a.md', 'both\n');
+		await sync.completeMerge({ allowMarkers: false });
+		expect(get(sync).lastSyncAt).toBeNull();
+		await sync.push();
+		expect(get(sync).lastSyncAt).not.toBeNull();
+	});
+
 	it('holds back on local changes, without touching them, and shows how far behind', async () => {
 		const { repo, sync, remote } = await setUp();
 		await repo.writeFile('a.md', 'edited\n');
@@ -182,11 +207,23 @@ describe('pull', () => {
 		expect(get(sync).ahead).toBe(1);
 	});
 
-	it('asks for an author it needs for a merge', async () => {
+	it('asks for an author it needs for a merge, and has still fetched', async () => {
 		const remote = await createRemote({ 'a.md': 'one\n' });
-		const { sync } = await openDevice(remote, { author: null });
-		expect((await sync.pull()).ok).toBe(false);
-		expect(get(sync).needsAuthor).toBe(true);
+		const { repo, sync } = await openDevice(remote, { author: null });
+		await repo.writeFile('a.md', 'mine\n');
+		await repo.commit({ paths: ['a.md'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'c.md': 'new\n' }, 'theirs');
+		expect(await sync.pull()).toEqual({ ok: false, code: ErrorCode.INVALID_ARGUMENT });
+		expect(get(sync)).toMatchObject({ needsAuthor: true, behind: 1, ahead: 1, merge: null, report: null });
+	});
+
+	it('pulls with no author when nothing needs merging', async () => {
+		const remote = await createRemote({ 'a.md': 'one\n' });
+		const { repo, sync } = await openDevice(remote, { author: null });
+		await pushFromElsewhere(remote, { 'c.md': 'new\n' }, 'theirs');
+		await sync.open();
+		expect(get(sync)).toMatchObject({ needsAuthor: false, behind: 0, report: null });
+		expect(await repo.readText('c.md')).toBe('new\n');
 	});
 });
 
@@ -280,6 +317,88 @@ describe('push', () => {
 		vi.spyOn(repo, 'push').mockRejectedValueOnce(networkError(new TypeError('down')));
 		expect(await sync.push()).toMatchObject({ ok: false, queued: true, code: ErrorCode.NETWORK });
 		expect(get(sync).pushPending).toBe(true);
+	});
+
+	describe('after a connection failure with the device online', () => {
+		const down = () => networkError(new TypeError('down'));
+
+		/**
+		 * @param {{ isVisible?: () => boolean, sendQueuedPush?: () => Promise<unknown> }} retry
+		 * @returns {Promise<Awaited<ReturnType<typeof openDevice>> & { remote: import('../../../test/remote-repo.js').Remote }>}
+		 */
+		const deviceWithCommit = async (retry) => {
+			const remote = await createRemote({ 'a.md': 'one\n' });
+			const device = await openDevice(remote, { retry: { pushRetryDelaysMs: [5], ...retry } });
+			await device.repo.writeFile('a.md', 'edited\n');
+			await device.sync.commit({ paths: ['a.md'], message: 'x' });
+			return { ...device, remote };
+		};
+
+		it('tries again by itself, repeatedly, until the push goes', async () => {
+			const { repo, sync, remote } = await deviceWithCommit({});
+			const push = vi.spyOn(repo, 'push').mockRejectedValueOnce(down()).mockRejectedValueOnce(down());
+			await sync.push();
+			expect(get(sync).pushPending).toBe(true);
+			await vi.waitFor(() => expect(get(sync)).toMatchObject({ pushPending: false, ahead: 0, report: null }), { timeout: 10_000 });
+			expect(push).toHaveBeenCalledTimes(3);
+			expect(await showRemote(remote, 'main:a.md')).toBe('edited\n');
+		});
+
+		it('leaves a hidden page alone, and its return sends the push', async () => {
+			const page = { visible: false };
+			const { repo, sync } = await deviceWithCommit({ isVisible: () => page.visible });
+			const push = vi.spyOn(repo, 'push').mockRejectedValueOnce(down());
+			await sync.push();
+			await new Promise((done) => setTimeout(done, 30));
+			expect(push).toHaveBeenCalledTimes(1);
+			page.visible = true;
+			await sync.pushIfPending();
+			expect(get(sync).pushPending).toBe(false);
+		});
+
+		it('sends the retry through whatever owns the queued push', async () => {
+			const sendQueuedPush = vi.fn(async () => undefined);
+			const { repo, sync } = await deviceWithCommit({ sendQueuedPush });
+			const push = vi.spyOn(repo, 'push').mockRejectedValueOnce(down());
+			await sync.push();
+			await vi.waitFor(() => expect(sendQueuedPush).toHaveBeenCalled(), { timeout: 10_000 });
+			expect(push).toHaveBeenCalledTimes(1);
+		});
+
+		it('keeps trying when the owner only got as far as a failed pull', async () => {
+			/** @type {() => Promise<unknown>} */
+			let owner = async () => undefined;
+			const { repo, sync } = await deviceWithCommit({ sendQueuedPush: () => owner() });
+			owner = () => sync.pull();
+			vi.spyOn(repo, 'push').mockRejectedValueOnce(down());
+			const pull = vi.spyOn(repo, 'pull').mockRejectedValue(down());
+			await sync.push();
+			await vi.waitFor(() => expect(pull.mock.calls.length).toBeGreaterThan(2), { timeout: 10_000 });
+		});
+
+		it('stops once the screen is gone', async () => {
+			const { repo, sync } = await deviceWithCommit({});
+			const push = vi.spyOn(repo, 'push').mockRejectedValueOnce(down());
+			await sync.push();
+			sync.stop();
+			await new Promise((done) => setTimeout(done, 30));
+			expect(push).toHaveBeenCalledTimes(1);
+		});
+
+		it('leaves a merge to its own way of sending the push', async () => {
+			const { repo, sync, remote } = await deviceWithCommit({});
+			const push = vi.spyOn(repo, 'push').mockRejectedValue(down());
+			await pushFromElsewhere(remote, { 'a.md': 'theirs\n' }, 'theirs');
+			await sync.push();
+			await sync.pull();
+			expect(get(sync).merge).not.toBeNull();
+			// A retry that fired before the merge opened may still be finishing.
+			await new Promise((done) => setTimeout(done, 30));
+			const calls = push.mock.calls.length;
+			await new Promise((done) => setTimeout(done, 30));
+			expect(push.mock.calls.length).toBe(calls);
+			expect(get(sync).pushPending).toBe(true);
+		});
 	});
 
 	it('never force-pushes: a diverged remote is refused and stays as it was', async () => {
@@ -380,6 +499,24 @@ describe('a queued push and an open merge', () => {
 		expect((await sync.completeMerge({ allowMarkers: false })).ok).toBe(true);
 		expect(get(sync)).toMatchObject({ merge: null, pushPending: false, ahead: 0, report: null });
 		expect(await showRemote(remote, 'main:a.md')).toBe('both\n');
+	});
+
+	it('is not left waiting when the merge is abandoned: the refusal offers a pull', async () => {
+		const { sync, remote } = await setUpQueued();
+		const head = await remoteHead(remote);
+		expect((await sync.abortMerge()).ok).toBe(true);
+		expect(get(sync)).toMatchObject({ merge: null, pushPending: false, report: { code: ErrorCode.NON_FAST_FORWARD } });
+		expect(await remoteHead(remote)).toBe(head);
+	});
+
+	it('is not left waiting when a damaged merge is reset', async () => {
+		const { fs, repo, reopen } = await setUpQueued();
+		await fs.promises.writeFile(`${repo.dir}/.git/gitnote-merge.json`, 'not json', { encoding: 'utf8' });
+		const reloaded = reopen();
+		await reloaded.open();
+		expect(get(reloaded)).toMatchObject({ mergeDamaged: true, pushPending: true });
+		expect((await reloaded.resetDamagedMerge()).ok).toBe(true);
+		expect(get(reloaded)).toMatchObject({ mergeDamaged: false, pushPending: false, report: { code: ErrorCode.NON_FAST_FORWARD } });
 	});
 
 	it('keeps waiting when the merge commit is made offline', async () => {
@@ -569,6 +706,18 @@ describe('the autosave operations', () => {
 		await repo.writeFile('a.md', 'edited\n');
 		expect(await sync.autosaveOps.checkCommit(['big.bin', 'a.md'])).toMatchObject([{ level: 'block', path: 'big.bin' }]);
 	}, 60_000);
+
+	it('name a file with conflict markers, so autosave can leave it out', async () => {
+		const { repo, sync } = await setUp();
+		await repo.writeFile('a.md', '<<<<<<< ours\na\n=======\nb\n>>>>>>> theirs\n');
+		expect(await sync.autosaveOps.findMarkers(['a.md', 'b.md'])).toEqual(['a.md']);
+	});
+
+	it('say a push is queued, so autosave sends it even with nothing ahead', async () => {
+		const { sync } = await setUp();
+		sync.autosaveOps.queuePush();
+		expect(await sync.autosaveOps.readWork()).toMatchObject({ ahead: 0, pushPending: true });
+	});
 
 	it('see an open merge, so autosave stands aside', async () => {
 		const { sync } = await setUpConflict();

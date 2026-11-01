@@ -29,6 +29,7 @@ import { authCallbacks, withSignal } from './http.js';
 import { checkFileSize, checkPushSize, checkUnpushedSize, limitsFor } from './limits.js';
 import { withRepoLock } from './lock.js';
 import { clearMergeState, createMergeDriver, hasConflictMarkers, isBinary, readMergeState, writeMergeState } from './merge.js';
+import { decodeText, MAX_TEXT_BYTES } from '../notes/text.js';
 
 // isomorphic-git uses the Node `Buffer` global; browsers have none.
 globalThis.Buffer ??= Buffer;
@@ -670,9 +671,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		const driver = createMergeDriver(driverBinaryPaths, mergedTexts);
 		/**
 		 * @param {TreeBlob | null} blob
-		 * @returns {Promise<string>} its content as the driver reads it; an absent base is empty
+		 * @returns {Promise<string>} its content as the driver reads it, keeping any byte order mark; an absent base is empty
 		 */
-		const decoded = async (blob) => (blob ? new TextDecoder().decode((await git.readBlob({ fs, gitdir, oid: blob.oid, cache })).blob) : '');
+		const decoded = async (blob) => (blob ? new TextDecoder('utf-8', { ignoreBOM: true }).decode((await git.readBlob({ fs, gitdir, oid: blob.oid, cache })).blob) : '');
 		const [baseOid] = await git.findMergeBase({ fs, gitdir, oids: [oursOid, theirsOid], cache });
 		/** @type {Conflict[]} */
 		const conflicts = [];
@@ -722,7 +723,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	/**
 	 * Merges fetched commits into a clean tree. The merge's record is flushed
 	 * before anything moves, and any failure puts everything back.
-	 * @param {{ branch: string, oursOid: string, theirsOid: string, remoteRef: string, author: { name: string, email: string } }} options
+	 * @param {{ branch: string, oursOid: string, theirsOid: string, remoteRef: string, author: { name: string, email: string } | null }} options `author` is null only for a fast-forward, which commits nothing
 	 * @returns {Promise<PullResult>}
 	 */
 	const applyPull = async ({ branch, oursOid, theirsOid, remoteRef, author }) => {
@@ -748,7 +749,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					...base,
 					ours: branch,
 					theirs: remoteRef,
-					author,
+					...(author ? { author } : { fastForwardOnly: true }),
 					abortOnConflict: true,
 					mergeDriver: createMergeDriver(new Set())
 				});
@@ -765,7 +766,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			// the whole working tree as text, and fails on a symbolic link.
 			const conflict = /** @type {{ code?: string, data?: { filepaths?: string[] } }} */ (
 				await git
-					.merge({ fs, gitdir, cache, ours: branch, theirs: remoteRef, author, abortOnConflict: false, mergeDriver: createMergeDriver(new Set()) })
+					.merge({ fs, gitdir, cache, ours: branch, theirs: remoteRef, author: author ?? undefined, abortOnConflict: false, mergeDriver: createMergeDriver(new Set()) })
 					.then(
 						() => {
 							throw new Error('The merge was expected to conflict.');
@@ -925,6 +926,16 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
+	 * Only a regular file holds text; reading a link would follow it.
+	 * @param {string} path
+	 * @returns {Promise<boolean>}
+	 */
+	const fileHasMarkers = async (path) => {
+		if (!(await lstatOrNull(abs(path)))?.isFile()) return false;
+		return hasConflictMarkers(/** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' })));
+	};
+
+	/**
 	 * @param {MergeState} merge
 	 * @returns {Promise<string[]>} conflicted text files that still hold markers
 	 */
@@ -932,11 +943,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		/** @type {string[]} */
 		const withMarkers = [];
 		for (const { path, binary } of merge.conflicts) {
-			if (binary) continue;
-			// Only a regular file holds text; reading a link would follow it.
-			if (!(await lstatOrNull(abs(path)))?.isFile()) continue;
-			const text = /** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' }));
-			if (hasConflictMarkers(text)) withMarkers.push(path);
+			if (!binary && (await fileHasMarkers(path))) withMarkers.push(path);
 		}
 		return withMarkers;
 	};
@@ -1253,6 +1260,48 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		writeFile: (path, data) => locked(() => writeWorkingFile(path, data, false)),
 
 		/**
+		 * Writes a note's text unless the file changed since the note read it. The
+		 * comparison and the write share one lock, so a pull cannot land between
+		 * them and have its change written over.
+		 * @param {string} path
+		 * @param {string} text
+		 * @param {string | null} base the text the note started from; null for no file
+		 * @returns {Promise<boolean>} false, with nothing written, when the file holds neither `base` nor `text`
+		 */
+		writeFileIfUnchanged: (path, text, base) =>
+			locked(async () => {
+				const filepath = normalizePath(path);
+				await assertCloned();
+				/** @type {string | null} */
+				let current = null;
+				try {
+					current = decodeText(/** @type {Uint8Array} */ (await fs.promises.readFile(abs(filepath))));
+				} catch (error) {
+					if (!isMissing(error)) throw error;
+				}
+				if (current === text) return true;
+				if (current !== base) return false;
+				await writeWorkingFile(filepath, text, false);
+				return true;
+			}),
+
+		/**
+		 * @param {string[]} paths
+		 * @returns {Promise<string[]>} those whose text holds conflict markers; a file too large to edit here is not read
+		 */
+		pathsWithMarkers: (paths) =>
+			locked(async () => {
+				await assertCloned();
+				/** @type {string[]} */
+				const marked = [];
+				for (const path of normalizePaths(paths)) {
+					const stat = await lstatOrNull(abs(path));
+					if (stat && stat.size <= MAX_TEXT_BYTES && (await fileHasMarkers(path))) marked.push(path);
+				}
+				return marked;
+			}),
+
+		/**
 		 * Writes a new working-tree file, creating its folders. Nothing is staged.
 		 * @param {string} path
 		 * @param {string | Uint8Array} data
@@ -1377,13 +1426,15 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		 * deleted), the index the merge's result with unmerged entries for those
 		 * paths, and the merge state is stored so a reload can resume it. The
 		 * branch ref does not move until `completeMerge`.
-		 * @param {{ author: Author, onProgress?: ProgressCallback, signal?: AbortSignal }} options
+		 *
+		 * Only a merge needs the author: a fast-forward commits nothing, so it goes
+		 * ahead without one, and a pull that needs a merge fetches and then refuses.
+		 * @param {{ author?: Author | null, onProgress?: ProgressCallback, signal?: AbortSignal }} options
 		 * @returns {Promise<PullResult>}
 		 */
 		pull: ({ author, onProgress, signal }) =>
 			(async () => {
 				const branch = await locked(async () => {
-					assertAuthor(author);
 					await assertCloned();
 					await assertNoMerge();
 					await assertCleanTree();
@@ -1402,8 +1453,11 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					const theirsOid = await git.resolveRef({ fs, gitdir, ref: remoteRef });
 					if (oursOid === theirsOid) return { status: 'up_to_date', oid: oursOid };
 					if ((await commitsUntil(theirsOid, await ancestorsOf(oursOid))).length === 0) return { status: 'up_to_date', oid: oursOid };
+					const fastForward = (await ancestorsOf(theirsOid)).has(oursOid);
+					if (!fastForward) assertAuthor(author);
+					const signature = fastForward || !author ? null : { name: author.name, email: author.email };
 					await assertNoUntrackedCollisions(theirsOid);
-					return applyPull({ branch, oursOid, theirsOid, remoteRef, author: { name: author.name, email: author.email } });
+					return applyPull({ branch, oursOid, theirsOid, remoteRef, author: signature });
 				}, signal);
 			})(),
 

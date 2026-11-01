@@ -7,13 +7,14 @@
 	 * @property {import('#lib/sync/sync.js').Sync} sync
 	 * @property {import('#lib/sync/autosave.js').AutosaveState} autosave
 	 * @property {number} unsavedNotes notes with text not yet saved to a file
+	 * @property {boolean} hasAuthor an author is known by now, whatever asked for one earlier
 	 * @property {boolean} changesOpen the commit panel is showing
 	 * @property {() => void} onchanges opens or closes the commit panel
 	 * @property {() => void} onconflicts shows the open merge
 	 */
 
 	/** @type {Props} */
-	let { sync, autosave, unsavedNotes, changesOpen, onchanges, onconflicts } = $props();
+	let { sync, autosave, unsavedNotes, hasAuthor, changesOpen, onchanges, onconflicts } = $props();
 
 	let confirmingUndo = $state(false);
 
@@ -25,6 +26,7 @@
 	const needsSignIn = $derived($sync.report?.code === ErrorCode.AUTH_REQUIRED);
 	const needsPull = $derived($sync.report?.code === ErrorCode.NON_FAST_FORWARD);
 	const blocked = $derived($sync.merge !== null || $sync.mergeDamaged);
+	const pendingText = $derived(blocked ? 'Push waiting for the merge' : $sync.online ? 'Could not reach the host; the push will try again' : 'Push waiting for the network');
 	const unpushed = $derived(`${$sync.ahead} unpushed ${$sync.ahead === 1 ? 'commit' : 'commits'}`);
 
 	const undo = async () => {
@@ -42,7 +44,7 @@
 		<span data-testid="sync-ahead" title="Commits only on this device">{unpushed}</span>
 		<span data-testid="sync-behind" title="Commits only on the remote, as of the last check">{$sync.behind} behind</span>
 		{#if $sync.pushPending}
-			<span class="rounded bg-amber-100 px-2 py-1 text-amber-900" data-testid="push-pending">{blocked ? 'Push waiting for the merge' : 'Push waiting for the network'}</span>
+			<span class="rounded bg-amber-100 px-2 py-1 text-amber-900" data-testid="push-pending">{pendingText}</span>
 		{/if}
 		<span class="text-gray-600" data-testid="last-sync">{$sync.lastSyncAt ? `Last sync ${new Date($sync.lastSyncAt).toLocaleString()}` : 'Not synced yet'}</span>
 		{#if autosave.enabled}
@@ -70,8 +72,8 @@
 	{#if unsavedNotes > 0 && !$sync.merge}
 		<p role="status" class="bg-gray-100 p-2" data-testid="unsaved-notes">{unsavedNotes} {unsavedNotes === 1 ? 'note has' : 'notes have'} unsaved text, which commits and pulls leave out. If a pull changes such a file, you choose between the two when you open it.</p>
 	{/if}
-	{#if $sync.needsAuthor}
-		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="needs-author">Commits and merges need an author. <a class="underline" href={resolve('/settings')}>Set your name and email in Settings</a>.</p>
+	{#if $sync.needsAuthor && !hasAuthor}
+		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="needs-author">Commits and merges need an author, so anything that needs a merge was not pulled. <a class="underline" href={resolve('/settings')}>Set your name and email in Settings</a>.</p>
 	{/if}
 	{#if autosave.enabled && autosave.skipped.length > 0}
 		<p role="status" class="bg-amber-50 p-2 text-amber-800" data-testid="autosave-skipped">Autosave left out {autosave.skipped.join(', ')}: the file changed after you started editing. Open it to choose which version to keep.</p>
@@ -105,7 +107,7 @@
 	{/if}
 	{#if $sync.mergeDamaged}
 		<div role="alert" class="flex flex-wrap items-center gap-2 bg-red-50 p-2 text-red-700" data-testid="merge-damaged">
-			<p class="min-w-0 flex-1">The record of an open merge is damaged, so it cannot be resumed. Resetting closes it and keeps your files as they are, as uncommitted changes you can commit or discard. Any conflict markers stay in the files until you remove them.</p>
+			<p class="min-w-0 flex-1">The record of an open merge is damaged, so it cannot be resumed. Resetting closes it and keeps your files as they are, as uncommitted changes you can commit or discard. Any conflict markers stay in the files until you remove them, and autosave leaves those files out until then.</p>
 			<button type="button" class="min-h-11 rounded border border-red-700 px-3" onclick={() => sync.resetDamagedMerge()} data-testid="reset-merge">Reset the merge</button>
 		</div>
 	{/if}
