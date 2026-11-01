@@ -11,6 +11,17 @@ import { isProviderId } from './limits.js';
 
 const PREFIX = 'gitnote.repo.';
 
+/** Where the sync screen remembers a repo's last sync and queued push. */
+const SYNC_PREFIX = 'gitnote.sync.';
+
+/**
+ * @param {string} id
+ * @returns {string} the storage key of a repo's sync record
+ */
+export function syncRecordKey(id) {
+	return SYNC_PREFIX + id;
+}
+
 /**
  * @typedef {object} LocalRepo
  * @property {string} id the engine's repo id
@@ -53,6 +64,7 @@ export function saveLocalRepo(repo, storage = globalThis.localStorage) {
  */
 export function forgetLocalRepo(id, storage = globalThis.localStorage) {
 	storage.removeItem(PREFIX + id);
+	storage.removeItem(syncRecordKey(id));
 }
 
 /**
