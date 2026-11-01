@@ -1,0 +1,450 @@
+/* global DataTransfer, ClipboardEvent, indexedDB, window, document */
+import { expect, test } from '@playwright/test';
+import { createRemote, pushFromElsewhere, remoteHead } from '../test/remote-repo.js';
+import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
+import { collectBreakage, GOOD_TOKEN, serveApi, serveGit } from './provider-fixtures.js';
+import { STATIC_SHELL_PORT } from './static-server.js';
+
+/** A real 1x1 PNG, so the browser's decoder proves a `blob:` URL really loaded. */
+const PIXEL = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==', 'base64');
+
+const WELCOME = `---
+title: hidden front matter
+---
+# Welcome
+
+- [x] done task
+- [ ] open task
+
+| Left | Right |
+| :--- | ---: |
+| 1 | 2 |
+
+![pixel](./assets/pixel.png)
+
+![broken](./page.html)
+
+[other note](./other%20note.md)
+
+[raw file](./data.bin)
+
+<script>window.noteScriptRan = true</script>
+<img src="nope.png" onerror="window.noteScriptRan = true">
+`;
+
+const SEED = {
+	'README.md': '# Top\n',
+	'notes/welcome.md': WELCOME,
+	'notes/other note.md': '# Other\n\nA needle in the note.\n',
+	'notes/page.html': '<script>window.noteScriptRan = true</script>',
+	'notes/raw.txt': 'plain text\n',
+	'zzz.md': '# Last\n'
+};
+
+/**
+ * Clones a real repo through the relay with a pasted token, the way a user gets
+ * here, then leaves the page on the repo list.
+ * @param {import('@playwright/test').Page} page
+ * @returns {Promise<{ fullName: string, remote: import('../test/remote-repo.js').Remote, id: string }>}
+ */
+async function cloneRepo(page) {
+	const remote = await createRemote(SEED, { root: E2E_GIT_ROOT, port: E2E_GIT_PORT });
+	await pushFromElsewhere(remote, { 'notes/assets/pixel.png': PIXEL, 'notes/data.bin': Buffer.from([0, 1, 2, 0, 3]) }, 'add binary files');
+	const fullName = new URL(remote.url).pathname.slice(1).replace(/\.git$/, '');
+	await serveApi(page, 'github', GOOD_TOKEN, {
+		'/user/repos?per_page=100&sort=updated&page=1': [{ id: 41, full_name: fullName, default_branch: 'main', size: 12, private: true }],
+		[`/repos/${fullName}/branches?per_page=100&page=1`]: [{ name: 'main' }]
+	});
+	await serveGit(page, 'github', GOOD_TOKEN);
+	await page.goto('/connect');
+	const github = page.getByTestId('account-github');
+	await github.getByLabel('Or paste a token').fill(GOOD_TOKEN);
+	await github.getByRole('button', { name: 'Check and save' }).click();
+	await expect(page.getByTestId('account-github-status')).toContainText('octo');
+	await page.getByRole('link', { name: 'Repositories' }).click();
+	await page.getByTestId('repo-option').click();
+	await page.getByTestId('clone-button').click();
+	await expect(page.getByTestId('open-copy')).toBeVisible();
+	return { fullName, remote, id: `github.com/${fullName}` };
+}
+
+/**
+ * @param {string} id
+ * @param {string} [path]
+ * @returns {string} the app's URL for a file
+ */
+const noteUrl = (id, path = '') => `/repo/${encodeURIComponent(id)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+
+/**
+ * Replaces the whole note in the editor by typing.
+ * @param {import('@playwright/test').Page} page
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function typeNote(page, text) {
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await page.getByTestId('note-editor').locator('.cm-content').click();
+	await page.keyboard.press('ControlOrMeta+A');
+	await page.keyboard.type(text);
+}
+
+test.describe.configure({ timeout: 90_000 });
+
+test('opens a note from the tree, rendered, safe, under the production CSP', async ({ page }) => {
+	const problems = collectBreakage(page);
+	await cloneRepo(page);
+
+	await page.getByTestId('open-copy').click();
+	await expect(page).toHaveURL(/\/repo\/github\.com%2F/);
+	const drawer = page.getByTestId('file-drawer');
+	const files = drawer.getByTestId('tree-file');
+
+	// Folders first, then markdown, then the rest; git's own folder never shows.
+	await expect(drawer.getByTestId('tree-folder')).toHaveText(['▸ notes']);
+	await expect(files).toHaveText(['README.md', 'zzz.md']);
+	await drawer.getByRole('button', { name: 'notes', exact: true }).click();
+	await expect(files.first()).toHaveText('other note.md');
+	await expect(drawer).not.toContainText('.git');
+
+	await drawer.getByRole('link', { name: 'welcome.md' }).click();
+	const preview = page.getByTestId('note-preview');
+	await expect(preview.getByRole('heading', { name: 'Welcome' })).toBeVisible();
+	await expect(preview).not.toContainText('hidden front matter');
+	await expect(preview.locator('input[type="checkbox"]')).toHaveCount(2);
+	await expect(preview.locator('input[type="checkbox"]').first()).toBeChecked();
+	await expect(preview.locator('table td')).toHaveText(['1', '2']);
+
+	// A real image decoded from a real blob URL; a page never becomes one.
+	const image = preview.getByRole('img', { name: 'pixel' });
+	await expect(image).toHaveAttribute('src', /^blob:/);
+	await expect.poll(() => image.evaluate((node) => /** @type {HTMLImageElement} */ (node).naturalWidth)).toBe(1);
+	await expect(preview.getByRole('img', { name: 'broken' })).not.toHaveAttribute('src', /./);
+
+	expect(await page.evaluate(() => Reflect.get(globalThis, 'noteScriptRan'))).toBeUndefined();
+	expect(await preview.innerHTML()).not.toMatch(/onerror|<script/);
+
+	// A relative link opens in the app, with no page load.
+	await page.evaluate(() => Reflect.set(globalThis, 'samePage', true));
+	await preview.getByRole('link', { name: 'other note' }).click();
+	await expect(page.getByTestId('note-path')).toHaveText('notes/other note.md');
+	expect(await page.evaluate(() => Reflect.get(globalThis, 'samePage'))).toBe(true);
+	await page.goBack();
+	await expect(page.getByTestId('note-path')).toHaveText('notes/welcome.md');
+
+	// Non-markdown files.
+	await preview.getByRole('link', { name: 'raw file' }).click();
+	await expect(page.getByTestId('binary-file')).toContainText('5 B');
+	await drawer.getByRole('link', { name: 'raw.txt' }).click();
+	await expect(page.getByTestId('raw-text')).toHaveText('plain text');
+	await drawer.getByRole('button', { name: 'assets', exact: true }).click();
+	await drawer.getByRole('link', { name: 'pixel.png' }).click();
+	await expect.poll(() => page.getByTestId('image-preview').evaluate((node) => /** @type {HTMLImageElement} */ (node).naturalWidth)).toBe(1);
+
+	// The tree's filter.
+	await page.getByTestId('tree-filter').fill('OTHER');
+	await expect(page.getByTestId('tree-file')).toHaveText(['other note.md']);
+	await page.getByTestId('tree-filter').fill('');
+
+	expect(problems).toEqual([]);
+});
+
+test('an edited buffer survives a reload, saves to the working tree only, and can be discarded', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { remote, id } = await cloneRepo(page);
+	const headBefore = await remoteHead(remote);
+
+	await page.goto(noteUrl(id, 'README.md'));
+	await expect(page.getByTestId('note-preview').getByRole('heading', { name: 'Top' })).toBeVisible();
+	await typeNote(page, '# Typed\n\nnever saved');
+
+	const indicator = page.getByTestId('dirty-indicator');
+	await expect(indicator).toHaveText('Unsaved, kept on this device');
+	await expect(page.getByTestId('tree-unsaved')).toHaveCount(1);
+
+	// The reload loses nothing, and comes back ready to keep typing.
+	await page.reload();
+	const content = page.getByTestId('note-editor').locator('.cm-content');
+	await expect(content).toContainText('never saved');
+	await expect(page.getByTestId('draft-restored')).toBeVisible();
+	await expect(indicator).toHaveText('Unsaved, kept on this device');
+
+	// Also from another note and back.
+	await page.getByTestId('file-drawer').getByRole('link', { name: 'zzz.md' }).click();
+	await expect(page.getByTestId('note-preview').getByRole('heading', { name: 'Last' })).toBeVisible();
+	await page.getByTestId('file-drawer').getByRole('link', { name: 'README.md' }).click();
+	await expect(content).toContainText('never saved');
+
+	// Saving with the keyboard writes the file, and leaves no draft to restore.
+	await content.click();
+	await page.keyboard.press('ControlOrMeta+S');
+	await expect(indicator).toHaveText('Saved to the working tree');
+	await expect(page.getByTestId('tree-unsaved')).toHaveCount(0);
+	await page.reload();
+	await expect(page.getByTestId('note-preview').getByRole('heading', { name: 'Typed' })).toBeVisible();
+	await expect(page.getByTestId('draft-restored')).toHaveCount(0);
+
+	// Nothing reached the remote.
+	expect(await remoteHead(remote)).toBe(headBefore);
+
+	// Discard goes back to the file.
+	await typeNote(page, 'throw this away');
+	await expect(indicator).toHaveText('Unsaved, kept on this device');
+	await page.getByTestId('discard-note').click();
+	await page.getByTestId('discard-confirm').click();
+	await expect(content).toContainText('never saved');
+	await page.reload();
+	await expect(page.getByTestId('note-preview')).toContainText('never saved');
+	await expect(page.getByTestId('draft-restored')).toHaveCount(0);
+
+	expect(problems).toEqual([]);
+});
+
+test('split view previews while typing on a wide screen', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id } = await cloneRepo(page);
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto(noteUrl(id, 'notes/welcome.md'));
+	await page.getByRole('button', { name: 'Split' }).click();
+	const preview = page.getByTestId('note-preview');
+	await expect(preview.getByRole('img', { name: 'pixel' })).toHaveAttribute('src', /^blob:/);
+	await expect(page.getByTestId('note-editor')).toBeVisible();
+	await page.getByTestId('note-editor').locator('.cm-content').click();
+	await page.keyboard.press('ControlOrMeta+End');
+	await page.keyboard.type('\n\n## Live heading\n');
+	await expect(preview.getByRole('heading', { name: 'Live heading' })).toBeVisible();
+	await expect(preview.getByRole('img', { name: 'pixel' })).toHaveAttribute('src', /^blob:/);
+	expect(problems).toEqual([]);
+});
+
+test('creates, renames, moves and deletes, with no commit made', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id, remote } = await cloneRepo(page);
+	const headBefore = await remoteHead(remote);
+	await page.goto(noteUrl(id));
+	const drawer = page.getByTestId('file-drawer');
+	await expect(page.getByTestId('no-note')).toBeVisible();
+
+	/**
+	 * @param {string} value
+	 * @returns {Promise<void>}
+	 */
+	const answer = async (value) => {
+		await page.getByTestId('dialog-path').fill(value);
+		await page.getByTestId('dialog-confirm').click();
+	};
+
+	// A new note opens ready to type in.
+	await page.getByTestId('new-note').click();
+	await answer('ideas/first idea');
+	await expect(page.getByTestId('note-path')).toHaveText('ideas/first idea.md');
+	await expect(page.getByTestId('note-editor')).toBeVisible();
+	await page.getByTestId('note-editor').locator('.cm-content').click();
+	await page.keyboard.type('# First idea');
+	await page.getByTestId('save-note').click();
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Saved to the working tree');
+
+	// It never overwrites an existing file, and git's folder is out of reach.
+	await page.getByTestId('new-note').click();
+	await answer('README.md');
+	await expect(page.getByTestId('dialog-error')).toContainText('already exists');
+	await answer('.git/evil');
+	await expect(page.getByTestId('dialog-error')).toContainText('not a valid file path');
+	await page.getByRole('button', { name: 'Cancel' }).click();
+
+	// A new folder shows through its placeholder.
+	await page.getByTestId('new-folder').click();
+	await answer('archive');
+	await expect(drawer.getByRole('button', { name: 'archive', exact: true })).toBeVisible();
+
+	// Move the open note; the page follows it.
+	await drawer.getByRole('button', { name: 'Actions for first idea.md' }).click();
+	await drawer.getByRole('button', { name: 'Rename or move' }).click();
+	await answer('archive/moved.md');
+	await expect(page.getByTestId('note-path')).toHaveText('archive/moved.md');
+	await expect(page.getByTestId('note-preview').getByRole('heading', { name: 'First idea' })).toBeVisible();
+
+	// Rename a folder; the open note inside it follows.
+	await drawer.getByRole('button', { name: 'Actions for archive' }).click();
+	await drawer.getByRole('button', { name: 'Rename or move' }).click();
+	await answer('old');
+	await expect(page.getByTestId('note-path')).toHaveText('old/moved.md');
+
+	// Delete warns about unsaved text in the folder, then closes the note.
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await page.getByTestId('note-editor').locator('.cm-content').click();
+	await page.keyboard.type('unsaved words ');
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+	await drawer.getByRole('button', { name: 'Actions for old' }).click();
+	await drawer.getByRole('button', { name: 'Delete' }).click();
+	await expect(page.getByTestId('delete-unsaved')).toContainText('1 unsaved note');
+	await page.getByTestId('dialog-confirm').click();
+	await expect(page.getByTestId('no-note')).toBeVisible();
+	await expect(drawer.getByRole('button', { name: 'old', exact: true })).toHaveCount(0);
+
+	// All of that survives a reload, as working-tree state.
+	await page.reload();
+	await expect(drawer.getByTestId('tree-file').first()).toBeVisible();
+	await expect(drawer.getByRole('button', { name: 'old', exact: true })).toHaveCount(0);
+	await expect(page.getByTestId('tree-unsaved')).toHaveCount(0);
+
+	// A link to a note not there yet offers to create it.
+	await page.goto(noteUrl(id, 'later/soon.md'));
+	await page.getByRole('button', { name: 'Create this note' }).click();
+	await expect(page.getByTestId('note-editor')).toBeVisible();
+	await expect(drawer.getByRole('link', { name: 'soon.md' })).toBeVisible();
+
+	expect(await remoteHead(remote)).toBe(headBefore);
+	expect(problems).toEqual([]);
+});
+
+test('adds images by picking and pasting, and searches note text', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id } = await cloneRepo(page);
+	await page.setViewportSize({ width: 1280, height: 800 });
+	await page.goto(noteUrl(id, 'notes/other note.md'));
+	await page.getByRole('button', { name: 'Split' }).click();
+	const preview = page.getByTestId('note-preview');
+
+	await page.getByTestId('image-picker').setInputFiles({ name: 'my cat.png', mimeType: 'image/png', buffer: PIXEL });
+	const content = page.getByTestId('note-editor').locator('.cm-content');
+	await expect(content).toContainText('![my-cat](./assets/my-cat.png)');
+	const picked = preview.getByRole('img', { name: 'my-cat' });
+	await expect.poll(() => picked.evaluate((node) => /** @type {HTMLImageElement} */ (node).naturalWidth)).toBe(1);
+	await page.getByTestId('file-drawer').getByRole('button', { name: 'assets', exact: true }).click();
+	await expect(page.getByTestId('file-drawer').getByRole('link', { name: 'my-cat.png' })).toBeVisible();
+
+	// A paste, the way the browser delivers one.
+	await content.click();
+	await content.evaluate((node, base64) => {
+		const bytes = Uint8Array.from(atob(base64), (char) => char.charCodeAt(0));
+		const data = new DataTransfer();
+		data.items.add(new File([bytes], 'image.png', { type: 'image/png' }));
+		node.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+	}, PIXEL.toString('base64'));
+	await expect(content).toContainText(/!\[pasted-\d{14}\]\(\.\/assets\/pasted-\d{14}\.png\)/);
+	await expect(preview.getByRole('img', { name: /^pasted-/ })).toHaveAttribute('src', /^blob:/);
+
+	// A type outside the allowlist is refused, with a reason.
+	await page.getByTestId('image-picker').setInputFiles({ name: 'page.html', mimeType: 'text/html', buffer: Buffer.from('<script></script>') });
+	await expect(page.getByTestId('workspace-report')).toContainText('Only PNG');
+
+	// Search reads the working tree's markdown.
+	await page.getByTestId('note-search').fill('NEEDLE');
+	await page.getByTestId('note-search-button').click();
+	const hit = page.getByTestId('search-hit');
+	await expect(hit).toHaveCount(1);
+	await expect(hit).toContainText('notes/other note.md:3');
+	await page.getByTestId('note-search').fill('no such words anywhere');
+	await page.getByTestId('note-search-button').click();
+	await expect(page.getByTestId('search-results')).toContainText('Nothing found');
+
+	expect(problems).toEqual([]);
+});
+
+test.describe('on a phone', () => {
+	test.use({ viewport: { width: 390, height: 844 }, hasTouch: true, isMobile: true });
+
+	test('the file list is a drawer, and notes fill the screen', async ({ page }) => {
+		const problems = collectBreakage(page);
+		const { id } = await cloneRepo(page);
+
+		// With no note open, the list is what there is to see.
+		await page.goto(noteUrl(id));
+		const drawer = page.getByTestId('file-drawer');
+		const toggle = page.getByTestId('drawer-toggle');
+		await expect(drawer).toBeVisible();
+		await expect(toggle).toHaveAttribute('aria-expanded', 'true');
+
+		// Picking a file closes it.
+		await drawer.getByRole('link', { name: 'README.md' }).tap();
+		await expect(drawer).toBeHidden();
+		await expect(page.getByTestId('note-preview').getByRole('heading', { name: 'Top' })).toBeVisible();
+		const article = await page.getByTestId('note-preview').boundingBox();
+		expect(article?.width).toBeGreaterThan(300);
+
+		// Open it again: it floats over the note, and the backdrop closes it.
+		await toggle.tap();
+		await expect(drawer).toBeVisible();
+		const box = await drawer.boundingBox();
+		expect(box?.x).toBe(0);
+		expect(box?.width).toBeLessThan(390);
+		await page.getByTestId('drawer-backdrop').tap({ position: { x: 380, y: 400 } });
+		await expect(drawer).toBeHidden();
+
+		// No sideways scroll, and split view is not on offer.
+		expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(true);
+		await expect(page.getByRole('button', { name: 'Split' })).toBeHidden();
+
+		// The editor works by touch, and its buffer survives a reload here too.
+		await page.getByRole('button', { name: 'Edit', exact: true }).tap();
+		const content = page.getByTestId('note-editor').locator('.cm-content');
+		await content.tap();
+		await page.keyboard.type('typed on a phone ');
+		await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+		await page.reload();
+		await expect(content).toContainText('typed on a phone');
+		expect(problems).toEqual([]);
+	});
+});
+
+test('runs the editor and blob images under the policy, and a deep link boots on the static server', async ({ page }) => {
+	const { id } = await cloneRepo(page);
+	await page.addInitScript(() => {
+		/** @type {string[]} */
+		const violations = [];
+		Object.assign(globalThis, { cspViolations: violations });
+		document.addEventListener('securitypolicyviolation', (event) => {
+			violations.push(`${event.effectiveDirective}: ${event.blockedURI || 'inline'}`);
+		});
+	});
+	const violations = () => page.evaluate(() => /** @type {string[]} */ (Reflect.get(globalThis, 'cspViolations')));
+
+	await page.goto(noteUrl(id, 'notes/welcome.md'));
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await expect(page.getByTestId('note-editor').locator('.cm-content')).toBeVisible();
+	await page.getByRole('button', { name: 'Read', exact: true }).click();
+	await expect(page.getByTestId('note-preview').getByRole('img', { name: 'pixel' })).toHaveAttribute('src', /^blob:/);
+	expect(await violations()).toEqual([]);
+
+	// Another origin has its own empty storage, so the repo is not there. The
+	// deep link's encoded id must still reach the client router as one segment.
+	await page.goto(`http://127.0.0.1:${STATIC_SHELL_PORT}${noteUrl(id, 'notes/welcome.md')}`, { waitUntil: 'networkidle' });
+	await expect(page.getByTestId('repo-not-here')).toBeVisible();
+	expect(await violations()).toEqual([]);
+});
+
+test('deleting a copy warns about unsaved text and removes it from the device', async ({ page }) => {
+	const { fullName, id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'README.md'));
+	await typeNote(page, 'unsaved private words');
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+
+	await page.getByRole('link', { name: 'Repositories' }).click();
+	const copy = page.getByTestId('local-copy');
+	await expect(copy).toContainText(fullName);
+	await copy.getByRole('button', { name: 'Delete from this device' }).click();
+	await expect(page.getByTestId('remove-copy')).toContainText('1 unsaved note');
+	await page.getByRole('button', { name: 'Delete this copy' }).click();
+	await expect(page.getByTestId('local-copy')).toHaveCount(0);
+
+	const stored = await page.evaluate(
+		(databaseName) =>
+			new Promise((resolve, reject) => {
+				const open = indexedDB.open(databaseName);
+				open.onerror = () => reject(open.error);
+				open.onsuccess = () => {
+					const all = open.result.transaction('drafts').objectStore('drafts').getAll();
+					all.onerror = () => reject(all.error);
+					all.onsuccess = () => {
+						open.result.close();
+						resolve(all.result);
+					};
+				};
+			}),
+		'gitnote-drafts'
+	);
+	expect(stored).toEqual([]);
+
+	await page.goto(noteUrl(id, 'README.md'));
+	await expect(page.getByTestId('repo-not-here')).toBeVisible();
+});
