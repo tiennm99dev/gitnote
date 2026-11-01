@@ -6,7 +6,10 @@ import { fileURLToPath } from 'node:url';
 /** Port of the plain static server the browser tests load the built shell from. */
 export const STATIC_SHELL_PORT = 4174;
 
-const BUILD_DIR = fileURLToPath(new URL('../build/', import.meta.url));
+/** Where the browser tests build to, under `app/`. It is never deployed. */
+export const E2E_BUILD_DIR = 'build-e2e';
+
+const BUILD_DIR = fileURLToPath(new URL(`../${E2E_BUILD_DIR}/`, import.meta.url));
 
 /** @type {Record<string, string>} */
 const CONTENT_TYPES = {

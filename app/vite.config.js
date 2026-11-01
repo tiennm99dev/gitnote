@@ -6,6 +6,8 @@ import { defineConfig } from 'vitest/config';
 // `wrangler dev` in relay/ listens here; `npm run dev` forwards /api to it.
 const RELAY_DEV_URL = 'http://localhost:8787';
 
+const BUILD_DIR = process.env.GITNOTE_BUILD_DIR || 'build';
+
 export default defineConfig({
 	plugins: [
 		tailwindcss(),
@@ -17,7 +19,8 @@ export default defineConfig({
 			},
 			// One SPA build serves both the web and the Capacitor shell: every
 			// unknown path falls back to index.html and the client router takes over.
-			adapter: adapter({ fallback: 'index.html' }),
+			// The Worker deploys `build`, so a test build with fixture IDs goes elsewhere.
+			adapter: adapter({ fallback: 'index.html', pages: BUILD_DIR, assets: BUILD_DIR }),
 			// Content Security Policy for the SPA shell. SvelteKit writes it into the
 			// built index.html as a `<meta http-equiv>` tag, so it also applies inside
 			// the Capacitor WebView, where no server sends headers. SvelteKit boots

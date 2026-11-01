@@ -1,6 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
-import { STATIC_SHELL_PORT } from './static-server.js';
+import { E2E_BUILD_DIR, STATIC_SHELL_PORT } from './static-server.js';
 
 /**
  * Collects uncaught page errors, console errors and failed network responses
@@ -79,7 +79,7 @@ test('ships a strict Content Security Policy in the built shell', async () => {
 	// gets no response headers, and Static Assets serve the file as built. (The
 	// preview server renders the shell on request and sends the same policy as a
 	// header, which the browser tests above run under.)
-	const html = await readFile(new URL('../build/index.html', import.meta.url), 'utf8');
+	const html = await readFile(new URL(`../${E2E_BUILD_DIR}/index.html`, import.meta.url), 'utf8');
 	const policy = /<meta http-equiv="content-security-policy" content="([^"]+)"/.exec(html)?.[1];
 	expect(policy).toBeTruthy();
 	const directives = Object.fromEntries(

@@ -1,7 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 import { artifactPolicy } from './e2e/artifact-policy.js';
 import { E2E_RELAY_PORT } from './e2e/git-engine-ports.js';
-import { STATIC_SHELL_PORT } from './e2e/static-server.js';
+import { E2E_BUILD_DIR, STATIC_SHELL_PORT } from './e2e/static-server.js';
 
 const PORT = 4173;
 
@@ -27,8 +27,10 @@ export default defineConfig({
 			command: `npm run build && npm run preview -- --port ${PORT} --strictPort`,
 			url: `http://localhost:${PORT}`,
 			// Fixture IDs that turn the sign-in buttons on. The tests stand in for
-			// the providers' sign-in pages, so nothing reaches GitHub or GitLab.
+			// the providers' sign-in pages, so nothing reaches GitHub or GitLab. They
+			// stay out of `build`, which is the directory the Worker deploys.
 			env: {
+				GITNOTE_BUILD_DIR: E2E_BUILD_DIR,
 				VITE_GITHUB_CLIENT_ID: 'e2e-github-client',
 				VITE_GITHUB_APP_SLUG: 'gitnote-e2e',
 				VITE_GITLAB_CLIENT_ID: 'e2e-gitlab-client'
