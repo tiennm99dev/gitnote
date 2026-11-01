@@ -1,5 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
 import { artifactPolicy } from './e2e/artifact-policy.js';
+import { E2E_RELAY_PORT } from './e2e/git-engine-ports.js';
 import { STATIC_SHELL_PORT } from './e2e/static-server.js';
 
 const PORT = 4173;
@@ -37,6 +38,15 @@ export default defineConfig({
 			command: 'node e2e/static-server.js',
 			url: `http://127.0.0.1:${STATIC_SHELL_PORT}`,
 			reuseExistingServer: false,
+			timeout: 120_000
+		},
+		{
+			// The git engine's test page, on the real relay in front of a local git
+			// server. SIGTERM lets it stop workerd and remove its temp files.
+			command: 'node e2e/git-engine-server.js',
+			url: `http://127.0.0.1:${E2E_RELAY_PORT}/api/health`,
+			reuseExistingServer: false,
+			gracefulShutdown: { signal: 'SIGTERM', timeout: 5_000 },
 			timeout: 120_000
 		}
 	]
