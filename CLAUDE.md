@@ -11,7 +11,8 @@ tooling notes: [README.md](README.md).
   Add `npm run e2e` when touching routes, layout, build config or anything the
   browser loads.
 - Fixed ports with `strictPort`: dev 5173, preview 4173, e2e static shell 4174,
-  `wrangler dev` 8787.
+  `wrangler dev` 8787, app unit tests 8175 (git) and 8788 (relay), browser
+  tests 8176 (git) and 8789 (relay).
   If a port is busy, stop the stale server instead of picking another port.
   `npm run e2e` builds and serves its own preview on 4173, so stop any
   running preview first.

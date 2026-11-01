@@ -30,11 +30,14 @@ Run from the repo root:
 | `npm run dev:relay` | `wrangler dev` for the relay on port 8787 |
 | `npm run lint` | ESLint (with `eslint-plugin-jsdoc` and `eslint-plugin-svelte`), zero warnings |
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
-| `npm test` | Vitest in both workspaces; relay tests run inside workerd |
+| `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174 |
+| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, plus the git engine on LightningFS through the relay on port 8789 |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
+
+`npm test` and `npm run e2e` need native `git` on the `PATH`, with its
+`http-backend` command.
 
 Playwright needs a browser once: `npx playwright install chromium`. To use a
 system Chromium instead, set `CHROMIUM_PATH`, for example
@@ -97,6 +100,42 @@ GITHUB_CLIENT_SECRET=<GitHub App client secret>
 
 In production, set the credentials with `wrangler secret put GITHUB_CLIENT_ID`
 and `wrangler secret put GITHUB_CLIENT_SECRET`.
+
+## Git engine
+
+`app/src/lib/git/` clones, reads, writes, commits, pulls and pushes a repo on
+the device, with no UI. `createRepo` in `repo.js` takes the file system as a
+parameter: LightningFS in the browser (`fs.js`), `memfs` in unit tests.
+
+- **Shallow only once.** The clone uses `depth: 1`; later fetches pass no
+  depth, because a depth-limited fetch leaves a diverged branch with no merge
+  base.
+- **Pull** runs only on a clean tree. A conflict is a result, not an error:
+  the working tree gets diff3 markers, the index the unmerged entries, and the
+  branch does not move. isomorphic-git writes no `MERGE_HEAD`, so the merge is
+  stored in `gitnote-merge.json` in the git directory, where a reload finds it.
+  A binary file keeps our bytes, and lands in `binaryPaths` for an ours/theirs
+  choice. Files that are not valid UTF-8 count as binary, because a line merge
+  would damage them.
+- **Size limits** are a table in `limits.js`, checked before any network call:
+
+  | Check | GitHub | GitLab.com |
+  | --- | --- | --- |
+  | Warn per file | over 50 MB | over 50 MB |
+  | Block per file | over 100 MiB | over 95 MB (relay cap) |
+  | Block per push | over 95 MB (relay cap) | over 95 MB (relay cap) |
+
+  The push size is an estimate: the summed size of the blobs the unpushed
+  commits add.
+- **Writes** go through `writeFile`, which swaps in a new file. isomorphic-git
+  judges a file unchanged by size, whole-second mtime and inode, so writing in
+  place could hide a same-size edit.
+- **Durability and locks.** Every operation holds a per-repo Web Lock, and one
+  that changes data flushes LightningFS's superblock before it resolves, so a
+  commit survives the tab closing right after.
+
+Failures are `GitEngineError`s with a stable `code` and a readable message
+(`errors.js`).
 
 ## Tooling notes
 
