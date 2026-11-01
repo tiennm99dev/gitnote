@@ -1,0 +1,113 @@
+name: Android
+
+# A tag builds the signed APK and attaches it to its release. A push that touches
+# the Android project builds an unsigned one, with no secrets, so a broken Gradle
+# project shows up before the next tag.
+on:
+  push:
+    tags: ['v*']
+    branches: [main]
+    # GitHub does not apply path filters to tags.
+    paths:
+      - android/**
+      - capacitor.config.json
+      - package-lock.json
+      - .github/actions/android-setup/**
+      - .github/workflows/android.yml
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    if: github.repository == 'tiennm99dev/gitnote' && github.ref_type == 'branch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up the Android build
+        uses: ./.github/actions/android-setup
+
+      - name: Build an unsigned APK
+        working-directory: android
+        run: ./gradlew assembleDebug --no-daemon
+
+  release:
+    if: github.repository == 'tiennm99dev/gitnote' && github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    env:
+      KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+      TAG: ${{ github.ref_name }}
+    steps:
+      - name: Require the signing secrets
+        run: |
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_ALIAS KEY_PASSWORD; do
+            if [ -z "${!name}" ]; then
+              echo "::error::The secret ANDROID_$name is not set. See docs/android.md."
+              exit 1
+            fi
+          done
+
+      - name: Warn about missing sign-in IDs
+        env:
+          CLIENT_ID_GITHUB: ${{ vars.VITE_GITHUB_CLIENT_ID }}
+          CLIENT_ID_GITLAB: ${{ vars.VITE_GITLAB_CLIENT_ID }}
+        run: |
+          [ -n "$CLIENT_ID_GITHUB" ] || echo "::warning::VITE_GITHUB_CLIENT_ID is not set, so this APK has no GitHub sign-in button."
+          [ -n "$CLIENT_ID_GITLAB" ] || echo "::warning::VITE_GITLAB_CLIENT_ID is not set, so this APK has no GitLab sign-in button."
+
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up the Android build
+        uses: ./.github/actions/android-setup
+        with:
+          github-client-id: ${{ vars.VITE_GITHUB_CLIENT_ID }}
+          github-app-slug: ${{ vars.VITE_GITHUB_APP_SLUG }}
+          gitlab-client-id: ${{ vars.VITE_GITLAB_CLIENT_ID }}
+
+      - name: Decode the keystore
+        run: |
+          umask 077
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release.jks"
+
+      - name: Build and sign the APK
+        env:
+          GITNOTE_VERSION_CODE: ${{ github.run_number }}
+        run: |
+          export GITNOTE_VERSION_NAME="${TAG#v}"
+          npx cap build android \
+            --androidreleasetype APK \
+            --signing-type apksigner \
+            --keystorepath "$RUNNER_TEMP/release.jks" \
+            --keystorepass "$KEYSTORE_PASSWORD" \
+            --keystorealias "$KEY_ALIAS" \
+            --keystorealiaspass "$KEY_PASSWORD"
+
+      - name: Verify the signature
+        run: |
+          apk="$(find android/app -name app-release-signed.apk -print -quit)"
+          apksigner verify --print-certs --verbose "$apk" | tee "$RUNNER_TEMP/verify.txt"
+          grep -Eq 'Verified using v[23] scheme .*: true' "$RUNNER_TEMP/verify.txt"
+          cp "$apk" "$RUNNER_TEMP/gitnote-$TAG.apk"
+
+      - name: Attach the APK to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file="$RUNNER_TEMP/gitnote-$TAG.apk"
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            gh release upload "$TAG" "$file" --clobber
+          else
+            flags=()
+            case "$TAG" in *-*) flags+=(--prerelease) ;; esac
+            gh release create "$TAG" "$file" --title "$TAG" --generate-notes "${flags[@]}"
+          fi

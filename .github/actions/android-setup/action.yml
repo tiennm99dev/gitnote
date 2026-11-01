@@ -1,0 +1,59 @@
+name: Set up the Android build
+description: Installs Node, JDK 21, the Android SDK and the npm dependencies, then builds the native web bundle and copies it into the Android project.
+
+inputs:
+  github-client-id:
+    description: The GitHub App's client ID; blank leaves its sign-in button off
+    required: false
+    default: ''
+  github-app-slug:
+    description: The GitHub App's URL name
+    required: false
+    default: ''
+  gitlab-client-id:
+    description: The gitlab.com application ID; blank leaves its sign-in button off
+    required: false
+    default: ''
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node
+      uses: actions/setup-node@v7
+      with:
+        node-version-file: .nvmrc
+        cache: npm
+
+    - name: Setup JDK
+      uses: actions/setup-java@v6
+      with:
+        distribution: temurin
+        java-version: '21'
+        cache: gradle
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v4
+      with:
+        log-accepted-android-sdk-licenses: false
+        packages: platform-tools platforms;android-36 build-tools;36.0.0
+
+    # `cap build` calls apksigner by name, and the SDK setup does not add build-tools.
+    - name: Put build-tools on the PATH
+      shell: bash
+      run: echo "$ANDROID_HOME/build-tools/36.0.0" >> "$GITHUB_PATH"
+
+    - name: Install dependencies
+      shell: bash
+      run: npm ci
+
+    - name: Build the native web bundle
+      shell: bash
+      run: npm run build:native -w app
+      env:
+        VITE_GITHUB_CLIENT_ID: ${{ inputs.github-client-id }}
+        VITE_GITHUB_APP_SLUG: ${{ inputs.github-app-slug }}
+        VITE_GITLAB_CLIENT_ID: ${{ inputs.gitlab-client-id }}
+
+    - name: Copy it into the Android project
+      shell: bash
+      run: npx cap sync android
