@@ -13,7 +13,7 @@ Status: early development. Nothing works end to end yet.
 | Path | What it is |
 | --- | --- |
 | `app/` | SvelteKit single-page app (Svelte 5, Vite, Tailwind 4), built with adapter-static |
-| `relay/` | Hono Worker on Cloudflare Workers for the `/api/*` routes; so far only `GET /api/health` |
+| `relay/` | Hono Worker on Cloudflare Workers: serves the SPA through Static Assets and answers `/api/*` (see [Relay](#relay)) |
 
 ## Requirements
 
@@ -39,6 +39,54 @@ For local work, run `npm run dev:relay` and `npm run dev` side by side.
 Playwright needs a browser once: `npx playwright install chromium`. To use a
 system Chromium instead, set `CHROMIUM_PATH`, for example
 `CHROMIUM_PATH=/usr/bin/chromium npm run e2e`.
+
+## Relay
+
+The Worker keeps nothing about users: no storage bindings, and Workers Logs,
+traces and Logpush stay off (`relay/wrangler.jsonc`). Only `/api/*` runs the
+Worker; every other path is a static asset, with unknown paths falling back to
+`index.html`.
+
+| Route | Does |
+| --- | --- |
+| `GET /api/health` | Liveness probe |
+| `GET /api/git/<host>/<repo path>.git/info/refs?service=git-upload-pack` (or `git-receive-pack`) | Git smart-HTTP ref discovery |
+| `POST /api/git/<host>/<repo path>.git/git-upload-pack` and `.../git-receive-pack` | Fetch and push; needs `Content-Length`, at most 95 MB (413 above it) |
+| `POST /api/oauth/github/token` | GitHub App code exchange: JSON `{ code, code_verifier?, redirect_uri? }` |
+| `POST /api/oauth/github/refresh` | GitHub App token refresh: JSON `{ refresh_token }` |
+
+- **Git hosts** come from the `GIT_HOSTS` var: `github.com,gitlab.com` over
+  https. Loopback entries such as `localhost:8174` use http, for local test
+  servers only. Other hosts, paths, methods and content types answer 403.
+- **Headers.** Only `Authorization`, `Content-Type`, `Accept`, `Git-Protocol`
+  and `User-Agent` go upstream, and a `User-Agent` that does not start with
+  `git/` becomes `git/gitnote-relay`. Redirects are never followed: an
+  upstream 3xx (a renamed repo) comes back as a JSON 502 `repo_moved`.
+- **Origins.** `/api/*` answers the Worker's own origin and the origins in
+  `CORS_ORIGINS` (`https://localhost`, the Capacitor WebView, which also gets
+  CORS headers). Requests without `Origin` pass unless `Sec-Fetch-Site` says
+  another site sent them. This stops browsers only; non-browser clients are
+  bounded by the host allowlist and the rate limits.
+- **Rate limits** per client IP (`cf-connecting-ip`): 300 requests a minute on
+  `/api/*`, 10 on `/api/oauth/*`. They are per Cloudflare location and
+  approximate.
+- **Errors** are JSON: `{ "error": "<code>", "message": "..." }`.
+- **Security headers** for the SPA live in `app/static/_headers`, because
+  asset responses skip the Worker. The Content Security Policy is generated
+  by SvelteKit (`csp` in `app/vite.config.js`) as a `<meta>` tag in the built
+  `index.html`, so it also applies inside Capacitor.
+
+For local work, `relay/.dev.vars` (gitignored) can extend the vars and hold
+the GitHub App credentials, for example:
+
+```sh
+GIT_HOSTS=github.com,gitlab.com,localhost:8174
+GITHUB_CLIENT_ID=<GitHub App client ID>
+GITHUB_CLIENT_SECRET=<GitHub App client secret>
+```
+
+In production, set the credentials with `wrangler secret put GITHUB_CLIENT_ID`
+and `wrangler secret put GITHUB_CLIENT_SECRET`.
 
 ## Tooling notes
 
