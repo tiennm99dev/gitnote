@@ -1,5 +1,5 @@
 import git from 'isomorphic-git';
-import { chmod, symlink, writeFile } from 'node:fs/promises';
+import { chmod, symlink, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 import { memfs } from 'memfs';
 import { describe, expect, it, vi } from 'vitest';
@@ -2001,6 +2001,42 @@ describe('discardChanges', () => {
 		expect((await repo.status()).clean).toBe(true);
 	});
 
+	describe('a file restored over a folder', () => {
+		/**
+		 * A committed file moved away, with a new folder of new notes in its place.
+		 * @returns {ReturnType<typeof clonedRepo>}
+		 */
+		async function replacedByFolder() {
+			const context = await clonedRepo({ a: 'committed\n' });
+			await context.repo.rename('a', 'b');
+			await context.repo.writeFile('a/keep.md', 'precious\n');
+			return context;
+		}
+
+		it('refuses, naming the unselected file, and changes nothing', async () => {
+			const { repo } = await replacedByFolder();
+			const before = (await repo.status()).files;
+			const refused = await rejection(repo.discardChanges(['a']));
+			expect(refused.code).toBe(ErrorCode.PATH_EXISTS);
+			expect(refused.message).toContain('a/keep.md');
+			expect(await repo.readText('a/keep.md')).toBe('precious\n');
+			expect((await repo.status()).files).toEqual(before);
+		});
+
+		it('refuses before discarding any other selected path', async () => {
+			const { repo } = await replacedByFolder();
+			await rejection(repo.discardChanges(['b', 'a']));
+			expect(await repo.readText('b')).toBe('committed\n');
+		});
+
+		it('goes ahead once the folder\'s files are selected too', async () => {
+			const { repo } = await replacedByFolder();
+			await repo.discardChanges(['a', 'a/keep.md', 'b']);
+			expect(await repo.readText('a')).toBe('committed\n');
+			expect((await repo.status()).clean).toBe(true);
+		});
+	});
+
 	it('skips paths with no changes, and refuses a path outside the tree', async () => {
 		const { repo } = await clonedRepo();
 		expect(await repo.discardChanges(['README.md'])).toEqual([]);
@@ -2020,6 +2056,22 @@ describe('readCommitted', () => {
 		await repo.writeFile('new.md', 'new\n');
 		expect(new TextDecoder().decode(/** @type {Uint8Array} */ (await repo.readCommitted('a.md')))).toBe('a\n');
 		expect(await repo.readCommitted('new.md')).toBeNull();
+	});
+});
+
+describe('a remote branch that has gone', () => {
+	it('fails a pull with its own code and a sentence naming the branch, after a rename on the host', async () => {
+		const { repo, remote } = await clonedRepo();
+		await runGit(['branch', '-m', 'main', 'trunk'], remote.bare);
+		const refused = await rejection(repo.pull({ author: AUTHOR }));
+		expect(refused.code).toBe(ErrorCode.BRANCH_NOT_FOUND);
+		expect(refused.message).toContain('main is no longer on the remote');
+	});
+
+	it('says the same when the remote has no branches left at all', async () => {
+		const { repo, remote } = await clonedRepo();
+		await runGit(['update-ref', '-d', 'refs/heads/main'], remote.bare);
+		expect((await rejection(repo.pull({ author: AUTHOR }))).code).toBe(ErrorCode.BRANCH_NOT_FOUND);
 	});
 });
 
@@ -2064,6 +2116,114 @@ describe('describeConflicts', () => {
 		expect(await repo.describeConflicts()).toEqual([{ path: 'gone.md', kind: 'deleted_by_theirs', binary: false, hasMarkers: false, undecided: true }]);
 		await repo.resolveConflict({ path: 'gone.md', side: 'theirs' });
 		expect((await repo.describeConflicts())[0]?.undecided).toBe(false);
+	});
+});
+
+describe('a conflict on a symbolic link', () => {
+	/**
+	 * A clone of a repo holding `link.md`, a link to `target.md`.
+	 * @returns {ReturnType<typeof clonedRepo>}
+	 */
+	async function linkedRepo() {
+		const remote = await createRemote({ 'target.md': 'text\n' });
+		await changeElsewhere(remote, {}, async (work) => {
+			await symlink('target.md', path.join(work, 'link.md'));
+			await runGit(['add', 'link.md'], work);
+		});
+		const fs = /** @type {FsClient} */ (/** @type {unknown} */ (memfs().fs));
+		const repo = openRepo(remote, { fs });
+		await repo.clone({ url: remote.url });
+		return { remote, repo, fs };
+	}
+
+	/**
+	 * @param {import('../../../test/remote-repo.js').Remote} remote
+	 * @param {string} target
+	 * @returns {Promise<void>}
+	 */
+	const retargetElsewhere = (remote, target) =>
+		changeElsewhere(remote, {}, async (work) => {
+			await unlink(path.join(work, 'link.md'));
+			await symlink(target, path.join(work, 'link.md'));
+			await runGit(['add', 'link.md'], work);
+		});
+
+	it('takes a side, not markers, when we made it a file and the remote retargeted it', async () => {
+		for (const [side, mode, content] of /** @type {const} */ ([
+			['ours', /^100644 /, 'mine\n'],
+			['theirs', /^120000 /, 'theirs.md']
+		])) {
+			const { remote, repo } = await linkedRepo();
+			await repo.remove('link.md');
+			await repo.writeFile('link.md', 'mine\n');
+			await repo.commit({ paths: ['link.md'], message: 'mine', author: AUTHOR });
+			await retargetElsewhere(remote, 'theirs.md');
+
+			expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+			expect(await repo.describeConflicts()).toEqual([{ path: 'link.md', kind: 'both_modified', binary: true, hasMarkers: false, undecided: true }]);
+			expect((await rejection(repo.completeMerge({ author: AUTHOR }))).code).toBe(ErrorCode.CONFLICTS_UNRESOLVED);
+
+			await repo.resolveConflict({ path: 'link.md', side });
+			await repo.completeMerge({ author: AUTHOR });
+			await repo.push();
+			expect(await runGit(['ls-tree', 'main', 'link.md'], remote.bare)).toMatch(mode);
+			expect(await showRemote(remote, 'main:link.md')).toBe(content);
+		}
+	});
+
+	it('reads a link with no target when we deleted it and the remote retargeted it', async () => {
+		const { remote, repo } = await linkedRepo();
+		await repo.remove('link.md');
+		await repo.commit({ paths: ['link.md'], message: 'drop', author: AUTHOR });
+		await retargetElsewhere(remote, 'nowhere.md');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+		expect(await repo.describeConflicts()).toEqual([{ path: 'link.md', kind: 'deleted_by_us', binary: expect.any(Boolean), hasMarkers: false, undecided: true }]);
+
+		await repo.resolveConflict({ path: 'link.md', side: 'ours' });
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+		expect(await runGit(['ls-tree', 'main', 'link.md'], remote.bare)).toBe('');
+	});
+
+	it('can be abandoned', async () => {
+		const { remote, repo } = await linkedRepo();
+		await repo.remove('link.md');
+		await repo.commit({ paths: ['link.md'], message: 'drop', author: AUTHOR });
+		await retargetElsewhere(remote, 'nowhere.md');
+		await repo.pull({ author: AUTHOR });
+		await repo.abortMerge();
+		expect((await repo.status()).clean).toBe(true);
+	});
+});
+
+describe('resolveConflict', () => {
+	it('keeps an executable file executable', async () => {
+		const remote = await createRemote({ 'run.sh': 'base\n' });
+		await changeElsewhere(remote, {}, async (work) => {
+			await chmod(path.join(work, 'run.sh'), 0o755);
+			await runGit(['add', 'run.sh'], work);
+		});
+		const repo = openRepo(remote);
+		await repo.clone({ url: remote.url });
+		await repo.remove('run.sh');
+		await repo.commit({ paths: ['run.sh'], message: 'drop', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'run.sh': 'theirs\n' }, 'theirs');
+		await repo.pull({ author: AUTHOR });
+		await repo.resolveConflict({ path: 'run.sh', side: 'theirs' });
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+		expect(await runGit(['ls-tree', 'main', 'run.sh'], remote.bare)).toMatch(/^100755 /);
+	});
+
+	it('refuses to delete a folder of new files standing where the file goes', async () => {
+		const { repo } = await conflictedRepo();
+		await repo.remove('clash.md');
+		await repo.writeFile('clash.md/keep.md', 'precious\n');
+		const refused = await rejection(repo.resolveConflict({ path: 'clash.md', side: 'theirs' }));
+		expect(refused.code).toBe(ErrorCode.PATH_EXISTS);
+		expect(refused.message).toContain('clash.md/keep.md');
+		expect(await repo.readText('clash.md/keep.md')).toBe('precious\n');
 	});
 });
 

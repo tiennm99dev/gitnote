@@ -492,6 +492,34 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
+	 * @param {string} path
+	 * @returns {Promise<string[]>} the path if it is a file or link, or every file in the folder it names
+	 */
+	const filesAt = async (path) => {
+		const stat = await lstatOrNull(abs(path));
+		if (!stat) return [];
+		if (!stat.isDirectory()) return [path];
+		const files = [];
+		for (const name of /** @type {string[]} */ (await fs.promises.readdir(abs(path)))) files.push(...(await filesAt(`${path}/${name}`)));
+		return files;
+	};
+
+	/**
+	 * Refuses before writing a committed file over a folder holding files nobody
+	 * chose to lose. Such a file can be new, and then git has no other copy of it.
+	 * @param {string} path the path about to be replaced
+	 * @param {Set<string>} chosen files the user already chose to throw away
+	 * @param {string} action what is being done, for the message
+	 * @returns {Promise<void>}
+	 */
+	const assertFolderSpared = async (path, chosen, action) => {
+		const lost = (await filesAt(path)).filter((file) => file !== path && !chosen.has(file));
+		if (lost.length > 0) {
+			throw new GitEngineError(ErrorCode.PATH_EXISTS, `${action} ${path} would delete ${lost.join(', ')}. Move ${lost.length === 1 ? 'that file' : 'those files'} somewhere else first.`, { detail: { files: lost } });
+		}
+	};
+
+	/**
 	 * Removes a path and the folders that leaves empty; git has no empty folders.
 	 * @param {string} path
 	 * @returns {Promise<void>}
@@ -658,7 +686,10 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			if (conflicted.has(path)) {
 				const survivor = ours ?? theirs;
 				const kind = !ours ? 'deleted_by_us' : !theirs ? 'deleted_by_theirs' : 'both_modified';
+				// A link's content is its target, which a line merge would turn into a regular file.
 				const binary =
+					ours?.mode === SYMLINK_MODE ||
+					theirs?.mode === SYMLINK_MODE ||
 					driverBinaryPaths.has(path) ||
 					(kind !== 'both_modified' &&
 						survivor !== null &&
@@ -901,7 +932,9 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		/** @type {string[]} */
 		const withMarkers = [];
 		for (const { path, binary } of merge.conflicts) {
-			if (binary || !(await lstatOrNull(abs(path)))) continue;
+			if (binary) continue;
+			// Only a regular file holds text; reading a link would follow it.
+			if (!(await lstatOrNull(abs(path)))?.isFile()) continue;
 			const text = /** @type {string} */ (await fs.promises.readFile(abs(path), { encoding: 'utf8' }));
 			if (hasConflictMarkers(text)) withMarkers.push(path);
 		}
@@ -920,16 +953,26 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			networkLock,
 			async () => {
 				signal?.throwIfAborted();
-				await git.fetch({
-					...base,
-					http: withSignal(http, signal),
-					remote: REMOTE,
-					ref: branch,
-					singleBranch: true,
-					tags: false,
-					onProgress,
-					...authCallbacks(getCredential)
-				});
+				const gone = (/** @type {unknown} */ cause) =>
+					new GitEngineError(ErrorCode.BRANCH_NOT_FOUND, `The branch ${branch} is no longer on the remote. It may have been renamed or deleted on the git host. Your files and commits here are unchanged.`, { cause });
+				try {
+					const { fetchHead } = await git.fetch({
+						...base,
+						http: withSignal(http, signal),
+						remote: REMOTE,
+						ref: branch,
+						singleBranch: true,
+						tags: false,
+						onProgress,
+						...authCallbacks(getCredential)
+					});
+					// A remote left with no refs at all answers with nothing, not an error.
+					if (!fetchHead) throw gone(undefined);
+				} catch (error) {
+					// The only ref a fetch looks up is the branch it was asked for.
+					if (/** @type {{ code?: string }} */ (error ?? {}).code === 'NotFoundError') throw gone(error);
+					throw error;
+				}
 				await flush();
 			},
 			signal
@@ -1395,14 +1438,10 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				if (!merge.conflictedPaths.includes(filepath)) {
 					throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, `${filepath} has no conflict.`);
 				}
-				const blob = await readBlobOrNull(side === 'ours' ? merge.oursOid : merge.theirsOid, filepath);
-				if (blob) {
-					const parent = filepath.split('/').slice(0, -1).join('/');
-					if (parent) await mkdirp(abs(parent));
-					await fs.promises.writeFile(abs(filepath), blob);
-				} else {
-					await removeFromTree(filepath);
-				}
+				await assertFolderSpared(filepath, new Set(), 'Choosing a side for');
+				const blob = await treeBlobAt(side === 'ours' ? merge.oursOid : merge.theirsOid, filepath);
+				if (blob) await writeTreeBlob(filepath, blob);
+				else await removeFromTree(filepath);
 				await flush();
 				if (!merge.resolvedPaths.includes(filepath)) {
 					await writeMergeState(fs, gitdir, { ...merge, resolvedPaths: [...merge.resolvedPaths, filepath] });
@@ -1549,6 +1588,8 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 					const blob = await treeBlobAt(headOid, path);
 					if (blob) committed.set(path, blob);
 				}
+				const chosen = new Set(toDiscard);
+				for (const path of committed.keys()) await assertFolderSpared(path, chosen, 'Discarding');
 				// Removals first: a new file can sit where a committed folder belongs.
 				for (const path of toDiscard) {
 					if (!committed.has(path)) await removeFromTree(path);
