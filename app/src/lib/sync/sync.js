@@ -43,6 +43,7 @@ import { syncRecordKey } from '../git/local-repos.js';
  * @property {boolean} pullHeldBack local changes stopped a pull, and the user has to commit or discard them
  * @property {boolean} needsAuthor a pull or commit needs an author nobody has set
  * @property {SyncReport | null} report the last failure
+ * @property {import('../git/limits.js').SizeFinding[]} commitWarnings size warnings from the last commit or merge commit
  */
 
 /**
@@ -51,6 +52,18 @@ import { syncRecordKey } from '../git/local-repos.js';
  * @returns {boolean}
  */
 const isConnectionFailure = (error) => error instanceof GitEngineError && (error.code === ErrorCode.NETWORK || error.code === ErrorCode.HOST_UNREACHABLE);
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} the merge record cannot be read
+ */
+const isMergeDamage = (error) => error instanceof GitEngineError && error.code === ErrorCode.MERGE_STATE_DAMAGED;
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} an open merge stands in the way, and closing it clears the way
+ */
+const isMergeRefusal = (error) => isMergeDamage(error) || (error instanceof GitEngineError && error.code === ErrorCode.MERGE_IN_PROGRESS);
 
 /**
  * @param {unknown} error
@@ -75,7 +88,7 @@ export function commitMessageFor(paths) {
 /**
  * @param {object} options
  * @param {string} options.repoId
- * @param {Pick<Repo, 'status' | 'aheadBehind' | 'describeConflicts' | 'pull' | 'fetchRemote' | 'push' | 'commit' | 'discardChanges' | 'resolveConflict' | 'completeMerge' | 'abortMerge' | 'undoUnpushedCommits' | 'resetDamagedMerge'>} options.repo
+ * @param {Pick<Repo, 'status' | 'aheadBehind' | 'describeConflicts' | 'pull' | 'fetchRemote' | 'push' | 'checkCommit' | 'commit' | 'discardChanges' | 'resolveConflict' | 'completeMerge' | 'abortMerge' | 'undoUnpushedCommits' | 'resetDamagedMerge'>} options.repo
  * @param {{ refresh: () => Promise<void>, saveDrafts: () => Promise<{ saved: string[], skipped: string[] }> }} options.notes told when files changed underneath it
  * @param {() => Author | null} options.getAuthor
  * @param {Storage} [options.storage]
@@ -102,7 +115,8 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		syncing: null,
 		pullHeldBack: false,
 		needsAuthor: false,
-		report: null
+		report: null,
+		commitWarnings: []
 	};
 	const store = writable(state);
 
@@ -119,10 +133,23 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 	const readEngine = async () => {
 		try {
 			const { files, merge } = await repo.status();
-			const [counts, conflicts] = await Promise.all([repo.aheadBehind(), merge ? repo.describeConflicts() : []]);
-			set({ loaded: true, mergeDamaged: false, files, merge, conflicts, ...counts, pullHeldBack: state.pullHeldBack && files.length > 0 });
+			const [counts, conflicts] = await Promise.allSettled([repo.aheadBehind(), merge ? repo.describeConflicts() : []]);
+			const failed = [counts, conflicts].find((result) => result.status === 'rejected');
+			if (failed && isMergeDamage(failed.reason)) throw failed.reason;
+			// An open merge refuses commit, pull and push, so its way out has to show
+			// even when these details cannot be read. Every file then counts as open.
+			set({
+				loaded: true,
+				mergeDamaged: false,
+				files,
+				merge,
+				conflicts: conflicts.status === 'fulfilled' ? conflicts.value : (merge?.conflicts ?? []).map((conflict) => ({ ...conflict, hasMarkers: true, undecided: true })),
+				...(counts.status === 'fulfilled' ? counts.value : {}),
+				pullHeldBack: state.pullHeldBack && files.length > 0,
+				...(failed ? { report: toReport(failed.reason) } : {})
+			});
 		} catch (error) {
-			if (error instanceof GitEngineError && error.code === ErrorCode.MERGE_STATE_DAMAGED) set({ loaded: true, mergeDamaged: true, merge: null, conflicts: [], report: toReport(error) });
+			if (isMergeDamage(error)) set({ loaded: true, mergeDamaged: true, merge: null, conflicts: [], report: toReport(error) });
 			else set({ loaded: true, report: toReport(error) });
 		}
 	};
@@ -231,7 +258,8 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 				return { ok: true, queued: false };
 			} catch (error) {
 				const queued = isConnectionFailure(error);
-				set({ pushPending: queued, report: toReport(error) });
+				// An open merge only delays a push asked for earlier; the merge's end sends it.
+				set({ pushPending: queued || (state.pushPending && isMergeRefusal(error)), report: toReport(error) });
 				await refresh();
 				return { ok: false, queued, code: error instanceof GitEngineError ? error.code : ErrorCode.UNKNOWN };
 			}
@@ -251,7 +279,7 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		}
 		try {
 			const { warnings } = await repo.commit({ paths, message, author });
-			set({ report: null, needsAuthor: false });
+			set({ report: null, needsAuthor: false, commitWarnings: warnings });
 			await refresh();
 			return { ok: true, warnings };
 		} catch (error) {
@@ -294,6 +322,19 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		}
 	};
 
+	/**
+	 * Sends a queued push if the network allows one. An open merge holds it, and
+	 * completing the merge sends it.
+	 * @returns {Promise<void>}
+	 */
+	const pushIfPending = async () => {
+		if (!state.pushPending || !isOnline()) return;
+		// Another tab may have opened or closed a merge since the last read.
+		await refresh();
+		if (state.merge || state.mergeDamaged) return;
+		await push();
+	};
+
 	return {
 		subscribe: store.subscribe,
 		refresh,
@@ -322,10 +363,7 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 			if (online !== state.online) set({ online });
 		},
 
-		/** @returns {Promise<void>} once a queued push has run, if the network allows one */
-		async pushIfPending() {
-			if (state.pushPending && isOnline()) await push();
-		},
+		pushIfPending,
 
 		/**
 		 * Saves every note's unsaved text and rereads the changes.
@@ -340,6 +378,7 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 				await refresh();
 				return { merge: state.merge !== null || state.mergeDamaged, paths: state.files.map((file) => file.path), ahead: state.ahead };
 			},
+			checkCommit: (paths) => repo.checkCommit(paths),
 			commit: (paths, message) => commit({ paths, message }),
 			pull: () => pull(),
 			push,
@@ -368,6 +407,7 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 		resolve: (path, side) => changingFiles(() => repo.resolveConflict({ path, side })),
 
 		/**
+		 * Makes the merge commit, then sends a push that waited for it.
 		 * @param {{ allowMarkers: boolean }} options
 		 * @returns {Promise<{ ok: boolean }>}
 		 */
@@ -377,7 +417,12 @@ export function createSync({ repoId, repo, notes, getAuthor, storage = globalThi
 				set({ needsAuthor: true });
 				return { ok: false };
 			}
-			return changingFiles(() => repo.completeMerge({ author, allowMarkers }));
+			const result = await changingFiles(() => repo.completeMerge({ author, allowMarkers }));
+			if (result.value) {
+				set({ commitWarnings: result.value.warnings });
+				await pushIfPending();
+			}
+			return result;
 		},
 
 		/** @returns {Promise<{ ok: boolean }>} */

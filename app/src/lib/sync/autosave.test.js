@@ -9,7 +9,7 @@ const MINUTE = 60_000;
 // eslint-disable-next-line jsdoc/require-returns
 /**
  * A record of what autosave asked for, in order, over a repo described by `work`.
- * @param {{ merge?: boolean, paths?: string[], ahead?: number, pull?: { ok: boolean, status?: string, code?: string }, skipped?: string[], draftPaths?: string[] }} [scene]
+ * @param {{ merge?: boolean, paths?: string[], ahead?: number, pull?: { ok: boolean, status?: string, code?: string }, skipped?: string[], draftPaths?: string[], tooBig?: string[] }} [scene]
  */
 function setUp(scene = {}) {
 	const work = { merge: scene.merge ?? false, paths: scene.paths ?? [], ahead: scene.ahead ?? 0 };
@@ -21,6 +21,7 @@ function setUp(scene = {}) {
 	/** @type {unknown[]} */
 	const failures = [];
 	const ops = {
+		checkCommit: vi.fn(async (/** @type {string[]} */ paths) => paths.filter((path) => (scene.tooBig ?? []).includes(path)).map((path) => ({ level: /** @type {const} */ ('block'), path, size: 2, limit: 1, message: `${path} is too big` }))),
 		saveDrafts: vi.fn(async () => {
 			calls.push('saveDrafts');
 			work.paths = [...work.paths, ...(scene.draftPaths ?? [])];
@@ -28,10 +29,10 @@ function setUp(scene = {}) {
 			return { saved: [], skipped: scene.skipped ?? [] };
 		}),
 		readWork: vi.fn(async () => ({ ...work })),
-		commit: vi.fn(async (/** @type {string[]} */ _paths, /** @type {string} */ message) => {
+		commit: vi.fn(async (/** @type {string[]} */ paths, /** @type {string} */ message) => {
 			calls.push('commit');
 			messages.push(message);
-			work.paths = [];
+			work.paths = work.paths.filter((path) => !paths.includes(path));
 			work.ahead += 1;
 			return { ok: true };
 		}),
@@ -144,6 +145,42 @@ describe('on the timer', () => {
 	});
 });
 
+describe('a file over a size limit', () => {
+	it('stays out of the commit and is named, while the other notes commit and push', async () => {
+		const context = setUp({ paths: ['big.bin', 'note.md'], tooBig: ['big.bin'] });
+		await turnOn(context);
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		expect(context.ops.commit).toHaveBeenCalledWith(['note.md'], 'autosave: note.md');
+		expect(context.calls).toEqual(['saveDrafts', 'commit', 'pull', 'push']);
+		expect(get(context.autosave).refused).toEqual(['big.bin is too big']);
+	});
+
+	it('makes no commit when it is the only change, and pushes nothing', async () => {
+		const context = setUp({ paths: ['big.bin'], tooBig: ['big.bin'] });
+		await turnOn(context);
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		expect(context.ops.commit).not.toHaveBeenCalled();
+		expect(context.ops.push).not.toHaveBeenCalled();
+		expect(get(context.autosave).refused).toEqual(['big.bin is too big']);
+	});
+
+	it('stops being named once it shrinks or goes', async () => {
+		const context = setUp({ paths: ['big.bin', 'note.md'], tooBig: ['big.bin'] });
+		await turnOn(context);
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		context.work.paths = [];
+		await vi.advanceTimersByTimeAsync(5 * MINUTE);
+		expect(get(context.autosave).refused).toEqual([]);
+	});
+
+	it('also stays out of the commit made on hiding', async () => {
+		const context = setUp({ paths: ['big.bin', 'note.md'], tooBig: ['big.bin'] });
+		await turnOn(context);
+		await context.autosave.handleHidden();
+		expect(context.ops.commit).toHaveBeenCalledWith(['note.md'], 'autosave: note.md');
+	});
+});
+
 describe('with a conflict', () => {
 	it('skips the run entirely while a merge is open', async () => {
 		const context = setUp({ merge: true, paths: ['clash.md'] });
@@ -216,6 +253,31 @@ describe('hiding and showing', () => {
 		expect(context.ops.commit).toHaveBeenCalledTimes(2);
 	});
 
+	it('waits on show for the commit the hide started, and pushes it', async () => {
+		const context = setUp({ paths: ['a.md'] });
+		await turnOn(context);
+		/** @type {(value: { saved: never[], skipped: string[] }) => void} */
+		let finishSaving = () => {};
+		context.ops.saveDrafts.mockImplementationOnce(
+			() =>
+				new Promise((resolve) => {
+					finishSaving = resolve;
+				})
+		);
+		context.environment.visible = false;
+		const hidden = context.autosave.handleHidden();
+		await vi.advanceTimersByTimeAsync(0);
+
+		context.environment.visible = true;
+		const shown = context.autosave.handleVisible();
+		await vi.advanceTimersByTimeAsync(0);
+		expect(context.calls).toEqual([]);
+
+		finishSaving({ saved: [], skipped: [] });
+		await Promise.all([hidden, shown]);
+		expect(context.calls).toEqual(['commit', 'pull', 'push']);
+	});
+
 	it('shows with nothing to push and makes no request', async () => {
 		const context = setUp();
 		await turnOn(context);
@@ -229,6 +291,36 @@ describe('hiding and showing', () => {
 		await context.autosave.handleHidden();
 		await context.autosave.handleVisible();
 		await context.autosave.handleOnline();
+		expect(context.calls).toEqual([]);
+	});
+});
+
+describe('arming before the first pull', () => {
+	it('commits on hide and runs its timer, while pushing nothing until told', async () => {
+		const context = setUp({ paths: ['a.md'], ahead: 1 });
+		context.autosave.arm({ enabled: true, intervalMinutes: 1 });
+		expect(get(context.autosave).enabled).toBe(true);
+		await vi.advanceTimersByTimeAsync(0);
+		expect(context.calls).toEqual([]);
+
+		await context.autosave.handleHidden();
+		expect(context.calls).toEqual(['saveDrafts', 'commit']);
+
+		await context.autosave.pushOnLaunch();
+		expect(context.calls).toEqual(['saveDrafts', 'commit', 'pull', 'push']);
+	});
+
+	it('starts the timer on arming', async () => {
+		const context = setUp({ paths: ['a.md'] });
+		context.autosave.arm({ enabled: true, intervalMinutes: 1 });
+		await vi.advanceTimersByTimeAsync(MINUTE);
+		expect(context.ops.commit).toHaveBeenCalledTimes(1);
+	});
+
+	it('pushes nothing on launch when off', async () => {
+		const context = setUp({ ahead: 1 });
+		context.autosave.arm({ enabled: false, intervalMinutes: 1 });
+		await context.autosave.pushOnLaunch();
 		expect(context.calls).toEqual([]);
 	});
 });

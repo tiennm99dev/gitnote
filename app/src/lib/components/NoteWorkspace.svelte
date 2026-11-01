@@ -103,16 +103,29 @@
 	 */
 	const messageOf = (error) => (error instanceof Error ? error.message : 'Something went wrong.');
 
+	/** @param {string} target */
+	const openNote = (target) => {
+		report = null;
+		notes.open(target).catch((/** @type {unknown} */ error) => {
+			report = messageOf(error);
+		});
+	};
+
 	$effect(() => {
 		const target = path;
 		untrack(() => {
-			report = null;
 			if (view === 'changes') view = 'note';
 			if (target !== createdPath) createdPath = '';
-			notes.open(target).catch((/** @type {unknown} */ error) => {
-				report = messageOf(error);
-			});
+			openNote(target);
 		});
+	});
+
+	// A damaged merge record stops every read, the open note's too, until it is reset.
+	let mergeWasDamaged = false;
+	$effect(() => {
+		const damaged = $sync.mergeDamaged;
+		if (mergeWasDamaged && !damaged) untrack(() => openNote(path));
+		mergeWasDamaged = damaged;
 	});
 
 	// Staying in this repository keeps the store, and with it any text storage refused.
@@ -150,12 +163,12 @@
 			void autosave.handleOnline();
 		};
 		const onOffline = () => sync.setOnline(false);
-		const applyAutosave = () => autosave.configure({ enabled: settings.autosave, intervalMinutes: settings.intervalMinutes });
+		const autosaveOptions = () => ({ enabled: settings.autosave, intervalMinutes: settings.intervalMinutes });
 		/** @param {StorageEvent} event */
 		const onStorage = (event) => {
 			if (!isSettingsChange(event)) return;
 			settings = loadSettings();
-			void applyAutosave();
+			void autosave.configure(autosaveOptions());
 		};
 		document.addEventListener('visibilitychange', onVisible);
 		// Two windows side by side stay visible, so only focus tells them apart.
@@ -174,8 +187,10 @@
 			}
 			await tick();
 			if (!alive) return;
+			// Armed before the pull, which can stall, because a hidden app is soon frozen.
+			autosave.arm(autosaveOptions());
 			await sync.open();
-			if (alive) await applyAutosave();
+			if (alive) await autosave.pushOnLaunch();
 		})().catch(sync.reportFailure);
 
 		return () => {
@@ -395,7 +410,7 @@
 				<CommitPanel {sync} {engine} draftPaths={$notes.draftPaths} hasAuthor={author !== null} />
 			{:else}
 				{#if view === 'conflicts' && $sync.merge}
-					<ConflictView {sync} {notes} {hrefFor} current={path} onclose={() => (view = 'note')} />
+					<ConflictView {sync} {notes} {hrefFor} current={path} autosaveOn={$autosave.enabled} onclose={() => (view = 'note')} />
 				{/if}
 				<div class="min-h-0 flex-1">
 					{#if $notes.note}

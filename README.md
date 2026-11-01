@@ -112,7 +112,8 @@ failures in its state instead of throwing.
   built from the paths. Size warnings come from the engine's `checkCommit`, and a
   blocked file turns the commit buttons off. Unsaved text is not a change yet: the
   panel lists it and offers Save all. Discard goes back to the branch's commit and
-  deletes a file the commit does not have.
+  deletes a file the commit does not have. It refuses when restoring a file would
+  delete a folder holding files that are not selected.
 - **Author.** Settings (`/settings`) first, then the account's profile, then for
   GitHub `<login>@users.noreply.github.com`. With none of those, committing and
   merging ask for one, and a pull on opening is skipped.
@@ -125,11 +126,15 @@ failures in its state instead of throwing.
   drafts. A file counts as resolved once it has no markers and no unsaved text;
   markers that are really the file's content take an explicit choice. Binary files
   and files one side deleted take an ours/theirs choice. The merge commit is always
-  the engine's `completeMerge`, and `abortMerge` is the way back.
+  the engine's `completeMerge`, and `abortMerge` is the way back. A symbolic link
+  also takes an ours/theirs choice, and stays a link. If a conflict's details cannot
+  be read, the list still shows it, unresolved, so the merge can be abandoned.
 - **Push.** There is no force push. Offline, or on a connection failure, the push
   is queued in localStorage and goes on `online`, on coming back and on opening.
-  Any other refusal is shown and not retried. A push over a size limit offers
-  `undoUnpushedCommits`.
+  An open merge holds a queued push, and completing the merge sends it. Any other
+  refusal is shown and not retried. A push over a size limit offers
+  `undoUnpushedCommits`, which asks to turn autosave off first, because autosave
+  would commit those files together again.
 - **A damaged merge record** makes every engine call fail with
   `MERGE_STATE_DAMAGED`, so the sync bar offers `resetDamagedMerge`: the index
   returns to the branch and the files stay, as changes to commit or discard.
@@ -138,8 +143,10 @@ failures in its state instead of throwing.
   `autosave: <paths>`, pulls, then pushes. Going hidden commits on the device only;
   coming back, launching and regaining the network push. It stands aside while a
   merge is open and resumes by itself after. A draft whose file changed underneath
-  it is left out and named. Timers run reliably only in the foreground, so it does
-  nothing while the app is in the background.
+  it is left out and named, and so is a file over a size limit, so the other notes
+  still get committed. It is armed before the pull on opening, which can stall.
+  Timers run reliably only in the foreground, so it does nothing while the app is
+  in the background.
 
 ## Notes
 

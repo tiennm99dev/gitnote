@@ -42,7 +42,7 @@
 		<span data-testid="sync-ahead" title="Commits only on this device">{unpushed}</span>
 		<span data-testid="sync-behind" title="Commits only on the remote, as of the last check">{$sync.behind} behind</span>
 		{#if $sync.pushPending}
-			<span class="rounded bg-amber-100 px-2 py-1 text-amber-900" data-testid="push-pending">Push waiting for the network</span>
+			<span class="rounded bg-amber-100 px-2 py-1 text-amber-900" data-testid="push-pending">{blocked ? 'Push waiting for the merge' : 'Push waiting for the network'}</span>
 		{/if}
 		<span class="text-gray-600" data-testid="last-sync">{$sync.lastSyncAt ? `Last sync ${new Date($sync.lastSyncAt).toLocaleString()}` : 'Not synced yet'}</span>
 		{#if autosave.enabled}
@@ -76,6 +76,14 @@
 	{#if autosave.enabled && autosave.skipped.length > 0}
 		<p role="status" class="bg-amber-50 p-2 text-amber-800" data-testid="autosave-skipped">Autosave left out {autosave.skipped.join(', ')}: the file changed after you started editing. Open it to choose which version to keep.</p>
 	{/if}
+	{#if autosave.enabled}
+		{#each autosave.refused as refusal (refusal)}
+			<p role="status" class="bg-amber-50 p-2 text-amber-800" data-testid="autosave-refused">Autosave left this file out: {refusal}</p>
+		{/each}
+	{/if}
+	{#each $sync.commitWarnings as warning (warning.message)}
+		<p role="status" class="bg-amber-50 p-2 text-amber-800" data-testid="commit-warning">{warning.message}</p>
+	{/each}
 	{#if $sync.report && !$sync.mergeDamaged}
 		<div role="alert" class="flex flex-wrap items-center gap-2 bg-red-50 p-2 text-red-700" data-testid="sync-report">
 			<p class="min-w-0 flex-1">{$sync.report.message}</p>
@@ -85,7 +93,9 @@
 			{#if needsPull}
 				<button type="button" class="min-h-11 rounded border border-red-700 px-3" onclick={() => sync.pull()} data-testid="report-pull">Pull now</button>
 			{/if}
-			{#if canUndo && confirmingUndo}
+			{#if canUndo && autosave.enabled}
+				<p class="basis-full" data-testid="undo-needs-autosave-off">To remake these commits in smaller groups, first turn autosave off in <a class="underline" href={resolve('/settings')}>Settings</a>, or its next run commits all the files together again. Then push once more to get the undo option here.</p>
+			{:else if canUndo && confirmingUndo}
 				<button type="button" class="min-h-11 rounded bg-red-700 px-3 text-white" onclick={undo} data-testid="undo-confirm">Undo {unpushed}; files stay as changes</button>
 				<button type="button" class="min-h-11 rounded border border-red-700 px-3" onclick={() => (confirmingUndo = false)}>Keep them</button>
 			{:else if canUndo}

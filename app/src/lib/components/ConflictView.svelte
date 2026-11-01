@@ -7,11 +7,12 @@
 	 * @property {import('#lib/stores/notes.js').Notes} notes
 	 * @property {(path: string) => string} hrefFor
 	 * @property {string} current the note open below this list
+	 * @property {boolean} autosaveOn autosave pushes the merge commit by itself
 	 * @property {() => void} onclose hides the list; the merge stays open
 	 */
 
 	/** @type {Props} */
-	let { sync, notes, hrefFor, current, onclose } = $props();
+	let { sync, notes, hrefFor, current, autosaveOn, onclose } = $props();
 
 	/** Text files whose markers the user said are the file's real content. Lasts until a reload. */
 	const keptMarkers = new SvelteSet();
@@ -36,6 +37,12 @@
 		if ($notes.draftPaths.includes(conflict.path)) return false;
 		return needsChoice(conflict) ? !conflict.undecided : !conflict.hasMarkers || keptMarkers.has(conflict.path);
 	};
+
+	const afterMerge = $derived.by(() => {
+		if ($sync.pushPending) return 'Your waiting push goes once the merge commit is made and the network allows it.';
+		if (autosaveOn) return 'Autosave pushes the merge commit on its next run.';
+		return 'Nothing is pushed until you push.';
+	});
 
 	const remaining = $derived($sync.conflicts.filter((conflict) => !isResolved(conflict)).length);
 
@@ -111,7 +118,7 @@
 		<h2 class="min-w-0 flex-1 text-lg font-semibold">The remote changed the same files. Nothing is lost.</h2>
 		<button type="button" class="min-h-11 rounded border border-gray-400 bg-white px-3" onclick={onclose}>Hide</button>
 	</div>
-	<p class="text-sm">Pick what each file should hold, then create the merge commit. Nothing is pushed until you push.</p>
+	<p class="text-sm">Pick what each file should hold, then create the merge commit. <span data-testid="after-merge">{afterMerge}</span></p>
 
 	<ul class="flex flex-col gap-2" data-testid="conflict-files">
 		{#each $sync.conflicts as conflict (conflict.path)}

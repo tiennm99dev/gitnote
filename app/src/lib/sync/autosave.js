@@ -5,6 +5,9 @@
  * frozen seconds after it leaves. So going hidden commits locally and goes no
  * further, and coming back, launching or regaining the network does the push.
  *
+ * A file over a size limit stays out of the commit and is named, so one such file
+ * does not hold every other note back.
+ *
  * It never commits while a merge is open and never resolves a conflict: a pull
  * that conflicts leaves the merge open for the user, and every later run stands
  * aside until it is closed. The timer keeps ticking through that, so autosave
@@ -33,6 +36,7 @@ export function autosaveMessage(paths) {
  * @typedef {object} AutosaveOps
  * @property {() => Promise<{ saved: string[], skipped: string[] }>} saveDrafts
  * @property {() => Promise<{ merge: boolean, paths: string[], ahead: number }>} readWork
+ * @property {(paths: string[]) => Promise<import('../git/limits.js').SizeFinding[]>} checkCommit
  * @property {(paths: string[], message: string) => Promise<{ ok: boolean }>} commit
  * @property {() => Promise<{ ok: boolean, status?: string, code?: string }>} pull
  * @property {() => Promise<{ ok: boolean }>} push
@@ -43,6 +47,7 @@ export function autosaveMessage(paths) {
  * @typedef {object} AutosaveState
  * @property {boolean} enabled
  * @property {string[]} skipped notes left out because their file changed underneath them
+ * @property {string[]} refused why files were left out of the last commit: each is over a size limit
  */
 
 // The scheduler's methods are inferred; `Autosave` below names them.
@@ -56,7 +61,7 @@ export function autosaveMessage(paths) {
  */
 export function createAutosave({ ops, isVisible, isOnline, onError }) {
 	/** @type {AutosaveState} */
-	let state = { enabled: false, skipped: [] };
+	let state = { enabled: false, skipped: [], refused: [] };
 	const store = writable(state);
 
 	/** @param {Partial<AutosaveState>} change */
@@ -86,8 +91,16 @@ export function createAutosave({ ops, isVisible, isOnline, onError }) {
 		set({ skipped });
 		const work = await ops.readWork();
 		if (work.merge) return { blocked: true, ahead: work.ahead };
-		if (work.paths.length === 0) return { blocked: false, ahead: work.ahead };
-		const committed = await ops.commit(work.paths, autosaveMessage(work.paths));
+		if (work.paths.length === 0) {
+			set({ refused: [] });
+			return { blocked: false, ahead: work.ahead };
+		}
+		const blocked = (await ops.checkCommit(work.paths)).filter((finding) => finding.level === 'block');
+		const left = new Set(blocked.map((finding) => finding.path));
+		const paths = work.paths.filter((path) => !left.has(path));
+		set({ refused: blocked.map((finding) => finding.message) });
+		if (paths.length === 0) return { blocked: false, ahead: work.ahead };
+		const committed = await ops.commit(paths, autosaveMessage(paths));
 		return { blocked: false, ahead: work.ahead + (committed.ok ? 1 : 0) };
 	};
 
@@ -141,8 +154,12 @@ export function createAutosave({ ops, isVisible, isOnline, onError }) {
 		}
 	};
 
-	/** Coming back, launching and reconnecting push what is there; none of them commits. */
+	/**
+	 * Coming back, launching and reconnecting push what is there; none of them
+	 * commits. A hide may still be committing, and that commit belongs in this push.
+	 */
 	const pushWhatIsThere = async () => {
+		await commitTail;
 		const work = await ops.readWork();
 		if (!work.merge && work.ahead > 0) await upload();
 	};
@@ -161,22 +178,48 @@ export function createAutosave({ ops, isVisible, isOnline, onError }) {
 		}
 	};
 
+	/**
+	 * @param {{ enabled: boolean, intervalMinutes: number }} options
+	 * @returns {boolean} this turned it on
+	 */
+	const apply = ({ enabled, intervalMinutes }) => {
+		const started = enabled && !state.enabled;
+		const nextInterval = intervalMinutes * MINUTE_MS;
+		const changed = enabled !== state.enabled || nextInterval !== intervalMs;
+		intervalMs = nextInterval;
+		set({ enabled });
+		if (changed) startTimer();
+		return started;
+	};
+
 	return {
 		subscribe: store.subscribe,
+
+		/**
+		 * Applies the settings and pushes nothing, so the timer and the commit on
+		 * hiding work from the moment a screen opens, however long its first pull
+		 * takes. `pushOnLaunch` follows once that pull has settled.
+		 * @param {{ enabled: boolean, intervalMinutes: number }} options
+		 * @returns {void}
+		 */
+		arm(options) {
+			apply(options);
+		},
+
+		/**
+		 * @returns {Promise<void>} once what an earlier session committed has been pushed
+		 */
+		async pushOnLaunch() {
+			if (state.enabled) await guarded(pushWhatIsThere);
+		},
 
 		/**
 		 * Applies the settings; turning it on counts as a launch.
 		 * @param {{ enabled: boolean, intervalMinutes: number }} options
 		 * @returns {Promise<void>}
 		 */
-		async configure({ enabled, intervalMinutes }) {
-			const started = enabled && !state.enabled;
-			const nextInterval = intervalMinutes * MINUTE_MS;
-			const changed = enabled !== state.enabled || nextInterval !== intervalMs;
-			intervalMs = nextInterval;
-			set({ enabled });
-			if (changed) startTimer();
-			if (started) await guarded(pushWhatIsThere);
+		async configure(options) {
+			if (apply(options)) await guarded(pushWhatIsThere);
 		},
 
 		/**

@@ -1,9 +1,11 @@
+import { symlink, unlink } from 'node:fs/promises';
+import path from 'node:path';
 import { memfs } from 'memfs';
 import { get } from 'svelte/store';
 import { describe, expect, it, vi } from 'vitest';
 import { memoryDraftStore } from '../../../test/draft-doubles.js';
 import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
-import { createRemote, pushFromElsewhere, rejectPushes, RELAY_PORT, remoteHead, runGit, showRemote } from '../../../test/remote-repo.js';
+import { changeElsewhere, createRemote, pushFromElsewhere, rejectPushes, RELAY_PORT, remoteHead, runGit, showRemote } from '../../../test/remote-repo.js';
 import { ErrorCode, networkError } from '../git/errors.js';
 import { createGitHttp } from '../git/http.js';
 import { syncRecordKey } from '../git/local-repos.js';
@@ -12,6 +14,7 @@ import { createNotes } from '../stores/notes.js';
 import { commitMessageFor, createSync } from './sync.js';
 
 const AUTHOR = { name: 'Local Author', email: 'local@example.com' };
+const MB = 1_000_000;
 
 /**
  * @returns {Storage}
@@ -169,6 +172,16 @@ describe('pull', () => {
 		expect(pull).not.toHaveBeenCalled();
 	});
 
+	it('says the remote branch has gone, naming it, and changes nothing here', async () => {
+		const { repo, sync, remote } = await setUp();
+		await repo.writeFile('a.md', 'edited\n');
+		await sync.commit({ paths: ['a.md'], message: 'mine' });
+		await runGit(['update-ref', '-d', 'refs/heads/main'], remote.bare);
+		expect(await sync.pull()).toEqual({ ok: false, code: ErrorCode.BRANCH_NOT_FOUND });
+		expect(get(sync).report).toMatchObject({ code: ErrorCode.BRANCH_NOT_FOUND, message: expect.stringContaining('main is no longer on the remote') });
+		expect(get(sync).ahead).toBe(1);
+	});
+
 	it('asks for an author it needs for a merge', async () => {
 		const remote = await createRemote({ 'a.md': 'one\n' });
 		const { sync } = await openDevice(remote, { author: null });
@@ -314,7 +327,111 @@ describe('push', () => {
 	});
 });
 
+describe('a queued push and an open merge', () => {
+	/**
+	 * A push queued offline, then a merge opened by the pull on coming back.
+	 * @returns {ReturnType<typeof setUp>}
+	 */
+	async function setUpQueued() {
+		const context = await setUp();
+		const { repo, sync, remote, network } = context;
+		await repo.writeFile('a.md', 'mine\n');
+		await sync.commit({ paths: ['a.md'], message: 'mine' });
+		network.online = false;
+		await sync.push();
+		network.online = true;
+		await pushFromElsewhere(remote, { 'a.md': 'theirs\n' }, 'theirs');
+		await sync.open();
+		expect(get(sync)).toMatchObject({ pushPending: true, merge: { conflictedPaths: ['a.md'] } });
+		return context;
+	}
+
+	it('stays queued, with nothing reported, when the tab comes back during the merge', async () => {
+		const { sync, repo } = await setUpQueued();
+		const push = vi.spyOn(repo, 'push');
+		await sync.pushIfPending();
+		expect(push).not.toHaveBeenCalled();
+		expect(get(sync)).toMatchObject({ pushPending: true, report: null });
+	});
+
+	it('stays queued through a reload during the merge', async () => {
+		const { reopen } = await setUpQueued();
+		const reloaded = reopen();
+		await reloaded.open();
+		await reloaded.pushIfPending();
+		expect(get(reloaded)).toMatchObject({ pushPending: true, report: null });
+	});
+
+	it('survives a push the merge refuses, when another tab opened that merge', async () => {
+		const { sync } = await setUpQueued();
+		expect(await sync.push()).toMatchObject({ ok: false, code: ErrorCode.MERGE_IN_PROGRESS });
+		expect(get(sync).pushPending).toBe(true);
+	});
+
+	it('does not queue a push of its own when the merge refuses it', async () => {
+		const { sync } = await setUpConflict();
+		await sync.push();
+		expect(get(sync).pushPending).toBe(false);
+	});
+
+	it('goes as soon as the merge commit is made', async () => {
+		const { repo, sync, remote } = await setUpQueued();
+		await repo.writeFile('a.md', 'both\n');
+		expect((await sync.completeMerge({ allowMarkers: false })).ok).toBe(true);
+		expect(get(sync)).toMatchObject({ merge: null, pushPending: false, ahead: 0, report: null });
+		expect(await showRemote(remote, 'main:a.md')).toBe('both\n');
+	});
+
+	it('keeps waiting when the merge commit is made offline', async () => {
+		const { repo, sync, network, remote } = await setUpQueued();
+		const head = await remoteHead(remote);
+		await repo.writeFile('a.md', 'both\n');
+		network.online = false;
+		expect((await sync.completeMerge({ allowMarkers: false })).ok).toBe(true);
+		expect(get(sync)).toMatchObject({ merge: null, pushPending: true });
+		expect(await remoteHead(remote)).toBe(head);
+	});
+
+	it('does not push a merge commit nobody asked to push', async () => {
+		const { repo, sync, remote } = await setUpConflict();
+		const head = await remoteHead(remote);
+		await repo.writeFile('a.md', 'both\n');
+		await sync.completeMerge({ allowMarkers: false });
+		expect(await remoteHead(remote)).toBe(head);
+	});
+});
+
+describe('size warnings', () => {
+	it('keep what a commit warned about, for a commit no panel checked first', async () => {
+		const { repo, sync } = await setUp();
+		await repo.writeFile('big.bin', new Uint8Array(60 * MB).fill(97));
+		await sync.autosaveOps.commit(['big.bin'], 'autosave: big.bin');
+		expect(get(sync).commitWarnings).toMatchObject([{ level: 'warn', path: 'big.bin' }]);
+
+		await repo.writeFile('a.md', 'edited\n');
+		await sync.commit({ paths: ['a.md'], message: 'small' });
+		expect(get(sync).commitWarnings).toEqual([]);
+	}, 60_000);
+
+	it('keep what a merge commit warned about', async () => {
+		const { repo, sync } = await setUpConflict();
+		await repo.writeFile('a.md', new Uint8Array(60 * MB).fill(97));
+		expect((await sync.completeMerge({ allowMarkers: false })).ok).toBe(true);
+		expect(get(sync).commitWarnings).toMatchObject([{ level: 'warn', path: 'a.md' }]);
+	}, 60_000);
+});
+
 describe('discard', () => {
+	it('reports a refusal to delete files nobody selected, and leaves them', async () => {
+		const remote = await createRemote({ a: 'one\n' });
+		const { repo, sync } = await openDevice(remote);
+		await repo.rename('a', 'b');
+		await repo.writeFile('a/keep.md', 'precious\n');
+		expect((await sync.discard(['a'])).ok).toBe(false);
+		expect(get(sync).report).toMatchObject({ code: ErrorCode.PATH_EXISTS, message: expect.stringContaining('a/keep.md') });
+		expect(await repo.readText('a/keep.md')).toBe('precious\n');
+	});
+
 	it('takes the file back and tells the open note', async () => {
 		const { repo, sync, notes } = await setUp();
 		await notes.open('a.md');
@@ -384,6 +501,53 @@ describe('a merge', () => {
 		expect((await sync.push()).code).toBe(ErrorCode.MERGE_IN_PROGRESS);
 	});
 
+	it('still shows the merge and its way out when a conflict\'s details cannot be read', async () => {
+		const { sync, repo } = await setUpConflict();
+		vi.spyOn(repo, 'describeConflicts').mockRejectedValue(new Error('storage went away'));
+		await sync.refresh();
+		expect(get(sync)).toMatchObject({
+			merge: { conflictedPaths: ['a.md'] },
+			conflicts: [{ path: 'a.md', hasMarkers: true, undecided: true }],
+			report: { message: 'storage went away' }
+		});
+		expect((await sync.autosaveOps.readWork()).merge).toBe(true);
+		vi.mocked(repo.describeConflicts).mockRestore();
+		expect((await sync.abortMerge()).ok).toBe(true);
+		expect(get(sync)).toMatchObject({ merge: null, report: null });
+	});
+
+	it('still shows the merge when the counts cannot be read', async () => {
+		const { sync, repo } = await setUpConflict();
+		vi.spyOn(repo, 'aheadBehind').mockRejectedValueOnce(new Error('storage went away'));
+		await sync.refresh();
+		expect(get(sync)).toMatchObject({ merge: { conflictedPaths: ['a.md'] }, report: { message: 'storage went away' } });
+	});
+
+	it('resolves a conflict on a symbolic link whose target is gone, and it stays a link', async () => {
+		const remote = await createRemote({ 'a.md': 'one\n' });
+		await changeElsewhere(remote, {}, async (work) => {
+			await symlink('a.md', path.join(work, 'link.md'));
+			await runGit(['add', 'link.md'], work);
+		});
+		const { repo, sync } = await openDevice(remote);
+		await repo.remove('link.md');
+		await sync.commit({ paths: ['link.md'], message: 'drop the link' });
+		await changeElsewhere(remote, {}, async (work) => {
+			await unlink(path.join(work, 'link.md'));
+			await symlink('nowhere.md', path.join(work, 'link.md'));
+			await runGit(['add', 'link.md'], work);
+		});
+
+		expect(await sync.pull()).toMatchObject({ ok: true, status: 'conflict' });
+		expect(get(sync)).toMatchObject({ report: null, merge: { conflictedPaths: ['link.md'] }, conflicts: [{ path: 'link.md', kind: 'deleted_by_us', hasMarkers: false, undecided: true }] });
+
+		expect((await sync.resolve('link.md', 'theirs')).ok).toBe(true);
+		expect((await sync.completeMerge({ allowMarkers: false })).ok).toBe(true);
+		await sync.push();
+		expect(await runGit(['ls-tree', 'main', 'link.md'], remote.bare)).toMatch(/^120000 /);
+		expect(await showRemote(remote, 'main:link.md')).toBe('nowhere.md');
+	});
+
 	it('offers a way out of a damaged record, instead of failing on every step', async () => {
 		const { sync, fs, repo, reopen } = await setUpConflict();
 		await fs.promises.writeFile(`${repo.dir}/.git/gitnote-merge.json`, 'not json', { encoding: 'utf8' });
@@ -399,6 +563,13 @@ describe('a merge', () => {
 });
 
 describe('the autosave operations', () => {
+	it('name the file over a size limit, so autosave can leave it out', async () => {
+		const { repo, sync } = await setUp();
+		await repo.writeFile('big.bin', new Uint8Array(101 * 1024 * 1024).fill(97));
+		await repo.writeFile('a.md', 'edited\n');
+		expect(await sync.autosaveOps.checkCommit(['big.bin', 'a.md'])).toMatchObject([{ level: 'block', path: 'big.bin' }]);
+	}, 60_000);
+
 	it('see an open merge, so autosave stands aside', async () => {
 		const { sync } = await setUpConflict();
 		expect((await sync.autosaveOps.readWork()).merge).toBe(true);
