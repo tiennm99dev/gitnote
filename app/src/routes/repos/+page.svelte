@@ -4,11 +4,11 @@
 	import { AuthError, AuthErrorCode } from '#lib/auth/errors.js';
 	import { authSession } from '#lib/auth/index.js';
 	import { PROVIDERS } from '#lib/auth/providers.js';
-	import { deleteDeviceRepo, openDeviceRepo } from '#lib/git/device-repos.js';
+	import { deleteDeviceRepo, describeDeviceWork, openDeviceRepo } from '#lib/git/device-repos.js';
 	import { ErrorCode, GitEngineError } from '#lib/git/errors.js';
 	import { getStorageUsage, repoIdForUrl } from '#lib/git/fs.js';
 	import { checkRepoSize, formatBytes } from '#lib/git/limits.js';
-	import { describeLocalWork, describeWorkCounts, listLocalRepos, saveLocalRepo, settleFailedClone } from '#lib/git/local-repos.js';
+	import { describeWorkCounts, listLocalRepos, saveLocalRepo, settleFailedClone } from '#lib/git/local-repos.js';
 
 	/** @typedef {import('#lib/auth/session.js').RemoteRepo} RemoteRepo */
 	/** @typedef {import('#lib/git/limits.js').ProviderId} ProviderId */
@@ -200,7 +200,7 @@
 	 * @param {import('#lib/git/local-repos.js').LocalRepo} repo
 	 * @returns {Promise<import('#lib/git/local-repos.js').LocalWork>}
 	 */
-	const countCopy = async (repo) => (await describeLocalWork([repo], openDeviceRepo))[0];
+	const countCopy = async (repo) => (await describeDeviceWork([repo]))[0];
 
 	/** @param {import('#lib/git/local-repos.js').LocalRepo} repo */
 	const startRemove = async (repo) => {
@@ -360,7 +360,11 @@
 			<ul class="flex flex-col gap-1">
 				{#each copies as { repo, files } (repo.id)}
 					<li class="rounded border border-gray-300 p-2" data-testid="local-copy">
-						<span class="font-medium">{repo.fullName}</span>
+						{#if repo.ready}
+							<a class="font-medium underline" href={resolve('/repo/[id]/[...path]', { id: encodeURIComponent(repo.id), path: '' })} data-testid="open-copy">{repo.fullName}</a>
+						{:else}
+							<span class="font-medium">{repo.fullName}</span>
+						{/if}
 						<span class="text-sm text-gray-600" data-testid="local-copy-state">{repo.branch}{describeCopy(repo, files)}</span>
 						{#if removing?.work.repo.id === repo.id}
 							<div class="mt-2 flex flex-col gap-2 rounded bg-gray-100 p-3" data-testid="remove-copy">
