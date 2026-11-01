@@ -3,6 +3,11 @@
   "name": "gitnote",
   "main": "src/index.js",
   "compatibility_date": "2026-10-23",
+  // Serve only from the app's own domain. A workers.dev or preview hostname
+  // would be a second origin that passes the same-origin check yet is missing
+  // from the app's CSP connect-src.
+  "workers_dev": false,
+  "preview_urls": false,
   // The SPA build. Only /api/* reaches the Worker; every other path is served
   // from the assets, and unknown paths fall back to index.html for the client
   // router. Asset response headers come from app/static/_headers.

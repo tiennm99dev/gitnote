@@ -32,7 +32,7 @@ Run from the repo root:
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build served on port 4173 |
+| `npm run e2e` | Playwright against a fresh production build, served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174 |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 
@@ -45,15 +45,16 @@ system Chromium instead, set `CHROMIUM_PATH`, for example
 The Worker keeps nothing about users: no storage bindings, and Workers Logs,
 traces and Logpush stay off (`relay/wrangler.jsonc`). Only `/api/*` runs the
 Worker; every other path is a static asset, with unknown paths falling back to
-`index.html`.
+`index.html`. The `workers.dev` and preview hostnames are off, so the app's own
+domain is the only origin.
 
 | Route | Does |
 | --- | --- |
 | `GET /api/health` | Liveness probe |
 | `GET /api/git/<host>/<repo path>.git/info/refs?service=git-upload-pack` (or `git-receive-pack`) | Git smart-HTTP ref discovery |
-| `POST /api/git/<host>/<repo path>.git/git-upload-pack` and `.../git-receive-pack` | Fetch and push; needs `Content-Length`, at most 95 MB (413 above it) |
-| `POST /api/oauth/github/token` | GitHub App code exchange: JSON `{ code, code_verifier?, redirect_uri? }` |
-| `POST /api/oauth/github/refresh` | GitHub App token refresh: JSON `{ refresh_token }` |
+| `POST /api/git/<host>/<repo path>.git/git-upload-pack` and `.../git-receive-pack` | Fetch and push; needs `Content-Length`, at most 95 MB (413 above it); body uncompressed or `Content-Encoding: gzip` (415 otherwise) |
+| `POST /api/oauth/github/token` | GitHub App code exchange: JSON `{ code, code_verifier?, redirect_uri? }`, with `Content-Length`, at most 8 KB |
+| `POST /api/oauth/github/refresh` | GitHub App token refresh: JSON `{ refresh_token }`, same limits |
 
 - **Git hosts** come from the `GIT_HOSTS` var: `github.com,gitlab.com` over
   https. Loopback entries such as `localhost:8174` use http, for local test

@@ -50,5 +50,6 @@ describe('rate limits', () => {
 		);
 		expect(passed).toBeGreaterThanOrEqual(300);
 		expect(passed).toBeLessThanOrEqual(600);
-	});
+		// Up to 600 sequential requests: the default 5 s runs out on a loaded host.
+	}, 30_000);
 });
