@@ -497,6 +497,14 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	 */
 	const removeFromTree = async (path) => {
 		await removeRecursive(abs(path));
+		await pruneEmptyParents(path);
+	};
+
+	/**
+	 * @param {string} path a path just removed or moved away
+	 * @returns {Promise<void>}
+	 */
+	const pruneEmptyParents = async (path) => {
 		const segments = path.split('/').slice(0, -1);
 		while (segments.length > 0) {
 			const folder = abs(segments.join('/'));
@@ -877,6 +885,52 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	};
 
 	/**
+	 * The caller holds the lock.
+	 * @param {string} path
+	 * @param {string | Uint8Array} data
+	 * @param {boolean} exclusive refuse a path that already exists
+	 * @returns {Promise<void>}
+	 */
+	const writeWorkingFile = async (path, data, exclusive) => {
+		const filepath = normalizePath(path);
+		if (typeof data !== 'string' && !(data instanceof Uint8Array)) {
+			throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'File content must be text or bytes.');
+		}
+		await assertCloned();
+		const parent = filepath.split('/').slice(0, -1).join('/');
+		if (parent) await mkdirp(abs(parent));
+		const existing = await lstatOrNull(abs(filepath));
+		if (existing?.isDirectory()) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${filepath} is a folder.`);
+		if (existing && exclusive) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${filepath} already exists.`);
+		// isomorphic-git decides a file is unchanged from its size, whole-second
+		// mtime and inode, so a same-size edit in the second of the last index
+		// write would look clean, and a pull could then run over it. Swapping
+		// in a file created while the old one exists always changes the inode.
+		const temp = `${gitdir}/${WRITE_TEMP_FILE}`;
+		const backup = `${gitdir}/${WRITE_BACKUP_FILE}`;
+		if (await lstatOrNull(backup)) await fs.promises.unlink(backup);
+		await fs.promises.writeFile(temp, data, {
+			...(typeof data === 'string' ? { encoding: 'utf8' } : {}),
+			...(existing ? { mode: existing.mode } : {})
+		});
+		// LightningFS deletes an unlinked file's data at once but saves its
+		// directory later. The old file is deleted only once the directory
+		// on disk points at the new one, so a closed tab always keeps one.
+		if (existing) await fs.promises.rename(abs(filepath), backup);
+		try {
+			await fs.promises.rename(temp, abs(filepath));
+		} catch (error) {
+			if (existing) await fs.promises.rename(backup, abs(filepath));
+			throw error;
+		}
+		await flush();
+		if (existing) {
+			await fs.promises.unlink(backup);
+			await flush();
+		}
+	};
+
+	/**
 	 * Never throws, because a copy too damaged to read must still be deletable.
 	 * A copy that cannot be read reports nulls rather than zero, so a warning
 	 * never understates what is at risk.
@@ -1069,44 +1123,16 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		 * @param {string | Uint8Array} data
 		 * @returns {Promise<void>}
 		 */
-		writeFile: (path, data) =>
-			locked(async () => {
-				const filepath = normalizePath(path);
-				if (typeof data !== 'string' && !(data instanceof Uint8Array)) {
-					throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'File content must be text or bytes.');
-				}
-				await assertCloned();
-				const parent = filepath.split('/').slice(0, -1).join('/');
-				if (parent) await mkdirp(abs(parent));
-				const existing = await lstatOrNull(abs(filepath));
-				if (existing?.isDirectory()) throw new GitEngineError(ErrorCode.PATH_EXISTS, `${filepath} is a folder.`);
-				// isomorphic-git decides a file is unchanged from its size, whole-second
-				// mtime and inode, so a same-size edit in the second of the last index
-				// write would look clean, and a pull could then run over it. Swapping
-				// in a file created while the old one exists always changes the inode.
-				const temp = `${gitdir}/${WRITE_TEMP_FILE}`;
-				const backup = `${gitdir}/${WRITE_BACKUP_FILE}`;
-				if (await lstatOrNull(backup)) await fs.promises.unlink(backup);
-				await fs.promises.writeFile(temp, data, {
-					...(typeof data === 'string' ? { encoding: 'utf8' } : {}),
-					...(existing ? { mode: existing.mode } : {})
-				});
-				// LightningFS deletes an unlinked file's data at once but saves its
-				// directory later. The old file is deleted only once the directory
-				// on disk points at the new one, so a closed tab always keeps one.
-				if (existing) await fs.promises.rename(abs(filepath), backup);
-				try {
-					await fs.promises.rename(temp, abs(filepath));
-				} catch (error) {
-					if (existing) await fs.promises.rename(backup, abs(filepath));
-					throw error;
-				}
-				await flush();
-				if (existing) {
-					await fs.promises.unlink(backup);
-					await flush();
-				}
-			}),
+		writeFile: (path, data) => locked(() => writeWorkingFile(path, data, false)),
+
+		/**
+		 * Writes a new working-tree file, creating its folders. Nothing is staged.
+		 * @param {string} path
+		 * @param {string | Uint8Array} data
+		 * @returns {Promise<void>}
+		 * @throws {GitEngineError} `PATH_EXISTS` when anything is already there
+		 */
+		createFile: (path, data) => locked(() => writeWorkingFile(path, data, true)),
 
 		/**
 		 * Renames a file or folder in the working tree. Never overwrites.
@@ -1127,6 +1153,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				const parent = target.split('/').slice(0, -1).join('/');
 				if (parent) await mkdirp(abs(parent));
 				await fs.promises.rename(abs(source), abs(target));
+				await pruneEmptyParents(source);
 				await flush();
 			}),
 
@@ -1141,6 +1168,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				await assertCloned();
 				if (!(await lstatOrNull(abs(filepath)))) throw new GitEngineError(ErrorCode.PATH_NOT_FOUND, `${filepath} does not exist.`);
 				await removeRecursive(abs(filepath));
+				await pruneEmptyParents(filepath);
 				await flush();
 			}),
 

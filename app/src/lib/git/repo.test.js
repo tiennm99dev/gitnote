@@ -498,6 +498,26 @@ describe('working tree', () => {
 		expect((await rejection(repo.rename('folder', 'folder/inner'))).code).toBe(ErrorCode.INVALID_PATH);
 	});
 
+	it('creates a file only where nothing exists', async () => {
+		const { repo } = await clonedRepo({ 'a.md': 'a\n', 'dir/b.md': 'b\n' });
+		await repo.createFile('new/c.md', 'c\n');
+		expect(await repo.readText('new/c.md')).toBe('c\n');
+		expect((await rejection(repo.createFile('a.md', ''))).code).toBe(ErrorCode.PATH_EXISTS);
+		expect((await rejection(repo.createFile('dir', ''))).code).toBe(ErrorCode.PATH_EXISTS);
+		expect(await repo.readText('a.md')).toBe('a\n');
+	});
+
+	it('leaves no empty folder behind a delete or a move', async () => {
+		const { repo } = await clonedRepo({ 'a/deep/b.md': 'b\n', 'c/d.md': 'd\n', 'e/f.md': 'f\n', 'e/g.md': 'g\n' });
+		await repo.remove('a/deep/b.md');
+		await repo.rename('c/d.md', 'x.md');
+		await repo.remove('e/f.md');
+
+		await repo.rename('x.md', 'a');
+		await repo.rename('a', 'c');
+		expect((await repo.listTree()).map((entry) => entry.path)).toEqual(['c', 'e/g.md']);
+	});
+
 	it('removes folders recursively', async () => {
 		const { repo } = await clonedRepo({ 'dir/a.md': 'a\n', 'dir/sub/b.md': 'b\n', 'c.md': 'c\n' });
 		await repo.remove('dir');
