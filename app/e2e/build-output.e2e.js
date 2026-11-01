@@ -39,3 +39,12 @@ test('fixture sign-in IDs stay out of the directory the Worker deploys', async (
 	expect(tested).toContain(FIXTURE_IDS[0]);
 	for (const id of FIXTURE_IDS) expect(deployed).not.toContain(id);
 });
+
+test('the deployable directory does not hold an Android build, whose policy allows inline scripts', async () => {
+	const deployed = await readBuild('build');
+	test.skip(deployed === null && !process.env.CI, 'Run `npm run build` first: there is no deployable build to check.');
+	const policy = /<meta http-equiv="content-security-policy" content="([^"]+)"/.exec(String(deployed))?.[1] ?? '';
+	const scriptSrc = policy.split(';').find((part) => part.trim().startsWith('script-src'));
+	expect(scriptSrc, 'after `npm run android:sync`, run `npm run build` before deploying').toBeTruthy();
+	expect(scriptSrc).not.toContain('unsafe-inline');
+});

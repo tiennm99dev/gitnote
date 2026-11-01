@@ -12,7 +12,7 @@ export const E2E_BUILD_DIR = 'build-e2e';
 const BUILD_DIR = fileURLToPath(new URL(`../${E2E_BUILD_DIR}/`, import.meta.url));
 
 /** @type {Record<string, string>} */
-const CONTENT_TYPES = {
+export const CONTENT_TYPES = {
 	'.html': 'text/html; charset=utf-8',
 	'.js': 'text/javascript; charset=utf-8',
 	'.css': 'text/css; charset=utf-8',

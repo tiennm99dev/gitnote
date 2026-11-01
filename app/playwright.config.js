@@ -1,6 +1,7 @@
 import { defineConfig, devices } from '@playwright/test';
 import { artifactPolicy } from './e2e/artifact-policy.js';
 import { E2E_RELAY_PORT } from './e2e/git-engine-ports.js';
+import { NATIVE_BUILD_DIR } from './e2e/native-shell.js';
 import { E2E_BUILD_DIR, STATIC_SHELL_PORT } from './e2e/static-server.js';
 
 const PORT = 4173;
@@ -24,7 +25,9 @@ export default defineConfig({
 	},
 	webServer: [
 		{
-			command: `npm run build && npm run preview -- --port ${PORT} --strictPort`,
+			// The native build goes first because `vite preview` serves SvelteKit's
+			// output from the last build, which must be the web one.
+			command: `node scripts/build-native.js ${NATIVE_BUILD_DIR} && npm run build && npm run preview -- --port ${PORT} --strictPort`,
 			url: `http://localhost:${PORT}`,
 			// Fixture IDs that turn the sign-in buttons on. The tests stand in for
 			// the providers' sign-in pages, so nothing reaches GitHub or GitLab. They
@@ -38,7 +41,7 @@ export default defineConfig({
 			// Always build and serve fresh: a reused preview would test a stale build.
 			// A busy port fails the run; stop the stale server instead.
 			reuseExistingServer: false,
-			timeout: 120_000
+			timeout: 240_000
 		},
 		{
 			// The same build as the Capacitor WebView and Static Assets serve it:
@@ -47,7 +50,7 @@ export default defineConfig({
 			command: 'node e2e/static-server.js',
 			url: `http://127.0.0.1:${STATIC_SHELL_PORT}`,
 			reuseExistingServer: false,
-			timeout: 120_000
+			timeout: 240_000
 		},
 		{
 			// The git engine's test page, on the real relay in front of a local git

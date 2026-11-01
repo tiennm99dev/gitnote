@@ -38,9 +38,11 @@ export function gitAuthorization(token, provider) {
  * @param {import('@playwright/test').Page} page
  * @param {ProviderId} provider
  * @param {string} token
+ * @param {{ crossOrigin?: boolean }} [options] the page is another origin than the relay:
+ *   keep its `Origin`, so the real relay decides and answers CORS
  * @returns {Promise<{ authorized: () => number }>}
  */
-export async function serveGit(page, provider, token) {
+export async function serveGit(page, provider, token, { crossOrigin = false } = {}) {
 	const { host } = PROVIDERS[provider];
 	let authorized = 0;
 	await page.route(new RegExp(`/api/git/${host.replace('.', '\\.')}/`), async (route) => {
@@ -54,7 +56,7 @@ export async function serveGit(page, provider, token) {
 		const path = url.pathname.replace(`/api/git/${host}/`, `/api/git/localhost:${E2E_GIT_PORT}/`);
 		const headers = { ...request.headers() };
 		// The test runner is the relay's client here, not the page's origin.
-		for (const name of ['origin', 'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest']) delete headers[name];
+		if (!crossOrigin) for (const name of ['origin', 'referer', 'sec-fetch-site', 'sec-fetch-mode', 'sec-fetch-dest']) delete headers[name];
 		// The app's token was checked above; the local server knows only its own credential.
 		headers.authorization = `Basic ${Buffer.from(`${FIXTURE_CREDENTIAL.username}:${FIXTURE_CREDENTIAL.password}`).toString('base64')}`;
 		const response = await route.fetch({ url: `http://127.0.0.1:${E2E_RELAY_PORT}${path}${url.search}`, headers });
