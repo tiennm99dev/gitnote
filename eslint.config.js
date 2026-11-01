@@ -21,7 +21,7 @@ export default defineConfig([
 		languageOptions: { globals: globals.worker }
 	},
 	{
-		files: ['**/*.config.js', 'app/e2e/**/*.js'],
+		files: ['**/*.config.js', 'app/e2e/**/*.js', 'app/test/**/*.js', 'app/src/**/*.test.js'],
 		languageOptions: { globals: globals.node }
 	},
 	{
