@@ -29,7 +29,7 @@ Run from the repo root:
 | `npm run dev` | Vite dev server on port 5173; `/api` is proxied to port 8787 |
 | `npm run dev:relay` | `wrangler dev` for the relay on port 8787 |
 | `npm run lint` | ESLint (with `eslint-plugin-jsdoc` and `eslint-plugin-svelte`), zero warnings |
-| `npm run typecheck` | `svelte-check` over the app's JS and JSDoc types |
+| `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
 | `npm run e2e` | Playwright against a fresh production build served on port 4173 |

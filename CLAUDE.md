@@ -18,7 +18,7 @@ tooling notes: [README.md](README.md).
 ## Rules
 
 - Plain JavaScript with JSDoc types. Never add `.ts` or `.d.ts` files.
-  Lint and `svelte-check` must end with zero warnings.
+  Lint, `svelte-check` and the relay `tsc` check must end with zero warnings.
 - npm only, one lockfile. Use caret ranges in `package.json`; exact versions
   live only in `package-lock.json`. A new package with an install script
   needs an explicit `allowScripts` entry.

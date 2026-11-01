@@ -14,7 +14,7 @@
     "dev": "npm run dev -w app",
     "dev:relay": "npm run dev -w relay",
     "lint": "eslint . --max-warnings=0",
-    "typecheck": "npm run check -w app",
+    "typecheck": "npm run check --workspaces",
     "test": "npm run test --workspaces",
     "build": "npm run build --workspaces",
     "e2e": "npm run e2e -w app"
