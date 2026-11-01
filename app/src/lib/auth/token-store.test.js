@@ -94,9 +94,21 @@ describe('the Android store', () => {
 		expect(await store.get('github')).toBeNull();
 	});
 
-	it.each([StorageErrorType.osError, StorageErrorType.invalidData])('reads a record the Keystore refuses as absent (%s)', async (code) => {
-		const { store } = secureStorage(new StorageError('refused', code));
+	it('reads a record in an invalid format as absent', async () => {
+		const { store } = secureStorage(new StorageError('The data in the store is in an invalid format', StorageErrorType.invalidData));
 		expect(await store.get('github')).toBeNull();
+	});
+
+	it.each(['AEADBadTagException', 'KeyPermanentlyInvalidatedException', 'UnrecoverableKeyException'])('reads a record whose key is lost for good as absent (%s)', async (name) => {
+		const { store } = secureStorage(new StorageError(`An OS error occurred (${name})`, StorageErrorType.osError));
+		expect(await store.get('github')).toBeNull();
+	});
+
+	it.each(['An OS error occurred (KeyStoreException)', 'An OS error occurred (IOException)', 'An OS error occurred (NoSuchAlgorithmException)', 'refused'])('reports a Keystore failure that may pass as a storage error (%s)', async (message) => {
+		const { store, items } = secureStorage(new StorageError(message, StorageErrorType.osError));
+		items.set('github', JSON.stringify(VALUE));
+		await expect(store.get('github')).rejects.toMatchObject({ code: AuthErrorCode.STORAGE });
+		expect(items.has('github')).toBe(true);
 	});
 
 	it('reports any other failure as a storage error', async () => {

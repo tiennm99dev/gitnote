@@ -184,8 +184,25 @@ async function withSecureStorage(operation) {
 }
 
 /**
+ * The plugin gives every Java security or I/O exception the one code `osError`, and
+ * names the class only in its message: "An OS error occurred (<SimpleName>)".
+ */
+const PERMANENT_KEY_LOSS = /\((?:AEADBadTagException|KeyPermanentlyInvalidatedException|UnrecoverableKeyException)\)$/;
+
+/**
+ * @param {unknown} error
+ * @returns {boolean} whether the failure means this record can never be read again
+ */
+function isLostRecord(error) {
+	const { code, message } = /** @type {{ code?: unknown, message?: unknown }} */ (error ?? {});
+	if (code === StorageErrorType.invalidData) return true;
+	return code === StorageErrorType.osError && typeof message === 'string' && PERMANENT_KEY_LOSS.test(message);
+}
+
+/**
  * The store for the Android build. A record the Keystore can no longer decrypt
- * reads as absent, like one on the web, so a new sign-in can replace it.
+ * reads as absent, like one on the web, so a new sign-in can replace it. Any other
+ * Keystore failure may pass, so it is reported and the record stays.
  * @template T
  * @param {Pick<typeof SecureStorage, 'get' | 'set' | 'remove'>} [storage]
  * @returns {TokenStore<T>}
@@ -198,8 +215,7 @@ export function createNativeTokenStore(storage = SecureStorage) {
 					const value = await storage.get(name, false);
 					return /** @type {T | null} */ (typeof value === 'object' ? value : null);
 				} catch (error) {
-					const code = /** @type {{ code?: unknown } | null} */ (error)?.code;
-					if (code === StorageErrorType.osError || code === StorageErrorType.invalidData) return null;
+					if (isLostRecord(error)) return null;
 					throw error;
 				}
 			}),
