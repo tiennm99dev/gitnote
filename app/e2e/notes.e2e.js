@@ -38,6 +38,8 @@ const SEED = {
 	'notes/other note.md': '# Other\n\nA needle in the note.\n',
 	'notes/page.html': '<script>window.noteScriptRan = true</script>',
 	'notes/raw.txt': 'plain text\n',
+	'notes/z-crlf.md': 'one\r\ntwo\r\n',
+	'notes/z-toc.md': `# Contents\n\n[jump](#far-away)\n\n<dialog open><a href="https://example.com/login">Session expired</a></dialog>\n\n${'filler\n\n'.repeat(200)}## Far away\n`,
 	'zzz.md': '# Last\n'
 };
 
@@ -86,6 +88,51 @@ async function typeNote(page, text) {
 	await page.getByTestId('note-editor').locator('.cm-content').click();
 	await page.keyboard.press('ControlOrMeta+A');
 	await page.keyboard.type(text);
+}
+
+/**
+ * Delivers a text paste to the editor the way the browser does.
+ * @param {import('@playwright/test').Locator} content
+ * @param {string} text
+ * @returns {Promise<void>}
+ */
+async function pasteText(content, text) {
+	await content.evaluate((node, pasted) => {
+		const data = new DataTransfer();
+		data.setData('text/plain', pasted);
+		node.dispatchEvent(new ClipboardEvent('paste', { clipboardData: data, bubbles: true, cancelable: true }));
+	}, text);
+}
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @returns {Promise<{ path: string, text: string }[]>} every draft on this device
+ */
+function storedDrafts(page) {
+	return page.evaluate(
+		() =>
+			new Promise((resolve, reject) => {
+				const open = indexedDB.open('gitnote-drafts');
+				open.onerror = () => reject(open.error);
+				open.onsuccess = () => {
+					const all = open.result.transaction('drafts').objectStore('drafts').getAll();
+					all.onerror = () => reject(all.error);
+					all.onsuccess = () => {
+						open.result.close();
+						resolve(all.result);
+					};
+				};
+			})
+	);
+}
+
+/**
+ * @param {import('@playwright/test').Page} page
+ * @param {string} path
+ * @returns {Promise<string | undefined>} the text of the draft kept for a path
+ */
+async function draftText(page, path) {
+	return (await storedDrafts(page)).find((draft) => draft.path === path)?.text;
 }
 
 test.describe.configure({ timeout: 90_000 });
@@ -293,6 +340,22 @@ test('creates, renames, moves and deletes, with no commit made', async ({ page }
 	await expect(page.getByTestId('note-editor')).toBeVisible();
 	await expect(drawer.getByRole('link', { name: 'soon.md' })).toBeVisible();
 
+	// Only that first opening starts in the editor; coming back starts in read mode.
+	await drawer.getByRole('link', { name: 'zzz.md' }).click();
+	await expect(page.getByTestId('note-path')).toHaveText('zzz.md');
+	await drawer.getByRole('link', { name: 'soon.md' }).click();
+	await expect(page.getByTestId('note-path')).toHaveText('later/soon.md');
+	await expect(page.getByRole('button', { name: 'Read', exact: true })).toHaveAttribute('aria-pressed', 'true');
+	await expect(page.getByTestId('note-editor')).toHaveCount(0);
+
+	// Moving a note onto its own path changes nothing.
+	await drawer.getByRole('button', { name: 'Actions for soon.md' }).click();
+	await drawer.getByRole('button', { name: 'Rename or move' }).click();
+	await page.getByTestId('dialog-confirm').click();
+	await expect(page.getByTestId('notes-dialog')).not.toBeVisible();
+	await expect(page.getByTestId('note-path')).toHaveText('later/soon.md');
+	await expect(drawer.getByRole('link', { name: 'soon.md' })).toBeVisible();
+
 	expect(await remoteHead(remote)).toBe(headBefore);
 	expect(problems).toEqual([]);
 });
@@ -339,6 +402,83 @@ test('adds images by picking and pasting, and searches note text', async ({ page
 	await expect(page.getByTestId('search-results')).toContainText('Nothing found');
 
 	expect(problems).toEqual([]);
+});
+
+test('a note links to its own headings, and cannot cover the app', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'notes/z-toc.md'));
+	const preview = page.getByTestId('note-preview');
+	const far = preview.getByRole('heading', { name: 'Far away' });
+	await expect(far).toBeAttached();
+	await expect(far).not.toBeInViewport();
+
+	// Raw HTML that would float over the header stays in the note's flow.
+	await expect(preview.locator('dialog')).toHaveCount(0);
+	const inFlow = await preview.getByRole('link', { name: 'Session expired' }).boundingBox();
+	const article = await preview.boundingBox();
+	expect(inFlow && article && inFlow.x >= article.x && inFlow.y >= article.y && inFlow.x + inFlow.width <= article.x + article.width).toBe(true);
+	await page.getByRole('button', { name: 'Edit', exact: true }).click({ trial: true });
+
+	await preview.getByRole('link', { name: 'jump' }).click();
+	await expect(far).toBeInViewport();
+	await expect(page).toHaveURL(/#user-content-far-away$/);
+
+	// A link from elsewhere arrives before the note has rendered.
+	await page.reload();
+	await expect(far).toBeInViewport();
+
+	expect(problems).toEqual([]);
+});
+
+test('pasted text takes the line endings of the note', async ({ page }) => {
+	const problems = collectBreakage(page);
+	const { id } = await cloneRepo(page);
+	const content = page.getByTestId('note-editor').locator('.cm-content');
+
+	await page.goto(noteUrl(id, 'notes/z-crlf.md'));
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await content.click();
+	await page.keyboard.press('ControlOrMeta+Home');
+	await pasteText(content, 'x\ny\n');
+	await expect(content.locator('.cm-line')).toHaveCount(5);
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+	expect(await draftText(page, 'notes/z-crlf.md')).toBe('x\r\ny\r\none\r\ntwo\r\n');
+
+	await page.goto(noteUrl(id, 'README.md'));
+	await page.getByRole('button', { name: 'Edit', exact: true }).click();
+	await content.click();
+	await page.keyboard.press('ControlOrMeta+Home');
+	await pasteText(content, 'x\r\ny\r\n');
+	await expect(content.locator('.cm-line')).toHaveCount(4);
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+	expect(await draftText(page, 'README.md')).toBe('x\ny\n# Top\n');
+
+	expect(problems).toEqual([]);
+});
+
+test('a save in one tab leaves the other tab able to keep its text', async ({ page, context }) => {
+	const { id } = await cloneRepo(page);
+	await page.goto(noteUrl(id, 'README.md'));
+	const other = await context.newPage();
+	await other.goto(noteUrl(id, 'README.md'));
+	await expect(other.getByTestId('note-preview').getByRole('heading', { name: 'Top' })).toBeVisible();
+
+	await typeNote(other, 'words from the other tab');
+	await expect(other.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+	await typeNote(page, 'words from this tab');
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Unsaved, kept on this device');
+	expect(await draftText(page, 'README.md')).toBe('words from this tab');
+	await page.getByTestId('save-note').click();
+	await expect(page.getByTestId('dirty-indicator')).toHaveText('Saved to the working tree');
+	await expect.poll(() => draftText(page, 'README.md')).toBeUndefined();
+
+	// The other tab gets its text kept again as soon as it is looked at.
+	await other.evaluate(() => window.dispatchEvent(new Event('focus')));
+	await expect.poll(() => draftText(page, 'README.md')).toBe('words from the other tab');
+	await other.reload();
+	await expect(other.getByTestId('note-editor').locator('.cm-content')).toContainText('words from the other tab');
+	await other.close();
 });
 
 test.describe('on a phone', () => {
@@ -427,23 +567,7 @@ test('deleting a copy warns about unsaved text and removes it from the device', 
 	await page.getByRole('button', { name: 'Delete this copy' }).click();
 	await expect(page.getByTestId('local-copy')).toHaveCount(0);
 
-	const stored = await page.evaluate(
-		(databaseName) =>
-			new Promise((resolve, reject) => {
-				const open = indexedDB.open(databaseName);
-				open.onerror = () => reject(open.error);
-				open.onsuccess = () => {
-					const all = open.result.transaction('drafts').objectStore('drafts').getAll();
-					all.onerror = () => reject(all.error);
-					all.onsuccess = () => {
-						open.result.close();
-						resolve(all.result);
-					};
-				};
-			}),
-		'gitnote-drafts'
-	);
-	expect(stored).toEqual([]);
+	expect(await storedDrafts(page)).toEqual([]);
 
 	await page.goto(noteUrl(id, 'README.md'));
 	await expect(page.getByTestId('repo-not-here')).toBeVisible();

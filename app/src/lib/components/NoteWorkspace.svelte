@@ -25,7 +25,7 @@
 	let drawerOpen = $state(untrack(() => path === ''));
 	/** @type {string | null} */
 	let report = $state(null);
-	/** A path just created, which opens ready to type in. */
+	/** A path just created, which opens ready to type in until the next navigation. */
 	let createdPath = $state('');
 
 	/**
@@ -63,6 +63,7 @@
 		const target = path;
 		untrack(() => {
 			report = null;
+			if (target !== createdPath) createdPath = '';
 			notes.open(target).catch((/** @type {unknown} */ error) => {
 				report = messageOf(error);
 			});
@@ -70,15 +71,21 @@
 	});
 
 	onMount(() => {
+		const refresh = () => {
+			notes.refresh().catch((/** @type {unknown} */ error) => {
+				report = messageOf(error);
+			});
+		};
 		const onVisible = () => {
-			if (document.visibilityState === 'visible') {
-				notes.refresh().catch((/** @type {unknown} */ error) => {
-					report = messageOf(error);
-				});
-			}
+			if (document.visibilityState === 'visible') refresh();
 		};
 		document.addEventListener('visibilitychange', onVisible);
-		return () => document.removeEventListener('visibilitychange', onVisible);
+		// Two windows side by side stay visible, so only focus tells them apart.
+		window.addEventListener('focus', refresh);
+		return () => {
+			document.removeEventListener('visibilitychange', onVisible);
+			window.removeEventListener('focus', refresh);
+		};
 	});
 
 	/** @param {Ask} next */
@@ -210,6 +217,9 @@
 	{#if report}
 		<p role="alert" class="bg-amber-50 p-2 text-amber-800" data-testid="workspace-report">{report}</p>
 	{/if}
+	{#if $notes.treeError}
+		<p role="alert" class="bg-red-50 p-2 text-red-700" data-testid="tree-error">The file list could not be read, so creating, moving and deleting are off: {$notes.treeError}</p>
+	{/if}
 
 	<div class="flex min-h-0 flex-1">
 		{#if drawerOpen}
@@ -251,9 +261,6 @@
 				</section>
 			{/if}
 
-			{#if $notes.treeError}
-				<p role="alert" class="text-red-700" data-testid="tree-error">{$notes.treeError}</p>
-			{/if}
 			<FileTree
 				entries={$notes.entries}
 				draftPaths={$notes.draftPaths}

@@ -113,18 +113,36 @@ segment. `app/src/lib/stores/notes.js` holds its state.
   commits. A draft remembers the file it started from: if the file changes
   underneath it, the user chooses between the two, and neither is overwritten
   until they do. Deleting a copy counts its drafts in the warning and removes
-  them with it.
+  them with it. A draft counts as a file when renaming: nothing moves onto one.
+- **Two tabs on one note.** Each tab keeps its own buffer and they share one
+  draft. A tab removes a draft only while it still holds the text that tab
+  stored, and a tab that regains focus stores its buffer again if the draft no
+  longer matches. Closing a tab whose draft another tab replaced, without going
+  back to it, loses that tab's unsaved text.
 - **Bytes.** Line endings and a byte order mark survive open and save unchanged.
-  A file over 5 MB, or one that is not valid UTF-8, shows its size only.
+  A file over 5 MB, or one that is not valid UTF-8, shows its size only. A note
+  edited past 5 MB stays editable until it is closed. Pasted text takes the
+  note's line ending; a note that mixes endings takes `\n`.
 - **Rendering** (`app/src/lib/markdown/render.js`). markdown-it with raw HTML on,
   then DOMPurify, then image and link rewriting. Raw HTML keeps its structure but
-  loses `style`, `class`, forms and media, so a note cannot pose as the app.
+  loses `style`, `class`, forms, media, dialogs, popovers and inline SVG, so a
+  note cannot pose as the app. Front matter is left out only when its first line
+  reads as YAML, so two horizontal rules keep the text between them. Headings get
+  ids, and `#fragment` links point at them, with sanitizing's `user-content-`
+  prefix.
   `blob:` URLs are made only for PNG, JPEG, GIF, WebP and SVG, and only land in an
   `<img>`. Remote images become links, because the CSP blocks them. Relative links
   open in the app.
 - **Images** go to `assets/` next to the note, under a name not in use, after the
-  per-file size check.
-- **Search** scans the working tree's markdown files in memory, ignoring case.
+  per-file size check. A paste counts as an image only in a markdown note with no
+  plain text on the clipboard.
+- **Search** scans the working tree's markdown files in memory, ignoring case. A
+  tracked name the engine refuses, such as one with a backslash, shows in the tree
+  and reports why when opened, and search skips it.
+- **A file list that cannot be read** shows above the note on every screen size.
+  Notes still open from the file itself, and creating, moving, deleting, adding
+  images and searching refuse rather than act on an old list. The engine's
+  `createFile` also refuses an existing path, which covers another tab.
 
 ## Git engine
 
