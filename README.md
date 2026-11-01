@@ -6,8 +6,8 @@ its markdown as notes, and commits and pushes only when you say so. The server
 keeps nothing about users: a stateless Cloudflare Worker serves the app and
 relays git traffic the browser cannot send directly.
 
-Status: early development. You can connect an account, clone a repo, and
-browse, edit and search its notes on the device; commit and sync are next.
+Status: early development. You can connect an account, clone a repo, browse,
+edit and search its notes on the device, then commit, pull and push them.
 
 ## Layout
 
@@ -102,6 +102,45 @@ GITHUB_CLIENT_SECRET=<GitHub App client secret>
 In production, set the credentials with `wrangler secret put GITHUB_CLIENT_ID`
 and `wrangler secret put GITHUB_CLIENT_SECRET`.
 
+## Commit and sync
+
+`app/src/lib/sync/sync.js` holds the state behind the sync bar, the commit panel
+(`CommitPanel.svelte`) and the merge list (`ConflictView.svelte`). It reports
+failures in its state instead of throwing.
+
+- **Commit.** Every changed file starts selected, with a line diff and a message
+  built from the paths. Size warnings come from the engine's `checkCommit`, and a
+  blocked file turns the commit buttons off. Unsaved text is not a change yet: the
+  panel lists it and offers Save all. Discard goes back to the branch's commit and
+  deletes a file the commit does not have.
+- **Author.** Settings (`/settings`) first, then the account's profile, then for
+  GitHub `<login>@users.noreply.github.com`. With none of those, committing and
+  merging ask for one, and a pull on opening is skipped.
+- **Pull** runs on opening and on request, only on a clean tree. Local changes hold
+  it back with a prompt to commit or discard; `fetchRemote` still updates the
+  behind count. Drafts do not hold it back: if a pull changes such a file, the
+  note asks which version to keep.
+- **Conflicts.** The list comes back after a reload, from the engine's merge
+  record. Conflicted text is edited in the ordinary note pane, so it keeps its
+  drafts. A file counts as resolved once it has no markers and no unsaved text;
+  markers that are really the file's content take an explicit choice. Binary files
+  and files one side deleted take an ours/theirs choice. The merge commit is always
+  the engine's `completeMerge`, and `abortMerge` is the way back.
+- **Push.** There is no force push. Offline, or on a connection failure, the push
+  is queued in localStorage and goes on `online`, on coming back and on opening.
+  Any other refusal is shown and not retried. A push over a size limit offers
+  `undoUnpushedCommits`.
+- **A damaged merge record** makes every engine call fail with
+  `MERGE_STATE_DAMAGED`, so the sync bar offers `resetDamagedMerge`: the index
+  returns to the branch and the files stay, as changes to commit or discard.
+- **Autosave (beta, off by default)** is `app/src/lib/sync/autosave.js`. While the
+  page is visible, every 1, 5, 10 or 30 minutes, it saves drafts, commits
+  `autosave: <paths>`, pulls, then pushes. Going hidden commits on the device only;
+  coming back, launching and regaining the network push. It stands aside while a
+  merge is open and resumes by itself after. A draft whose file changed underneath
+  it is left out and named. Timers run reliably only in the foreground, so it does
+  nothing while the app is in the background.
+
 ## Notes
 
 `/repo/<id>/<path>` is the notes screen, with the repo id URL-encoded into one
@@ -109,8 +148,8 @@ segment. `app/src/lib/stores/notes.js` holds its state.
 
 - **Where text lives.** The editor's buffer is copied to a draft in IndexedDB
   (`gitnote-drafts`) on every change, so a reload loses nothing. Save writes it
-  to the working tree. Only a commit puts it in git, and nothing on this screen
-  commits. A draft remembers the file it started from: if the file changes
+  to the working tree. Only a commit puts it in git, and only the commit panel
+  or the autosave beta commits. A draft remembers the file it started from: if the file changes
   underneath it, the user chooses between the two, and neither is overwritten
   until they do. Deleting a copy counts its drafts in the warning and removes
   them with it. A draft counts as a file when renaming or creating: nothing moves
