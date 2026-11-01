@@ -12,6 +12,12 @@ const CODE_VERIFIER = /^[A-Za-z0-9._~-]{43,128}$/;
 const REFRESH_TOKEN = /^[A-Za-z0-9_.-]{1,1024}$/;
 const MAX_REDIRECT_URI_LENGTH = 2048;
 
+/**
+ * GitHub errors about this relay's own App settings, not about the user's grant.
+ * They go out as a 502 so that no client can take them for a refused sign-in.
+ */
+const APP_CONFIG_ERRORS = new Set(['incorrect_client_credentials', 'redirect_uri_mismatch', 'unsupported_grant_type']);
+
 /** Token responses must never be cached anywhere. */
 const NO_STORE = { 'Cache-Control': 'no-store', Pragma: 'no-cache' };
 
@@ -60,7 +66,8 @@ oauthGithub.post('/refresh', async (c) => {
 /**
  * Sends the fields plus the App credentials to GitHub and relays the result:
  * the token JSON on success, a 400 carrying GitHub's error code when GitHub
- * rejects the grant, a 502 when GitHub answers with anything unexpected.
+ * rejects the grant, a 502 when GitHub rejects the App's own settings or answers
+ * with anything unexpected.
  * @param {import('./app-env.js').AppContext} c
  * @param {Record<string, string>} fields
  * @returns {Promise<Response>}
@@ -101,7 +108,7 @@ async function exchange(c, fields) {
 	}
 	if (typeof data.error === 'string') {
 		const message = typeof data.error_description === 'string' ? data.error_description : 'GitHub rejected the request.';
-		return jsonError(400, data.error, message, {}, NO_STORE);
+		return jsonError(APP_CONFIG_ERRORS.has(data.error) ? 502 : 400, data.error, message, {}, NO_STORE);
 	}
 	if (typeof data.access_token !== 'string') {
 		return jsonError(502, 'upstream_bad_response', 'GitHub returned no access token.');

@@ -345,6 +345,54 @@ describe('keeping tokens fresh', () => {
 		expect(await store.get('github')).not.toHaveProperty('needsSignIn');
 	});
 
+	it.each([
+		['a blocked request', () => jsonResponse({ error: 'origin_not_allowed', message: 'x' }, 403)],
+		['a deploy gap', () => new Response('<html>not found</html>', { status: 404 })],
+		['a refused body', () => jsonResponse({ error: 'payload_too_large', message: 'x' }, 413)],
+		['a config error sent as a 4xx', () => jsonResponse({ error: 'incorrect_client_credentials', message: 'x' }, 400)]
+	])('keeps the sign-in after %s, and spends the refresh token again later', async (_name, answer) => {
+		let refused = true;
+		const { session, store } = setup((url) => {
+			if (url.origin !== RELAY) return undefined;
+			return refused ? answer() : jsonResponse({ access_token: 'new-access', refresh_token: 'new-refresh', expires_in: 28800 });
+		});
+		await storeOauth(store, 'github', { expiresAt: START - 1, refreshToken: 'still-good' });
+		const source = session.gitCredentials('github');
+
+		const error = await failure(/** @type {Promise<unknown>} */ (source({ url: 'https://github.com/o/r.git', failed: false })));
+
+		expect(error.code).toBe(ErrorCode.NETWORK);
+		expect(await store.get('github')).toMatchObject({ refreshToken: 'still-good' });
+		expect(await store.get('github')).not.toHaveProperty('needsSignIn');
+		expect((await session.listAccounts())[0].needsSignIn).toBe(false);
+
+		refused = false;
+		expect(await source({ url: 'https://github.com/o/r.git', failed: false })).toMatchObject({ password: 'new-access' });
+	});
+
+	it.each([
+		['an expired grant', 400],
+		['a grant refused with a 401', 401]
+	])('ends a GitLab sign-in on %s', async (_name, status) => {
+		const { session, store } = setup((url) => (url.pathname === '/oauth/token' ? jsonResponse({ error: 'invalid_grant', error_description: 'x' }, status) : undefined));
+		await storeOauth(store, 'gitlab', { expiresAt: START - 1 });
+
+		const error = await failure(/** @type {Promise<unknown>} */ (session.gitCredentials('gitlab')({ url: 'https://gitlab.com/o/r.git', failed: false })));
+
+		expect(error.code).toBe(ErrorCode.AUTH_REQUIRED);
+		expect(await store.get('gitlab')).toMatchObject({ needsSignIn: true });
+	});
+
+	it('keeps a GitLab sign-in when GitLab refuses the app rather than the grant', async () => {
+		const { session, store } = setup((url) => (url.pathname === '/oauth/token' ? jsonResponse({ error: 'invalid_client', error_description: 'x' }, 401) : undefined));
+		await storeOauth(store, 'gitlab', { expiresAt: START - 1 });
+
+		const error = await failure(/** @type {Promise<unknown>} */ (session.gitCredentials('gitlab')({ url: 'https://gitlab.com/o/r.git', failed: false })));
+
+		expect(error.code).toBe(ErrorCode.NETWORK);
+		expect(await store.get('gitlab')).not.toHaveProperty('needsSignIn');
+	});
+
 	it('asks for a new sign-in when the provider refuses the refresh, keeping the record', async () => {
 		const { session, store, fetch } = setup((url) => (url.origin === RELAY ? jsonResponse({ error: 'bad_refresh_token', message: 'x' }, 400) : undefined));
 		await storeOauth(store, 'github', { expiresAt: START - 1 });

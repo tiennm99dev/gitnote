@@ -14,6 +14,12 @@ export const REQUEST_TIMEOUT_MS = 30_000;
 const PENDING_PREFIX = 'gitnote.oauth.pending.';
 
 /**
+ * The only token endpoint answers that speak about the refresh token itself:
+ * GitHub's code, relayed by the Worker, and the OAuth 2 code GitLab sends.
+ */
+const REFUSED_REFRESH_CODES = new Set(['bad_refresh_token', 'invalid_grant']);
+
+/**
  * What a token endpoint gave us, in the app's own shape.
  * @typedef {object} TokenSet
  * @property {string} accessToken
@@ -154,16 +160,16 @@ export function parseTokenResponse(data, now) {
 }
 
 /**
- * Posts to a token endpoint and sorts the failures. A 4xx means the grant was
- * refused, which is final; anything else may pass, so the caller keeps what it
- * has. `credentials: 'omit'` keeps any provider cookie out of the exchange.
+ * Posts to a token endpoint and sorts the failures. `rejected` decides what a
+ * 4xx means; a 429 or 5xx may pass, so the caller keeps what it has.
+ * `credentials: 'omit'` keeps any provider cookie out of the exchange.
  * @param {object} options
  * @param {typeof fetch} options.fetch
  * @param {string} options.url
  * @param {Record<string, string>} options.headers
  * @param {string} options.body
  * @param {string} options.hostLabel names the other side in messages
- * @param {(detail: string | null) => AuthError} options.rejected builds the error for a refused grant
+ * @param {(detail: string | null, code: string | null, status: number) => AuthError} options.rejected builds the error for a 4xx
  * @returns {Promise<unknown>} the JSON body of a 2xx answer
  */
 export async function postTokenRequest({ fetch: fetchImpl, url, headers, body, hostLabel, rejected }) {
@@ -187,7 +193,23 @@ export async function postTokenRequest({ fetch: fetchImpl, url, headers, body, h
 	if (response.status === 429 || response.status >= 500) {
 		throw new AuthError(AuthErrorCode.UNAVAILABLE, `${hostLabel} is not available right now (status ${response.status}). Try again later.`);
 	}
-	const fields = /** @type {{ message?: unknown, error_description?: unknown }} */ (typeof data === 'object' && data !== null ? data : {});
+	const fields = /** @type {{ error?: unknown, message?: unknown, error_description?: unknown }} */ (typeof data === 'object' && data !== null ? data : {});
 	const detail = fields.message ?? fields.error_description;
-	throw rejected(typeof detail === 'string' ? detail : null);
+	throw rejected(typeof detail === 'string' ? detail : null, typeof fields.error === 'string' ? fields.error : null, response.status);
+}
+
+/**
+ * Sorts a 4xx answer to a refresh. Only an explicit refusal of the refresh token
+ * ends the sign-in, because that cannot be undone from here. Anything else, such
+ * as a blocked request, a deploy gap or a wrong client secret, says nothing about
+ * the token, so it stays stored and is tried again.
+ * @param {string} providerLabel
+ * @param {string} hostLabel names the side that answered
+ * @returns {(detail: string | null, code: string | null, status: number) => AuthError}
+ */
+export function refreshRejection(providerLabel, hostLabel) {
+	return (_detail, code, status) =>
+		code !== null && REFUSED_REFRESH_CODES.has(code)
+			? new AuthError(AuthErrorCode.SIGN_IN_REQUIRED, `${providerLabel} ended this sign-in. Sign in again; your notes on this device are safe.`)
+			: new AuthError(AuthErrorCode.UNAVAILABLE, `${hostLabel} could not renew your ${providerLabel} sign-in (status ${status}). Try again later.`);
 }

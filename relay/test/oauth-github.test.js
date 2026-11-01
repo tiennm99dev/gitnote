@@ -142,6 +142,13 @@ describe('POST /api/oauth/github/token', () => {
 		});
 	});
 
+	it.each(['incorrect_client_credentials', 'redirect_uri_mismatch', 'unsupported_grant_type'])('reports %s as the relay\'s fault, not a refused sign-in', async (code) => {
+		stubUpstream(() => Response.json({ error: code, error_description: 'Check the App settings.' }));
+		const response = await postJson('/api/oauth/github/refresh', { refresh_token: 'still-good' });
+		expect(response.status).toBe(502);
+		expect(await response.json()).toEqual({ error: code, message: 'Check the App settings.' });
+	});
+
 	it('answers 502 when GitHub returns no token or cannot be reached', async () => {
 		stubUpstream(() => new Response('<html>busy</html>', { status: 503 }));
 		const busy = await postJson('/api/oauth/github/token', { code: 'abc' });

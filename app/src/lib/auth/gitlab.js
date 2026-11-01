@@ -6,7 +6,7 @@
 
 import { branchNames, isRepoPath, optionalText, PER_PAGE, readPages } from './api-lists.js';
 import { AuthError, AuthErrorCode } from './errors.js';
-import { parseTokenResponse, postTokenRequest } from './oauth.js';
+import { parseTokenResponse, postTokenRequest, refreshRejection } from './oauth.js';
 
 /** @typedef {import('./session.js').ProviderAdapter} ProviderAdapter */
 /** @typedef {import('./session.js').RemoteRepo} RemoteRepo */
@@ -27,7 +27,7 @@ export function createGitlabAdapter({ clientId, fetch: fetchImpl = (...args) => 
 	/**
 	 * @param {Record<string, string>} fields
 	 * @param {number} now
-	 * @param {(detail: string | null) => AuthError} rejected
+	 * @param {(detail: string | null, code: string | null, status: number) => AuthError} rejected
 	 * @returns {Promise<import('./oauth.js').TokenSet>}
 	 */
 	const callTokenEndpoint = async (fields, now, rejected) =>
@@ -66,9 +66,7 @@ export function createGitlabAdapter({ clientId, fetch: fetchImpl = (...args) => 
 			),
 
 		refresh: ({ refreshToken, redirectUri, now }) =>
-			callTokenEndpoint({ grant_type: 'refresh_token', refresh_token: refreshToken, redirect_uri: redirectUri ?? '' }, now, () =>
-				new AuthError(AuthErrorCode.SIGN_IN_REQUIRED, 'GitLab ended this sign-in. Sign in again; your notes on this device are safe.')
-			),
+			callTokenEndpoint({ grant_type: 'refresh_token', refresh_token: refreshToken, redirect_uri: redirectUri ?? '' }, now, refreshRejection('GitLab', 'GitLab')),
 
 		async fetchUser(api) {
 			const user = /** @type {{ username?: unknown, name?: unknown, email?: unknown, commit_email?: unknown }} */ (await api('/user'));

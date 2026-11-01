@@ -7,13 +7,15 @@
 
 import { branchNames, isRepoPath, optionalText, PER_PAGE, readPages } from './api-lists.js';
 import { AuthError, AuthErrorCode } from './errors.js';
-import { parseTokenResponse, postTokenRequest } from './oauth.js';
+import { parseTokenResponse, postTokenRequest, refreshRejection } from './oauth.js';
 
 /** @typedef {import('./session.js').ProviderAdapter} ProviderAdapter */
 /** @typedef {import('./session.js').RemoteRepo} RemoteRepo */
 
 /** A GitHub repo is exactly `owner/name`; the relay refuses anything else. */
 const FULL_NAME = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+
+const RELAY_LABEL = 'The gitnote relay';
 
 /**
  * @param {object} options
@@ -28,7 +30,7 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 	 * @param {string} route
 	 * @param {Record<string, string>} fields
 	 * @param {number} now
-	 * @param {(detail: string | null) => AuthError} rejected
+	 * @param {(detail: string | null, code: string | null, status: number) => AuthError} rejected
 	 * @returns {Promise<import('./oauth.js').TokenSet>}
 	 */
 	const callRelay = async (route, fields, now, rejected) =>
@@ -38,7 +40,7 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 				url: `${relayOrigin}/api/oauth/github/${route}`,
 				headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
 				body: JSON.stringify(fields),
-				hostLabel: 'The gitnote relay',
+				hostLabel: RELAY_LABEL,
 				rejected
 			}),
 			now
@@ -65,9 +67,7 @@ export function createGithubAdapter({ clientId, appSlug = '', relayOrigin = glob
 			),
 
 		refresh: ({ refreshToken, now }) =>
-			callRelay('refresh', { refresh_token: refreshToken }, now, () =>
-				new AuthError(AuthErrorCode.SIGN_IN_REQUIRED, 'GitHub ended this sign-in. Sign in again; your notes on this device are safe.')
-			),
+			callRelay('refresh', { refresh_token: refreshToken }, now, refreshRejection('GitHub', RELAY_LABEL)),
 
 		async fetchUser(api) {
 			const user = /** @type {{ login?: unknown, name?: unknown, email?: unknown }} */ (await api('/user'));
