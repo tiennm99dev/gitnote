@@ -222,6 +222,45 @@ describe('clone', () => {
 		expect(config).toContain('defaultBranch = main');
 	});
 
+	it('checks out the branch the user picked, and pushes that branch', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		await runGit(['branch', 'drafts', 'main'], remote.bare);
+		await pushFromElsewhere(remote, { 'only-on-main.md': 'main\n' }, 'main moves on');
+		const fs = /** @type {FsClient} */ (/** @type {unknown} */ (memfs().fs));
+		const repo = openRepo(remote, { fs });
+
+		const result = await repo.clone({ url: remote.url, ref: 'drafts' });
+
+		expect(result.branch).toBe('drafts');
+		expect((await repo.listTree()).map((file) => file.path)).toEqual(['README.md']);
+		await commitFile(repo, 'new.md', 'on drafts\n');
+		expect((await repo.push()).pushed).toBe(true);
+		expect(await showRemote(remote, 'drafts:new.md')).toBe('on drafts\n');
+		await expect(showRemote(remote, 'main:new.md')).rejects.toThrow();
+	});
+
+	it('names a missing branch and leaves nothing behind', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const repo = openRepo(remote);
+
+		const error = await rejection(repo.clone({ url: remote.url, ref: 'gone' }));
+
+		expect(error.code).toBe(ErrorCode.BRANCH_NOT_FOUND);
+		expect(error.message).toContain('gone');
+		expect(await repo.isCloned()).toBe(false);
+		expect((await repo.clone({ url: remote.url })).branch).toBe('main');
+	});
+
+	it.each(['-upload-pack=x', '../main', 'a b', 'a..b', 'x.lock', ''])('refuses the branch name %j before any request', async (ref) => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const { http, requests } = countingHttp();
+
+		const error = await rejection(openRepo(remote, { http }).clone({ url: remote.url, ref }));
+
+		expect(error.code).toBe(ErrorCode.INVALID_ARGUMENT);
+		expect(requests()).toBe(0);
+	});
+
 	it('leaves nothing behind when cancelled, so it can be retried', async () => {
 		const remote = await createRemote({ 'README.md': 'seed\n' });
 		const repo = openRepo(remote);

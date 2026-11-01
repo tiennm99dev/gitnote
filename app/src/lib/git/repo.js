@@ -120,6 +120,9 @@ const SYMLINK_MODE = 0o120000;
 /** These would break the `name <email>` line of a commit's header. */
 const AUTHOR_FORBIDDEN = /[\p{Cc}<>]/u;
 
+/** What git's check-ref-format forbids in a branch name, including a leading `-`. */
+const BAD_BRANCH_NAME = /^-|^\/|\/$|\/\/|\.\.|@\{|\.lock(\/|$)|\.$|\/\.|^\.|[\p{Cc} ~^:?*[\\]/u;
+
 /** Path segments that would reach git's own data or leave the working tree. */
 const FORBIDDEN_SEGMENTS = new Set(['', '.', '..', '.git']);
 
@@ -874,15 +877,16 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 		isCloned: () => locked(isCloned),
 
 		/**
-		 * Shallow-clones the default branch. On failure or cancel nothing is
-		 * left behind, and what an interrupted clone left is cleared first, so
-		 * the clone can simply be retried.
-		 * @param {{ url: string, onProgress?: ProgressCallback, signal?: AbortSignal }} options
+		 * Shallow-clones one branch: `ref`, or the remote's default branch without
+		 * it. On failure or cancel nothing is left behind, and what an interrupted
+		 * clone left is cleared first, so the clone can simply be retried.
+		 * @param {{ url: string, ref?: string, onProgress?: ProgressCallback, signal?: AbortSignal }} options
 		 * @returns {Promise<{ branch: string, oid: string, persisted: boolean | null }>}
 		 */
-		clone: ({ url, onProgress, signal }) =>
+		clone: ({ url, ref, onProgress, signal }) =>
 			locked(async () => {
 				assertCloneUrl(url);
+				if (ref !== undefined) assertBranchName(ref);
 				if (await isCloned()) {
 					throw new GitEngineError(ErrorCode.ALREADY_CLONED, 'This repository is already cloned on this device.');
 				}
@@ -898,6 +902,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 						...base,
 						http: withSignal(http, signal),
 						url,
+						...(ref === undefined ? {} : { ref }),
 						remote: REMOTE,
 						singleBranch: true,
 						noTags: true,
@@ -920,6 +925,10 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				} catch (error) {
 					await removeRecursive(dir);
 					await flush();
+					// Asking for a branch the remote lacks fails in the fetch, naming the ref alone.
+					if (ref !== undefined && /** @type {{ code?: string }} */ (error ?? {}).code === 'NotFoundError') {
+						throw new GitEngineError(ErrorCode.BRANCH_NOT_FOUND, `The branch ${ref} is not on the remote. Pick another branch.`, { cause: error });
+					}
 					// With no refs on the remote, clone cannot find a branch to check out.
 					if (isMissingBranch(error)) {
 						throw new GitEngineError(ErrorCode.EMPTY_REPO, 'This repository has no commits yet. Add a first commit on the git host, then clone it.', {
@@ -1435,7 +1444,18 @@ function normalizePaths(paths) {
 }
 
 /**
+ * @param {unknown} ref
+ * @returns {void}
+ */
+function assertBranchName(ref) {
+	if (typeof ref !== 'string' || ref === '' || ref === '@' || BAD_BRANCH_NAME.test(ref)) {
+		throw new GitEngineError(ErrorCode.INVALID_ARGUMENT, 'That is not a valid branch name.');
+	}
+}
+
+/**
  * @param {unknown} url
+ * @returns {void}
  */
 function assertCloneUrl(url) {
 	/** @type {URL} */

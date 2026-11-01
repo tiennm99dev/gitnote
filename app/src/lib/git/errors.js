@@ -11,6 +11,7 @@ import { formatBytes, RELAY_MAX_BODY_BYTES } from './limits.js';
 export const ErrorCode = Object.freeze({
 	ALREADY_CLONED: 'already_cloned',
 	EMPTY_REPO: 'empty_repo',
+	BRANCH_NOT_FOUND: 'branch_not_found',
 	NOT_CLONED: 'not_cloned',
 	REPO_DAMAGED: 'repo_damaged',
 	CANCELLED: 'cancelled',

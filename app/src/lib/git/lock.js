@@ -35,8 +35,20 @@ export function repoLockName(repoId) {
  * @param {{ locks?: LockManagerLike | null }} [options] defaults to `navigator.locks`
  * @returns {Promise<T>}
  */
-export function withRepoLock(repoId, operation, { locks = defaultLocks() } = {}) {
-	const name = repoLockName(repoId);
+export function withRepoLock(repoId, operation, options) {
+	return withNamedLock(repoLockName(repoId), operation, options);
+}
+
+/**
+ * Runs `operation` while holding the exclusive lock `name`, across tabs where
+ * the Web Locks API exists. Not re-entrant.
+ * @template T
+ * @param {string} name
+ * @param {() => Promise<T>} operation
+ * @param {{ locks?: LockManagerLike | null }} [options] defaults to `navigator.locks`
+ * @returns {Promise<T>}
+ */
+export function withNamedLock(name, operation, { locks = defaultLocks() } = {}) {
 	if (locks) return locks.request(name, { mode: 'exclusive' }, operation);
 
 	const previous = localQueues.get(name) ?? Promise.resolve();
