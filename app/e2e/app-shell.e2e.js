@@ -1,3 +1,4 @@
+import { readFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
 
 /**
@@ -70,4 +71,35 @@ test('boots the client router on unknown paths', async ({ page, baseURL }) => {
 	await expect(page.getByRole('heading', { name: '404' })).toBeVisible();
 	await expect(page.getByText('Not Found')).toBeVisible();
 	expect(errors).toEqual([]);
+});
+
+test('ships a strict Content Security Policy in the built shell', async () => {
+	// The policy must live in the built index.html itself: the Capacitor WebView
+	// gets no response headers, and Static Assets serve the file as built. (The
+	// preview server renders the shell on request and sends the same policy as a
+	// header, which the browser tests above run under.)
+	const html = await readFile(new URL('../build/index.html', import.meta.url), 'utf8');
+	const policy = /<meta http-equiv="content-security-policy" content="([^"]+)"/.exec(html)?.[1];
+	expect(policy).toBeTruthy();
+	const directives = Object.fromEntries(
+		String(policy)
+			.split(';')
+			.map((part) => part.trim().split(/\s+/))
+			.map(([name, ...values]) => [name, values])
+	);
+	expect(directives['default-src']).toEqual(["'self'"]);
+	expect(directives['object-src']).toEqual(["'none'"]);
+	expect(directives['base-uri']).toEqual(["'self'"]);
+	// Scripts: own origin plus the hash of SvelteKit's inline boot script, never
+	// 'unsafe-inline' or 'unsafe-eval'.
+	expect(directives['script-src'][0]).toBe("'self'");
+	expect(directives['script-src'].slice(1)).not.toHaveLength(0);
+	for (const source of directives['script-src'].slice(1)) expect(source).toMatch(/^'sha256-[A-Za-z0-9+/=]+'$/);
+	expect(directives['style-src']).toEqual(["'self'", "'unsafe-inline'"]);
+	expect(directives['connect-src']).toEqual([
+		"'self'",
+		'https://api.github.com',
+		'https://gitlab.com',
+		'https://gitnote.miti99.dev'
+	]);
 });

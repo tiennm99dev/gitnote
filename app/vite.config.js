@@ -17,7 +17,33 @@ export default defineConfig({
 			},
 			// One SPA build serves both the web and the Capacitor shell: every
 			// unknown path falls back to index.html and the client router takes over.
-			adapter: adapter({ fallback: 'index.html' })
+			adapter: adapter({ fallback: 'index.html' }),
+			// Content Security Policy for the SPA shell. SvelteKit writes it into the
+			// built index.html as a `<meta http-equiv>` tag, so it also applies inside
+			// the Capacitor WebView, where no server sends headers. SvelteKit boots
+			// from an inline script, so `script-src 'self'` alone would block the app;
+			// hash mode adds that script's hash. CodeMirror injects `<style>` elements
+			// at runtime, hence `'unsafe-inline'` for styles only (SvelteKit then adds
+			// no style hashes, which would make browsers ignore `'unsafe-inline'`).
+			// `connect-src` covers the CORS-enabled GitHub REST and GitLab token APIs.
+			// `frame-ancestors` cannot be set from a meta tag; `static/_headers` sends it.
+			csp: {
+				mode: 'hash',
+				directives: {
+					'default-src': ['self'],
+					'script-src': ['self'],
+					'style-src': ['self', 'unsafe-inline'],
+					'img-src': ['self', 'blob:', 'data:'],
+					'connect-src': [
+						'self',
+						'https://api.github.com',
+						'https://gitlab.com',
+						'https://gitnote.miti99.dev'
+					],
+					'object-src': ['none'],
+					'base-uri': ['self']
+				}
+			}
 		})
 	],
 	server: {

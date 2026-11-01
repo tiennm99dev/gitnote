@@ -1,0 +1,8 @@
+# Cloudflare Static Assets applies these to every asset response. Assets skip
+# the Worker (it runs first only for /api/*), so headers set in Worker code
+# never reach the SPA. The full CSP ships as a <meta> tag in index.html;
+# frame-ancestors only works as a header.
+/*
+  Referrer-Policy: no-referrer
+  X-Content-Type-Options: nosniff
+  Content-Security-Policy: frame-ancestors 'none'
