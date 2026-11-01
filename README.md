@@ -35,7 +35,8 @@ Run from the repo root:
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
 | `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in, repo and notes pages with the providers' APIs stood in for and real git behind the relay. It also builds the Android bundle into `app/build-native-e2e/` and runs it behind Capacitor's real bridge script |
-| `npm run android:sync` | Build the Android bundle into `app/build/` and copy it into `android/`; run `npm run build` again before deploying (see [docs/android.md](docs/android.md)) |
+| `npm run android:sync` | Build the Android bundle into `app/build/` and copy it into `android/` (see [docs/android.md](docs/android.md)) |
+| `npm run deploy` | Build the web app and deploy the Worker; wrangler refuses a directory holding an Android build |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 

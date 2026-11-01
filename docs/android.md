@@ -12,9 +12,10 @@ so they run on a PC with Android Studio or in GitHub Actions.
 - **Sign-in** opens in a Custom Tab, never in the WebView, and returns through
   `gitnote://oauth/callback`. PKCE and `state` make a code useless to another app
   claiming that scheme. Both ways Android delivers the link are handled:
-  `appUrlOpen`, and `getLaunchUrl` when the callback starts the app. Android repeats
-  the launch URL when it recreates the task from Recents, so a launch URL whose
-  sign-in is no longer awaited is dropped quietly.
+  `appUrlOpen`, and `getLaunchUrl` when the callback starts the app. Any website or
+  app can fire that link, so one this device is not waiting for leaves the open page
+  and the Custom Tab alone, and only shows a notice. Android repeats the launch URL
+  when it recreates the task from Recents, so an unawaited launch URL shows nothing.
 - **Tokens** are in `@aparajita/capacitor-secure-storage`, encrypted with an Android
   Keystore key. Its file is left out of backups by `backup_rules.xml` and
   `data_extraction_rules.xml`, because a new device does not get the key. Notes and
@@ -24,6 +25,12 @@ so they run on a PC with Android Studio or in GitHub Actions.
   inline script. DOMPurify is therefore the only XSS defence on Android.
 - **Autosave.** The app's `pause` and `resume` events act like going hidden and
   coming back: `pause` commits locally and `resume` pushes.
+- **Repository list.** Links to other sites, such as installing the GitHub App, open
+  in the device's browser. `resume` re-reads the list, so new repositories show up on
+  return.
+- **WebView version.** `minWebViewVersion` is 120, the first with `URL.canParse`. On
+  an older WebView, Capacitor loads `app/static/webview-outdated.html`, which asks the
+  user to update it.
 
 `npm run e2e` runs this build in Chromium through `app/e2e/native-shell.js`: the real
 bridge script and the real relay, with only the plugins' Java side stood in for. It
@@ -32,8 +39,9 @@ does not replace a device test.
 ## Never deploy a native build
 
 `webDir` is `app/build`, the directory the Worker deploys, and a native build has the
-weaker policy. After `npm run android:sync`, run `npm run build` before deploying.
-`npm run e2e` fails while that directory holds a native build.
+weaker policy. Deploy with `npm run deploy`, which builds the web app first. Wrangler
+also runs `app/scripts/check-deployable-build.js` as its build command, so a bare
+`wrangler deploy` from a native build stops with an error, as does `npm run e2e`.
 
 ## Run it on a device
 
@@ -56,30 +64,47 @@ Then check on the device:
    github.com: nothing new. Return to the app: the commit arrives.
 4. Force-stop the app during a sign-in, finish it in the browser, and confirm the
    app starts and completes it.
+5. With a GitHub account that has not installed the App, tap **Choose which
+   repositories gitnote can use** on the repo list and finish the install. The
+   browser ends on the web app, where you are not signed in, which is expected.
+   Return to the Android app: the repositories show up.
+6. Check the layout on Android 15 or newer, where the app draws edge to edge: no
+   heading, button or editor line sits under the status bar or the navigation bar.
 
 ## Release signing
 
-The keystore stays off this repo. Create it once, on your own PC, and keep a backup:
-an APK signed with a new key cannot update an installed app.
+The keystore stays off this repo. Create it once, on your own PC, in a folder outside
+this checkout, and keep a backup: an APK signed with a new key cannot update an
+installed app. Git ignores `*.jks` and `*.keystore` as a second line of defence.
 
 ```sh
 keytool -genkeypair -v -keystore gitnote-release.jks -alias gitnote \
   -keyalg RSA -keysize 4096 -validity 10000
 ```
 
-Add the secrets, from the folder holding the keystore:
+The secrets live in a GitHub environment that only `v*` tags can use. Create it once:
 
 ```sh
-base64 -w 0 gitnote-release.jks | gh secret set ANDROID_KEYSTORE_BASE64 -R tiennm99dev/gitnote
-gh secret set ANDROID_KEYSTORE_PASSWORD -R tiennm99dev/gitnote
-gh secret set ANDROID_KEY_ALIAS -R tiennm99dev/gitnote --body gitnote
-gh secret set ANDROID_KEY_PASSWORD -R tiennm99dev/gitnote
+gh api -X PUT repos/tiennm99dev/gitnote/environments/android-release \
+  -F 'deployment_branch_policy[protected_branches]=false' \
+  -F 'deployment_branch_policy[custom_branch_policies]=true'
+gh api -X POST repos/tiennm99dev/gitnote/environments/android-release/deployment-branch-policies \
+  -f name='v*' -f type=tag
 ```
 
-In PowerShell, replace the first line with:
+Then add the secrets, from the folder holding the keystore:
+
+```sh
+base64 -w 0 gitnote-release.jks | gh secret set ANDROID_KEYSTORE_BASE64 -R tiennm99dev/gitnote --env android-release
+gh secret set ANDROID_KEYSTORE_PASSWORD -R tiennm99dev/gitnote --env android-release
+gh secret set ANDROID_KEY_ALIAS -R tiennm99dev/gitnote --env android-release --body gitnote
+gh secret set ANDROID_KEY_PASSWORD -R tiennm99dev/gitnote --env android-release
+```
+
+In PowerShell, replace the first secret line with:
 
 ```powershell
-[Convert]::ToBase64String([IO.File]::ReadAllBytes("gitnote-release.jks")) | gh secret set ANDROID_KEYSTORE_BASE64 -R tiennm99dev/gitnote
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("gitnote-release.jks")) | gh secret set ANDROID_KEYSTORE_BASE64 -R tiennm99dev/gitnote --env android-release
 ```
 
 Add the public sign-in IDs as repository variables:
@@ -92,10 +117,13 @@ gh variable set VITE_GITLAB_CLIENT_ID -R tiennm99dev/gitnote --body <gitlab.com 
 
 ## Releasing
 
-Pushing a `v*` tag runs `.github/workflows/android.yml`. It builds and signs the APK,
-checks it has a v2 or v3 signature, and attaches it to the release. A tag with a
-hyphen becomes a prerelease. The version name comes from the tag and the version code
-from the workflow's run number.
+Pushing a `v*` tag runs `.github/workflows/android.yml`. One job builds an unsigned
+APK with no secrets and a read-only token. A second job, on a fresh machine that runs
+no npm or Gradle code, signs that file with the SDK's `apksigner`, checks it has a v2
+or v3 signature, and attaches it to the release. So a compromised dependency could
+tamper with one build but cannot steal the key, which could never be replaced. A tag
+with a hyphen becomes a prerelease. The version name comes from the tag and the
+version code from the workflow's run number.
 
 ```sh
 git tag v0.1.0-beta.1
