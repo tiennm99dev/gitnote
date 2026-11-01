@@ -1952,3 +1952,51 @@ describe('deleting a copy', () => {
 		expect(await repo.isCloned()).toBe(false);
 	});
 });
+
+describe('a merge inside a folder', () => {
+	it('writes conflict markers into a nested file, and refuses the commit until they are gone', async () => {
+		const { repo, remote } = await clonedRepo({ 'deep/er/clash.md': 'base\n' });
+		await repo.writeFile('deep/er/clash.md', 'mine\n');
+		await repo.commit({ paths: ['deep/er/clash.md'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'deep/er/clash.md': 'theirs\n' }, 'theirs');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+
+		const text = await repo.readText('deep/er/clash.md');
+		expect(text).toContain('<<<<<<< ');
+		expect(text).toContain('mine\n');
+		expect(text).toContain('theirs\n');
+		expect((await rejection(repo.completeMerge({ author: AUTHOR }))).code).toBe(ErrorCode.CONFLICTS_UNRESOLVED);
+	});
+
+	it('asks for a side on a nested binary file instead of keeping ours unasked', async () => {
+		const { repo, remote } = await clonedRepo({ 'deep/pic.bin': new Uint8Array([0, 1, 2, 3]) });
+		await repo.writeFile('deep/pic.bin', new Uint8Array([0, 9, 9, 9]));
+		await repo.commit({ paths: ['deep/pic.bin'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'deep/pic.bin': new Uint8Array([0, 7, 7, 7]) }, 'theirs');
+
+		const pulled = await repo.pull({ author: AUTHOR });
+
+		expect(pulled.status).toBe('conflict');
+		if (pulled.status !== 'conflict') return;
+		expect(pulled.merge.binaryPaths).toEqual(['deep/pic.bin']);
+		expect((await rejection(repo.completeMerge({ author: AUTHOR }))).code).toBe(ErrorCode.CONFLICTS_UNRESOLVED);
+	});
+
+	it("keeps both sides' clean edits to a nested file while another file conflicts", async () => {
+		const lines = 'one\ntwo\nthree\nfour\nfive\nsix\n';
+		const { repo, remote } = await clonedRepo({ 'deep/both.md': lines, 'clash.md': 'base\n' });
+		await repo.writeFile('deep/both.md', lines.replace('one', 'ONE'));
+		await repo.writeFile('clash.md', 'mine\n');
+		await repo.commit({ paths: ['deep/both.md', 'clash.md'], message: 'mine', author: AUTHOR });
+		await pushFromElsewhere(remote, { 'deep/both.md': lines.replace('six', 'SIX'), 'clash.md': 'theirs\n' }, 'theirs');
+
+		expect((await repo.pull({ author: AUTHOR })).status).toBe('conflict');
+
+		expect(await repo.readText('deep/both.md')).toBe('ONE\ntwo\nthree\nfour\nfive\nSIX\n');
+		await repo.writeFile('clash.md', 'settled\n');
+		await repo.completeMerge({ author: AUTHOR });
+		await repo.push();
+		expect(await showRemote(remote, 'main:deep/both.md')).toBe('ONE\ntwo\nthree\nfour\nfive\nSIX\n');
+	});
+});

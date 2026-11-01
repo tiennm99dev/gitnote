@@ -599,17 +599,34 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 	 * Only a conflict the merge driver ran on can have markers, and a file one
 	 * side deleted never reaches the driver, so what each side did is read from
 	 * the commits.
-	 * @param {{ oursOid: string, theirsOid: string, conflictedPaths: string[], driverBinaryPaths: Set<string>, mergedTexts: Map<string, string> }} options
+	 *
+	 * isomorphic-git hands its driver a file's base name, so what it reports
+	 * cannot be told apart by path. The driver runs again here, on each file both
+	 * sides changed, with the full path.
+	 * @param {{ branch: string, oursOid: string, theirsOid: string, conflictedPaths: string[] }} options
 	 * @returns {Promise<Conflict[]>}
 	 */
-	const applyConflictedMerge = async ({ oursOid, theirsOid, conflictedPaths, driverBinaryPaths, mergedTexts }) => {
+	const applyConflictedMerge = async ({ branch, oursOid, theirsOid, conflictedPaths }) => {
 		const conflicted = new Set(conflictedPaths);
+		/** @type {Set<string>} */
+		const driverBinaryPaths = new Set();
+		/** @type {Map<string, string>} */
+		const mergedTexts = new Map();
+		const driver = createMergeDriver(driverBinaryPaths, mergedTexts);
+		/**
+		 * @param {TreeBlob | null} blob
+		 * @returns {Promise<string>} its content as the driver reads it; an absent base is empty
+		 */
+		const decoded = async (blob) => (blob ? new TextDecoder().decode((await git.readBlob({ fs, gitdir, oid: blob.oid, cache })).blob) : '');
 		const [baseOid] = await git.findMergeBase({ fs, gitdir, oids: [oursOid, theirsOid], cache });
 		/** @type {Conflict[]} */
 		const conflicts = [];
 		/** @type {string[]} */
 		const toStage = [];
 		for (const { path, ours, theirs, base: baseBlob } of await changedBlobs(oursOid, theirsOid, baseOid)) {
+			if (ours && theirs && ours.oid !== theirs.oid && baseBlob?.oid !== ours.oid && baseBlob?.oid !== theirs.oid) {
+				await driver({ branches: ['base', branch, `${REMOTE}/${branch}`], contents: [await decoded(baseBlob), await decoded(ours), await decoded(theirs)], path });
+			}
 			const mergedText = mergedTexts.get(path);
 			if (conflicted.has(path)) {
 				const survivor = ours ?? theirs;
@@ -686,15 +703,11 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 				if (/** @type {{ code?: string }} */ (error)?.code !== 'MergeConflictError') throw error;
 			}
 
-			/** @type {Set<string>} */
-			const driverBinaryPaths = new Set();
-			/** @type {Map<string, string>} */
-			const mergedTexts = new Map();
 			// With no `dir`, the merge only fills the index. With one, it rewrites
 			// the whole working tree as text, and fails on a symbolic link.
 			const conflict = /** @type {{ code?: string, data?: { filepaths?: string[] } }} */ (
 				await git
-					.merge({ fs, gitdir, cache, ours: branch, theirs: remoteRef, author, abortOnConflict: false, mergeDriver: createMergeDriver(driverBinaryPaths, mergedTexts) })
+					.merge({ fs, gitdir, cache, ours: branch, theirs: remoteRef, author, abortOnConflict: false, mergeDriver: createMergeDriver(new Set()) })
 					.then(
 						() => {
 							throw new Error('The merge was expected to conflict.');
@@ -705,7 +718,7 @@ export function createRepo({ id, fs, http, provider, getCredential, dir = '/repo
 			if (conflict?.code !== 'MergeConflictError') throw conflict;
 			const conflictedPaths = [...(conflict.data?.filepaths ?? [])].sort();
 
-			const conflicts = await applyConflictedMerge({ oursOid, theirsOid, conflictedPaths, driverBinaryPaths, mergedTexts });
+			const conflicts = await applyConflictedMerge({ branch, oursOid, theirsOid, conflictedPaths });
 			// The record is overwritten at once, so it may say `conflicted` only
 			// once the tree it describes is saved; until then a crash rolls back.
 			await flush();
