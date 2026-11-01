@@ -42,13 +42,14 @@ describe('origin check on /api/*', () => {
 			headers: {
 				Origin: 'https://localhost',
 				'Access-Control-Request-Method': 'POST',
-				'Access-Control-Request-Headers': 'authorization, content-type'
+				'Access-Control-Request-Headers': 'authorization, content-type, accept, git-protocol'
 			}
 		});
 		expect(response.status).toBe(204);
 		expect(response.headers.get('access-control-allow-origin')).toBe('https://localhost');
 		expect(response.headers.get('access-control-allow-methods')).toBe('GET, POST');
-		expect(response.headers.get('access-control-allow-headers')).toContain('Authorization');
+		const allowed = response.headers.get('access-control-allow-headers')?.toLowerCase().split(/,\s*/);
+		expect(allowed).toEqual(expect.arrayContaining(['authorization', 'content-type', 'accept', 'git-protocol']));
 		expect(response.headers.get('access-control-allow-credentials')).toBeNull();
 	});
 

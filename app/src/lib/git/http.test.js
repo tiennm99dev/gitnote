@@ -1,4 +1,8 @@
+import git from 'isomorphic-git';
+import { memfs } from 'memfs';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import { FIXTURE_CREDENTIAL } from '../../../test/git-http-server.js';
+import { createRemote, RELAY_PORT } from '../../../test/remote-repo.js';
 import { ErrorCode } from './errors.js';
 import { authCallbacks, createGitHttp, toRelayUrl, withSignal } from './http.js';
 
@@ -165,5 +169,42 @@ describe('authCallbacks', () => {
 	it('answers nothing when the source has no credential', async () => {
 		const { onAuth } = authCallbacks(() => null);
 		expect(await onAuth?.('u')).toBeUndefined();
+	});
+});
+
+describe('the relay and a cross-origin app shell', () => {
+	it('allows in its preflight every header a real clone and push send', async () => {
+		const remote = await createRemote({ 'README.md': 'seed\n' });
+		const relayOrigin = `http://127.0.0.1:${RELAY_PORT}`;
+		const relayed = createGitHttp({ relayOrigin });
+		/** @type {Set<string>} */
+		const sent = new Set();
+		/** @type {import('isomorphic-git').HttpClient} */
+		const http = {
+			request(request) {
+				for (const name of Object.keys(request.headers ?? {})) sent.add(name.toLowerCase());
+				return relayed.request(request);
+			}
+		};
+		const { fs } = memfs();
+		const dir = '/repo';
+		await git.clone({ fs, dir, url: remote.url, http });
+		await fs.promises.writeFile(`${dir}/note.md`, 'written\n');
+		await git.add({ fs, dir, filepath: 'note.md' });
+		await git.commit({ fs, dir, message: 'add a note', author: { name: 'Test', email: 'test@example.com' } });
+		await git.push({ fs, dir, http, onAuth: () => FIXTURE_CREDENTIAL });
+		// Set by isomorphic-git, and dropped by Chromium rather than sent to a preflight.
+		sent.delete('user-agent');
+		expect(sent).toContain('authorization');
+		expect(sent).toContain('content-type');
+
+		const response = await fetch(`${relayOrigin}/api/git/github.com/octo/notes.git/git-upload-pack`, {
+			method: 'OPTIONS',
+			headers: { Origin: 'https://localhost', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': [...sent].join(', ') }
+		});
+
+		expect(response.status).toBe(204);
+		const allowed = response.headers.get('access-control-allow-headers')?.toLowerCase().split(/,\s*/);
+		expect(allowed).toEqual(expect.arrayContaining([...sent]));
 	});
 });
