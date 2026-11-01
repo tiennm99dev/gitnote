@@ -15,6 +15,7 @@ edit and search its notes on the device, then commit, pull and push them.
 | --- | --- |
 | `app/` | SvelteKit single-page app (Svelte 5, Vite, Tailwind 4), built with adapter-static |
 | `relay/` | Hono Worker on Cloudflare Workers: serves the SPA through Static Assets and answers `/api/*` (see [Relay](#relay)) |
+| `android/` | Capacitor's Android project around a native build of the SPA (see [docs/android.md](docs/android.md)) |
 
 ## Requirements
 
@@ -33,7 +34,8 @@ Run from the repo root:
 | `npm run typecheck` | JSDoc type check in both workspaces: `svelte-check` for the app, `tsc` against generated Worker types for the relay |
 | `npm test` | Vitest in both workspaces; relay tests run inside workerd, and git engine tests go through the real relay to a local `git http-backend` |
 | `npm run build` | Build the SPA into `app/build/` and dry-run the Worker bundle |
-| `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in, repo and notes pages with the providers' APIs stood in for and real git behind the relay |
+| `npm run e2e` | Playwright against a fresh production build in `app/build-e2e/` (never `app/build/`, which the Worker deploys, because this build holds fixture client IDs), served by `vite preview` on port 4173 and as plain files (no CSP header) on port 4174, the git engine on LightningFS through the relay on port 8789, and the sign-in, repo and notes pages with the providers' APIs stood in for and real git behind the relay. It also builds the Android bundle into `app/build-native-e2e/` and runs it behind Capacitor's real bridge script |
+| `npm run android:sync` | Build the Android bundle into `app/build/` and copy it into `android/`; run `npm run build` again before deploying (see [docs/android.md](docs/android.md)) |
 
 For local work, run `npm run dev:relay` and `npm run dev` side by side.
 
@@ -88,7 +90,9 @@ domain is the only origin.
 - **Security headers** for the SPA live in `app/static/_headers`, because
   asset responses skip the Worker. The Content Security Policy is generated
   by SvelteKit (`csp` in `app/vite.config.js`) as a `<meta>` tag in the built
-  `index.html`, so it also applies inside Capacitor.
+  `index.html`, so it also applies inside Capacitor. The Android build
+  (`CAP_BUILD=1`) allows inline scripts for Capacitor's bridge, so it must never
+  be deployed.
 
 For local work, `relay/.dev.vars` (gitignored) can extend the vars and hold
 the GitHub App credentials, for example:

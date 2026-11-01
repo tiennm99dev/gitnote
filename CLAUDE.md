@@ -34,6 +34,10 @@ tooling notes: [README.md](README.md).
   request headers and this repo is public, so an e2e run that sends a token
   sets `GITNOTE_E2E_TOKEN` (which turns traces and screenshots off, see
   `app/e2e/artifact-policy.js`) and its job uploads no Playwright artifacts.
+- `android/` came from `npx cap add android` and is edited by hand; `npx cap sync`
+  keeps those edits. `npm run android:sync` writes a weaker CSP to the directory
+  the Worker deploys, so run `npm run build` before any deploy. See
+  [docs/android.md](docs/android.md).
 - Never commit secrets, `.dev.vars`, `.env` files or local machine paths.
 - Conventional Commits, with no AI attribution. Push verified work straight to
   `main` (no PRs).
