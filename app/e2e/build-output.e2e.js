@@ -8,7 +8,7 @@ const FIXTURE_IDS = ['e2e-github-client', 'e2e-gitlab-client', 'gitnote-e2e'];
 
 /**
  * @param {string} name a build directory under `app/`
- * @returns {Promise<string>} the text of everything in it; empty when it was never built
+ * @returns {Promise<string | null>} the text of everything in it; null when it holds no build
  */
 async function readBuild(name) {
 	const root = fileURLToPath(new URL(`../${name}/`, import.meta.url));
@@ -17,10 +17,11 @@ async function readBuild(name) {
 	try {
 		entries = await readdir(root, { withFileTypes: true, recursive: true });
 	} catch (error) {
-		if (/** @type {NodeJS.ErrnoException} */ (error).code === 'ENOENT') return '';
+		if (/** @type {NodeJS.ErrnoException} */ (error).code === 'ENOENT') return null;
 		throw error;
 	}
 	const files = entries.filter((entry) => entry.isFile() && /\.(html|js)$/.test(entry.name));
+	if (files.length === 0) return null;
 	const texts = await Promise.all(files.map((entry) => readFile(`${entry.parentPath}/${entry.name}`, 'utf8')));
 	return texts.join('\n');
 }
@@ -28,6 +29,11 @@ async function readBuild(name) {
 test('fixture sign-in IDs stay out of the directory the Worker deploys', async () => {
 	const tested = await readBuild(E2E_BUILD_DIR);
 	const deployed = await readBuild('build');
+
+	// A clean checkout has nothing to inspect, which must not read as a pass. CI
+	// builds first, so a missing build fails there.
+	test.skip(deployed === null && !process.env.CI, 'Run `npm run build` first: there is no deployable build to check.');
+	expect(deployed, 'CI must build the deployable output before this test').not.toBeNull();
 
 	// The test build does hold them, so a clean `build` proves something.
 	expect(tested).toContain(FIXTURE_IDS[0]);
