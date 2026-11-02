@@ -3,6 +3,9 @@
 # never reach the SPA. The full CSP ships as a <meta> tag in index.html;
 # frame-ancestors only works as a header.
 /*
+  # no-transform stops Cloudflare injecting its analytics beacon into the HTML;
+  # the app promises no analytics, and the CSP would refuse the script anyway.
+  Cache-Control: public, max-age=0, must-revalidate, no-transform
   Referrer-Policy: no-referrer
   X-Content-Type-Options: nosniff
   Content-Security-Policy: frame-ancestors 'none'
