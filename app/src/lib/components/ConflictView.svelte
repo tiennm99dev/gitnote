@@ -176,10 +176,10 @@
 	<div class="flex flex-wrap gap-2">
 		<button type="button" class="min-h-11 rounded bg-gray-900 px-3 text-white disabled:opacity-50" disabled={busy || remaining > 0} onclick={complete} data-testid="complete-merge">Create merge commit</button>
 		{#if confirmingAbort}
-			<button type="button" class="min-h-11 rounded bg-red-700 px-3 text-white" onclick={abort} data-testid="abort-confirm">Abandon the merge and my resolutions</button>
+			<button type="button" class="min-h-11 rounded bg-red-700 px-3 text-white disabled:opacity-50" disabled={busy} onclick={abort} data-testid="abort-confirm">Abandon the merge and my resolutions</button>
 			<button type="button" class="min-h-11 rounded border border-gray-400 bg-white px-3" onclick={() => (confirmingAbort = false)}>Keep going</button>
 		{:else}
-			<button type="button" class="min-h-11 rounded border border-gray-400 bg-white px-3" onclick={() => (confirmingAbort = true)} data-testid="abort-merge">Abandon merge</button>
+			<button type="button" class="min-h-11 rounded border border-gray-400 bg-white px-3 disabled:opacity-50" disabled={busy} onclick={() => (confirmingAbort = true)} data-testid="abort-merge">Abandon merge</button>
 		{/if}
 	</div>
 </section>
