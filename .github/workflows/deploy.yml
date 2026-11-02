@@ -49,6 +49,14 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
+      - name: Warn about missing sign-in IDs
+        env:
+          CLIENT_ID_GITHUB: ${{ vars.VITE_GITHUB_CLIENT_ID }}
+          CLIENT_ID_GITLAB: ${{ vars.VITE_GITLAB_CLIENT_ID }}
+        run: |
+          [ -n "$CLIENT_ID_GITHUB" ] || echo "::warning::VITE_GITHUB_CLIENT_ID is not set, so this deploy has no GitHub sign-in button."
+          [ -n "$CLIENT_ID_GITLAB" ] || echo "::warning::VITE_GITLAB_CLIENT_ID is not set, so this deploy has no GitLab sign-in button."
+
       # The IDs are public, and blank ones turn that provider's sign-in button off.
       - name: Build the web app
         run: npm run build -w app
@@ -59,16 +67,18 @@ jobs:
 
       # The token appears in this step alone, so the build's packages never see it.
       - name: Deploy the Worker
-        run: npm run deploy -w relay
+        run: |
+          [ -n "$CLOUDFLARE_API_TOKEN" ] || { echo '::error::The CLOUDFLARE_API_TOKEN secret is not set; see Deploying in README.md.'; exit 1; }
+          [ -n "$CLOUDFLARE_ACCOUNT_ID" ] || { echo '::error::The CLOUDFLARE_ACCOUNT_ID variable is not set; see Deploying in README.md.'; exit 1; }
+          npm run deploy -w relay
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
 
-  # Skipped until the test repo is named. Its token reaches only the test step, and
-  # this job uploads nothing: a Playwright run with a token must publish no artifacts.
+  # Every deploy gets the smoke tests, which need no credentials. This job uploads
+  # nothing: a Playwright run with a token must publish no artifacts.
   live-e2e:
     needs: deploy
-    if: vars.GITNOTE_E2E_REPO != ''
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -87,13 +97,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Test the live site
+      - name: Smoke test the live site
+        run: npm run e2e:live -w app -- smoke.live.js
+        env:
+          CHROMIUM_PATH: /usr/bin/google-chrome
+
+      # Skipped until the test repo is named. Its token reaches only this step.
+      - name: Test a note round trip on the live site
+        if: vars.GITNOTE_E2E_REPO != ''
         run: |
           if [ -z "$GITNOTE_E2E_TOKEN" ]; then
             echo '::error::GITNOTE_E2E_REPO is set but the GITNOTE_E2E_TOKEN secret is not.'
             exit 1
           fi
-          npm run e2e:live
+          npm run e2e:live -w app -- notes.live.js
         env:
           CHROMIUM_PATH: /usr/bin/google-chrome
           GITNOTE_E2E_REPO: ${{ vars.GITNOTE_E2E_REPO }}

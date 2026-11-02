@@ -1,12 +1,13 @@
 import { createHash } from 'node:crypto';
 import { expect, test } from '@playwright/test';
+import { LIVE_ORIGIN } from '../scripts/live-origin.js';
 import { createRemote, remoteHead, showRemote } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
 import { installNativeShell, NATIVE_ORIGIN } from './native-shell.js';
 import { collectBreakage, GOOD_TOKEN, PROVIDERS, REFRESH_TOKEN, serveApi, serveGit } from './provider-fixtures.js';
 
 const CALLBACK = 'gitnote://oauth/callback';
-const RELAY = 'https://gitnote.miti99.dev';
+const RELAY = LIVE_ORIGIN;
 const TOKEN_ANSWER = { access_token: GOOD_TOKEN, refresh_token: REFRESH_TOKEN, expires_in: 28800, refresh_token_expires_in: 15897600, token_type: 'bearer', scope: '' };
 
 /** @typedef {Awaited<ReturnType<typeof installNativeShell>>} Device */

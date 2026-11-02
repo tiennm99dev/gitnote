@@ -10,8 +10,8 @@ import { App } from '@capacitor/app';
 import { Browser } from '@capacitor/browser';
 import { Capacitor } from '@capacitor/core';
 
-/** The relay's origin; its routes all live under `/api`. */
-const RELAY_ORIGIN = 'https://gitnote.miti99.dev';
+/** The relay's origin, from `relay/wrangler.jsonc`; its routes all live under `/api`. */
+const RELAY_ORIGIN = import.meta.env.VITE_RELAY_ORIGIN;
 
 /** Registered on both sign-in apps; `AndroidManifest.xml` routes it here. */
 export const NATIVE_REDIRECT_URI = 'gitnote://oauth/callback';

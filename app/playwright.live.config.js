@@ -1,5 +1,6 @@
 import { defineConfig, devices } from '@playwright/test';
 import { artifactPolicy } from './e2e/artifact-policy.js';
+import { LIVE_ORIGIN } from './scripts/live-origin.js';
 
 /**
  * The deployed site, tested with no stand-ins and no local servers. `npm run e2e`
@@ -16,7 +17,7 @@ export default defineConfig({
 	reporter: process.env.CI ? 'github' : 'list',
 	use: {
 		...devices['Desktop Chrome'],
-		baseURL: process.env.GITNOTE_LIVE_URL || 'https://gitnote.miti99.dev',
+		baseURL: process.env.GITNOTE_LIVE_URL || LIVE_ORIGIN,
 		...artifactPolicy(process.env),
 		launchOptions: { executablePath: process.env.CHROMIUM_PATH || undefined }
 	}

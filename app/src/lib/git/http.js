@@ -22,7 +22,7 @@ const MIN_UPLOAD_BYTES_PER_SECOND = 16_000;
 
 /**
  * @param {string} url a git host URL isomorphic-git wants to fetch
- * @param {string} relayOrigin e.g. `https://gitnote.miti99.dev`
+ * @param {string} relayOrigin e.g. `https://relay.example.com`
  * @returns {string} the same request through the relay
  */
 export function toRelayUrl(url, relayOrigin) {

@@ -2,6 +2,7 @@ import adapter from '@sveltejs/adapter-static';
 import { sveltekit } from '@sveltejs/kit/vite';
 import tailwindcss from '@tailwindcss/vite';
 import { defineConfig } from 'vitest/config';
+import { LIVE_ORIGIN } from './scripts/live-origin.js';
 
 // `wrangler dev` in relay/ listens here; `npm run dev` forwards /api to it.
 const RELAY_DEV_URL = 'http://localhost:8787';
@@ -12,6 +13,9 @@ const BUILD_DIR = process.env.GITNOTE_BUILD_DIR || 'build';
 const NATIVE_BUILD = process.env.CAP_BUILD === '1';
 
 export default defineConfig({
+	define: {
+		'import.meta.env.VITE_RELAY_ORIGIN': JSON.stringify(LIVE_ORIGIN)
+	},
 	plugins: [
 		tailwindcss(),
 		sveltekit({
@@ -48,7 +52,7 @@ export default defineConfig({
 						'self',
 						'https://api.github.com',
 						'https://gitlab.com',
-						'https://gitnote.miti99.dev'
+						/** @type {`https://${string}.${string}`} */ (LIVE_ORIGIN)
 					],
 					'object-src': ['none'],
 					'base-uri': ['self']

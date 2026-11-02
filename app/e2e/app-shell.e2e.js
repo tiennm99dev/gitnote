@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
 import { expect, test } from '@playwright/test';
+import { LIVE_ORIGIN } from '../scripts/live-origin.js';
 import { E2E_BUILD_DIR, STATIC_SHELL_PORT } from './static-server.js';
 
 /**
@@ -101,7 +102,7 @@ test('ships a strict Content Security Policy in the built shell', async () => {
 		"'self'",
 		'https://api.github.com',
 		'https://gitlab.com',
-		'https://gitnote.miti99.dev'
+		LIVE_ORIGIN
 	]);
 });
 
