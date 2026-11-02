@@ -12,7 +12,7 @@ const PUBLIC_REPO = 'github.com/tiennm99dev/gitnote.git';
 
 // A deep link's last segment can look like a file: only the fallback to index.html
 // keeps these from being a 404 on reload.
-const DEEP_LINKS = ['/repos', '/repo/github.com%2Fowner%2Frepo/', '/repo/github.com%2Fowner%2Frepo/notes/a.md', '/repo/github.com%2Fowner%2Frepo/assets/a.png'];
+const REPO_LINKS = ['/repo/github.com%2Fowner%2Frepo/', '/repo/github.com%2Fowner%2Frepo/notes/a.md', '/repo/github.com%2Fowner%2Frepo/assets/a.png'];
 
 test("the page carries the asset headers and a web build's CSP", async ({ request }) => {
 	const response = await request.get('/');
@@ -24,17 +24,27 @@ test("the page carries the asset headers and a web build's CSP", async ({ reques
 	expect(deployProblem(await response.text())).toBeNull();
 });
 
-for (const link of DEEP_LINKS) {
+/**
+ * @param {string} link
+ * @param {(page: import('@playwright/test').Page) => import('@playwright/test').Locator} rendered
+ *   what only the mounted app shows: the static page holds nothing but its boot script,
+ *   and a route that fails to load shows SvelteKit's error page instead
+ */
+function testDeepLink(link, rendered) {
 	test(`a reload of ${link} boots the app under its CSP`, async ({ page }) => {
 		const problems = collectBreakage(page);
 		const response = await page.goto(link);
 		expect(response?.status()).toBe(200);
 		expect(response?.headers()['content-type']).toContain('text/html');
-		await expect(page.locator('body')).not.toBeEmpty();
+		await expect(rendered(page)).toBeVisible();
 		await page.waitForLoadState('networkidle');
 		expect(problems).toEqual([]);
 	});
 }
+
+testDeepLink('/repos', (page) => page.getByRole('heading', { name: 'Repositories' }));
+// A new browser has cloned nothing, so every repo link lands on the same notice.
+for (const link of REPO_LINKS) testDeepLink(link, (page) => page.getByTestId('repo-not-here'));
 
 test('the relay answers its own health check with API headers', async ({ request }) => {
 	const response = await request.get('/api/health');
