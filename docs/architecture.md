@@ -100,19 +100,21 @@ downloads through the relay: Workers does not limit response bodies.
 
 ## Testing against the live site
 
-`npm run e2e:live` runs `app/e2e/live/` against `https://gitnote.miti99.dev`, or
-`GITNOTE_LIVE_URL`, with nothing stood in for.
+`npm run e2e:live` runs `app/e2e/live/` against the domain in `routes` in
+`relay/wrangler.jsonc`, or `GITNOTE_LIVE_URL`, with nothing stood in for.
 
 - `smoke.live.js` needs no credentials: asset headers, the CSP, deep-link reloads, the
   relay's refusals, the Android preflight and a native `git clone` of this public repo.
 - `notes.live.js` pastes a token, clones, edits, commits, pushes and pulls, checking
   each result directly against GitHub's API. It skips unless both `GITNOTE_E2E_REPO`
   (`<owner>/<repo>`) and `GITNOTE_E2E_TOKEN` are set. Use a private repo kept for this,
-  with a seed commit on its default branch, and a fine-grained token scoped to that repo
-  alone with Contents read and write. Each run moves its `gitnote-e2e` branch back to
+  whose default branch holds a `README.md` for the test to edit, and a fine-grained token
+  scoped to that repo alone with Contents read and write. For a repo in an organization,
+  the token's resource owner must be the organization, and its policy must allow
+  fine-grained tokens. Each run moves its `gitnote-e2e` branch back to
   the default branch's tip; the default branch itself never changes.
 
-In `.github/workflows/deploy.yml` the `live-e2e` job runs after each deploy and is
-skipped while the `GITNOTE_E2E_REPO` repository variable is empty. A pull request can
-never start it. It uploads no artifacts, because a Playwright trace would hold the
-token.
+In `.github/workflows/deploy.yml` the `live-e2e` job runs after each deploy. Its smoke
+step always runs, with no token in its environment. Its note round trip is skipped while
+the `GITNOTE_E2E_REPO` repository variable is empty. A pull request can never start the
+job. It uploads no artifacts, because a Playwright trace would hold the token.

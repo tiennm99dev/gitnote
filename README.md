@@ -66,7 +66,10 @@ deployment means trusting whoever runs it and Cloudflare; run your own if you wo
 rather not (see [Self-hosting](#self-hosting)).
 
 Your token goes only to the provider's API and, through the relay, its git host. Your
-notes stay in your repo and on your device.
+notes stay in your repo and on your device, with one exception on Android: the app
+allows Android backups and leaves only the token file out, so clones and drafts, private
+repos included, can reach your Google account's backup or a device transfer. Turn off
+the device's backup if you do not want that.
 
 ## Supported providers
 
@@ -105,18 +108,22 @@ tests. It only touches this Worker. It needs:
 | `CLOUDFLARE_API_TOKEN` | Secret | A token that can edit this account's Workers and the zone's Worker routes |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | The Cloudflare account ID |
 | `VITE_GITHUB_CLIENT_ID`, `VITE_GITHUB_APP_SLUG`, `VITE_GITLAB_CLIENT_ID` | Variables | See [docs/sign-in-apps.md](docs/sign-in-apps.md); blank ones turn that sign-in button off |
-| `GITNOTE_E2E_REPO`, `GITNOTE_E2E_TOKEN` | Variable, secret | See [the live tests](docs/architecture.md#testing-against-the-live-site); the job is skipped without the variable |
+| `GITNOTE_E2E_REPO`, `GITNOTE_E2E_TOKEN` | Variable, secret | See [the live tests](docs/architecture.md#testing-against-the-live-site); the note round trip is skipped without the variable, and the smoke tests always run |
 
 The Worker's own secrets are set once, from `relay/`, with
 `npx wrangler secret put GITHUB_CLIENT_ID` and
-`npx wrangler secret put GITHUB_CLIENT_SECRET`. To deploy by hand, run `npm run deploy`.
+`npx wrangler secret put GITHUB_CLIENT_SECRET`.
+
+To deploy by hand, run `npm run deploy` with the `VITE_` values in the environment. They
+are built into the app, so a deploy without them removes the sign-in buttons from the
+live site, with no warning, until the next deploy that has them.
 
 ## Self-hosting
 
 1. Fork this repo and choose a domain on a Cloudflare zone you control.
-2. Replace the live domain with yours in `routes` in `relay/wrangler.jsonc`,
-   `connect-src` in `app/vite.config.js` and `RELAY_ORIGIN` in
-   `app/src/lib/platform/native.js`.
+2. Replace the live domain with yours in `routes` in `relay/wrangler.jsonc`. The app's
+   `connect-src`, the Android build's relay and the tests all read it from there, so the
+   live tests, and any token you give them, go to your deployment.
 3. Change the repository name in the `if:` conditions of
    `.github/workflows/deploy.yml` and `.github/workflows/android.yml`.
 4. Pick your own `namespace_id` values under `ratelimits` in `relay/wrangler.jsonc` if
