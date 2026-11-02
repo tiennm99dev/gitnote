@@ -12,7 +12,7 @@ const PUBLIC_REPO = 'github.com/tiennm99dev/gitnote.git';
 
 // A deep link's last segment can look like a file: only the fallback to index.html
 // keeps these from being a 404 on reload.
-const REPO_LINKS = ['/repo/github.com%2Fowner%2Frepo/', '/repo/github.com%2Fowner%2Frepo/notes/a.md', '/repo/github.com%2Fowner%2Frepo/assets/a.png'];
+const REPO_LINKS = ['/repo/github.com~owner~repo/', '/repo/github.com~owner~repo/notes/a.md', '/repo/github.com~owner~repo/assets/a.png'];
 
 test("the page carries the asset headers and a web build's CSP", async ({ request }) => {
 	const response = await request.get('/');
@@ -36,6 +36,8 @@ function testDeepLink(link, rendered) {
 		const response = await page.goto(link);
 		expect(response?.status()).toBe(200);
 		expect(response?.headers()['content-type']).toContain('text/html');
+		// The edge must not rewrite the path: a redirect here would open another route.
+		expect(new URL(page.url()).pathname).toBe(link);
 		await expect(rendered(page)).toBeVisible();
 		await page.waitForLoadState('networkidle');
 		expect(problems).toEqual([]);

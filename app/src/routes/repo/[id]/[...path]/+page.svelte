@@ -3,8 +3,9 @@
 	import { page } from '$app/state';
 	import NoteWorkspace from '#lib/components/NoteWorkspace.svelte';
 	import { listLocalRepos } from '#lib/git/local-repos.js';
+	import { repoIdFromRoute } from '#lib/git/repo-route.js';
 
-	const repoId = $derived(page.params.id ?? '');
+	const repoId = $derived(repoIdFromRoute(page.params.id ?? ''));
 	const repo = $derived(listLocalRepos().find((item) => item.id === repoId && item.ready));
 </script>
 

@@ -2,6 +2,7 @@
 import { symlink } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
+import { repoRouteId } from '../src/lib/git/repo-route.js';
 import { changeElsewhere, createRemote, pushFromElsewhere, remoteHead, runGit } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
 import { collectBreakage, GOOD_TOKEN, serveApi, serveGit } from './provider-fixtures.js';
@@ -90,7 +91,7 @@ async function cloneRepo(page) {
  * @param {string} [path]
  * @returns {string} the app's URL for a file
  */
-const noteUrl = (id, path = '') => `/repo/${encodeURIComponent(id)}/${path.split('/').map(encodeURIComponent).join('/')}`;
+const noteUrl = (id, path = '') => `/repo/${repoRouteId(id)}/${path.split('/').map(encodeURIComponent).join('/')}`;
 
 /**
  * Replaces the whole note in the editor by typing.
@@ -157,7 +158,7 @@ test('opens a note from the tree, rendered, safe, under the production CSP', asy
 	await cloneRepo(page);
 
 	await page.getByTestId('open-copy').click();
-	await expect(page).toHaveURL(/\/repo\/github\.com%2F/);
+	await expect(page).toHaveURL(/\/repo\/github\.com~/);
 	const drawer = page.getByTestId('file-drawer');
 	const files = drawer.getByTestId('tree-file');
 

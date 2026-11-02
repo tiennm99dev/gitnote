@@ -3,6 +3,7 @@
 	import { SvelteSet } from 'svelte/reactivity';
 	import { beforeNavigate, goto } from '$app/navigation';
 	import { resolve } from '$app/paths';
+	import { repoIdFromRoute, repoRouteId } from '#lib/git/repo-route.js';
 	import { authSession } from '#lib/auth/index.js';
 	import { deviceDrafts, openDeviceRepo } from '#lib/git/device-repos.js';
 	import { dirName, encodePath, notePathFrom } from '#lib/notes/paths.js';
@@ -113,7 +114,7 @@
 	 * @param {string} target a working-tree path, or empty for the repo's top
 	 * @returns {string} the app's URL for it
 	 */
-	const hrefFor = (target) => resolve('/repo/[id]/[...path]', { id: encodeURIComponent(repo.id), path: encodePath(target) });
+	const hrefFor = (target) => resolve('/repo/[id]/[...path]', { id: repoRouteId(repo.id), path: encodePath(target) });
 
 	/**
 	 * @param {unknown} error
@@ -148,7 +149,7 @@
 
 	// Staying in this repository keeps the store, and with it any text storage refused.
 	beforeNavigate((navigation) => {
-		if (navigation.to?.params?.id === repo.id) return;
+		if (repoIdFromRoute(navigation.to?.params?.id ?? '') === repo.id) return;
 		const { unkeptPaths, note } = $notes;
 		if (unkeptPaths.length === 0 && !(note?.dirty && !note.draftStored)) return;
 		// Leaving the page: cancelling makes the browser ask.
