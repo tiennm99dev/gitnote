@@ -2,6 +2,7 @@
 import { symlink, unlink } from 'node:fs/promises';
 import path from 'node:path';
 import { expect, test } from '@playwright/test';
+import { repoRouteId } from '../src/lib/git/repo-route.js';
 import { syncRecordKey } from '../src/lib/git/local-repos.js';
 import { changeElsewhere, createRemote, pushFromElsewhere, rejectPushes, remoteHead, runGit, showRemote } from '../test/remote-repo.js';
 import { E2E_GIT_PORT, E2E_GIT_ROOT } from './git-engine-ports.js';
@@ -53,7 +54,7 @@ async function openDevice(browser, remote) {
 		context,
 		problems,
 		open: async (path = '') => {
-			await page.goto(`/repo/${encodeURIComponent(id)}/${path.split('/').map(encodeURIComponent).join('/')}`);
+			await page.goto(`/repo/${repoRouteId(id)}/${path.split('/').map(encodeURIComponent).join('/')}`);
 			await expect(page.getByTestId('sync-branch')).toHaveText('main');
 		}
 	};

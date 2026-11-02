@@ -1,4 +1,5 @@
 import { expect } from '@playwright/test';
+import { repoRouteId } from '../src/lib/git/repo-route.js';
 
 /** @typedef {import('@playwright/test').Page} Page */
 
@@ -7,7 +8,7 @@ import { expect } from '@playwright/test';
  * @param {string} note its path in the repo
  * @returns {string} the app's address for that note
  */
-const noteUrl = (fullName, note) => `/repo/${encodeURIComponent(`github.com/${fullName}`)}/${note.split('/').map(encodeURIComponent).join('/')}`;
+const noteUrl = (fullName, note) => `/repo/${repoRouteId(`github.com/${fullName}`)}/${note.split('/').map(encodeURIComponent).join('/')}`;
 
 /**
  * What a user does first: pastes a GitHub token, picks a repo and branch, and clones.

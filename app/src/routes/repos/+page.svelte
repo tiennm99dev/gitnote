@@ -9,6 +9,7 @@
 	import { getStorageUsage, repoIdForUrl } from '#lib/git/fs.js';
 	import { checkRepoSize, formatBytes } from '#lib/git/limits.js';
 	import { describeWorkCounts, listLocalRepos, saveLocalRepo, settleFailedClone } from '#lib/git/local-repos.js';
+	import { repoRouteId } from '#lib/git/repo-route.js';
 	import { watchAppLifecycle } from '#lib/platform/native.js';
 
 	/** @typedef {import('#lib/auth/session.js').RemoteRepo} RemoteRepo */
@@ -383,7 +384,7 @@
 				{#each copies as { repo, files } (repo.id)}
 					<li class="rounded border border-gray-300 p-2" data-testid="local-copy">
 						{#if repo.ready}
-							<a class="font-medium underline" href={resolve('/repo/[id]/[...path]', { id: encodeURIComponent(repo.id), path: '' })} data-testid="open-copy">{repo.fullName}</a>
+							<a class="font-medium underline" href={resolve('/repo/[id]/[...path]', { id: repoRouteId(repo.id), path: '' })} data-testid="open-copy">{repo.fullName}</a>
 						{:else}
 							<span class="font-medium">{repo.fullName}</span>
 						{/if}
