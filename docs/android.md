@@ -1,7 +1,7 @@
 # The Android app
 
 The Android app is the same SvelteKit app inside Capacitor. Its git traffic still
-goes through the relay at `gitnote.miti99.dev`. Android builds need the Android SDK,
+goes through the relay at `gitnote.tiennm99.workers.dev`. Android builds need the Android SDK,
 so they run on a PC with Android Studio or in GitHub Actions.
 
 ## What differs from the web
@@ -50,7 +50,7 @@ also runs `app/scripts/check-deployable-build.js` as its build command, so a bar
 
 ## Run it on a device
 
-The app needs the relay deployed at `gitnote.miti99.dev` for sign-in and git. On a PC
+The app needs the relay deployed at `gitnote.tiennm99.workers.dev` for sign-in and git. On a PC
 with Android Studio, a JDK 21 and a device or emulator:
 
 ```sh

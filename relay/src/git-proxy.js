@@ -2,8 +2,8 @@
 import { jsonError } from './json-error.js';
 
 /**
- * Largest request body the relay forwards: the `miti99.dev` zone caps request
- * bodies at 100 MB, so a push pack must stay under that with some headroom.
+ * Largest request body the relay forwards: Cloudflare caps request bodies at
+ * 100 MB on this plan, so a push pack must stay under that with some headroom.
  */
 export const MAX_BODY_BYTES = 95_000_000;
 

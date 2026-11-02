@@ -3,12 +3,11 @@
   "name": "gitnote",
   "main": "src/index.js",
   "compatibility_date": "2026-10-23",
-  // Serve only from the app's own domain. A workers.dev or preview hostname
-  // would be a second origin that passes the same-origin check yet is missing
-  // from the app's CSP connect-src.
-  "workers_dev": false,
+  // Serve only from the workers.dev hostname. A preview hostname would be a
+  // second origin that passes the same-origin check yet is missing from the
+  // app's CSP connect-src.
+  "workers_dev": true,
   "preview_urls": false,
-  "routes": [{ "pattern": "gitnote.miti99.dev", "custom_domain": true }],
   // `npm run android:sync` writes a build the web must never get into the assets
   // directory, so a deploy from there stops here, however it was started.
   "build": {
@@ -24,6 +23,9 @@
     "run_worker_first": ["/api/*"]
   },
   "vars": {
+    // Where this Worker is served. The app's CSP, the Android build's relay and
+    // the live tests all read it, so a fork changes this one line.
+    "APP_ORIGIN": "https://gitnote.tiennm99.workers.dev",
     // Git hosts the relay may reach, as host or host:port. Loopback hosts use
     // http (local test fixtures only); every other host uses https.
     "GIT_HOSTS": "github.com,gitlab.com",
