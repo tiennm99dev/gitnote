@@ -73,7 +73,7 @@ app's own domain is the only origin.
 | Drafts | IndexedDB `gitnote-drafts` | Until saved or discarded |
 | Web tokens | IndexedDB `gitnote-auth`, encrypted with a non-exportable AES-GCM key | Until sign-out |
 | Android tokens | Android Keystore-backed secure storage | Until sign-out |
-| Local copies list, queued pushes, in-progress sign-in | localStorage | Until replaced or finished |
+| Local copies list, queued pushes, commit author name and email, autosave choice, in-progress sign-in | localStorage | Until replaced or finished |
 | Merge in progress | `gitnote-merge.json` in the clone's git directory | Until the merge ends |
 | Anything about users, on the server | Nothing: no KV, D1, R2 or Durable Objects; logs, traces, Tail Workers and Logpush off | Not applicable |
 

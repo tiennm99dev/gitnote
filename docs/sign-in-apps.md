@@ -5,8 +5,8 @@ are registered by hand, once, by whoever runs the deployment. Until then the
 sign-in buttons stay off and pasting a token still works.
 
 The values below are for the live deployment at `gitnote.miti99.dev`. If you
-run your own, use your own domain in the URLs; the Worker's route and the app's
-CSP (`app/vite.config.js`) need the same change.
+run your own, use your own domain in the URLs, and see
+[Self-hosting](../README.md#self-hosting) for the one place in the code that names it.
 
 ## GitHub App
 

@@ -8,7 +8,8 @@ relays git traffic the browser cannot send directly.
 
 Status: early development. You can connect an account, clone a repo, browse,
 edit and search its notes on the device, then commit, pull and push them. The
-web app is at <https://gitnote.miti99.dev>; the Android APK comes from
+web app is at <https://gitnote.miti99.dev>. No Android release has been published
+yet; the APK will come from
 [GitHub Releases](https://github.com/tiennm99dev/gitnote/releases).
 
 Offline-first has one gap on the web: reloading the page needs a network, because
@@ -101,11 +102,12 @@ GITHUB_CLIENT_SECRET=<GitHub App client secret>
 ## Deploying
 
 `.github/workflows/deploy.yml` publishes `main` after CI passes, then runs the live
-tests. It only touches this Worker. It needs:
+tests. It only touches this Worker. Re-running an older CI run publishes nothing: a
+commit `main` has moved past is skipped with a notice. It needs:
 
 | Name | Kind | Value |
 | --- | --- | --- |
-| `CLOUDFLARE_API_TOKEN` | Secret | A token that can edit this account's Workers and the zone's Worker routes |
+| `CLOUDFLARE_API_TOKEN` | Secret | An API token with **Account > Workers Scripts > Edit** on this account, the permission [Cloudflare lists for attaching a Worker to a domain](https://developers.cloudflare.com/api/resources/workers/subresources/domains/methods/update/) |
 | `CLOUDFLARE_ACCOUNT_ID` | Variable | The Cloudflare account ID |
 | `VITE_GITHUB_CLIENT_ID`, `VITE_GITHUB_APP_SLUG`, `VITE_GITLAB_CLIENT_ID` | Variables | See [docs/sign-in-apps.md](docs/sign-in-apps.md); blank ones turn that sign-in button off |
 | `GITNOTE_E2E_REPO`, `GITNOTE_E2E_TOKEN` | Variable, secret | See [the live tests](docs/architecture.md#testing-against-the-live-site); the note round trip is skipped without the variable, and the smoke tests always run |
@@ -318,9 +320,9 @@ the gitlab.com application, and where their IDs go, is in
   cannot call the installation endpoints.
 - **Storage.** `token-store.js` encrypts each sign-in in IndexedDB with an AES-GCM
   key the browser will not export. This protects a copied database, not a script
-  already running in the page; the CSP and sanitized rendering cover that. In the
-  app's localStorage are only the list of local copies and, during a sign-in, its
-  `state` and PKCE verifier.
+  already running in the page; the CSP and sanitized rendering cover that. Everything
+  else on the device is listed under
+  [Storage](docs/architecture.md#storage).
 - **Refresh.** Tokens refresh 5 minutes before expiry and on a 401. Both providers
   rotate refresh tokens, so every refresh holds a per-provider Web Lock and rereads
   the store inside it, and the new pair is stored in one write. A refresh that
