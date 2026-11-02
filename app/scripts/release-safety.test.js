@@ -268,9 +268,10 @@ describe('the deploy workflow', () => {
 describe('the deployed Worker configuration', () => {
 	const config = unstable_readConfig({ config: path.join(ROOT, 'relay/wrangler.jsonc') });
 
-	it('serves from the custom domain alone', () => {
-		expect(config.routes).toEqual([{ pattern: new URL(LIVE_ORIGIN).hostname, custom_domain: true }]);
-		expect(config.workers_dev).toBe(false);
+	it('serves from its workers.dev hostname alone', () => {
+		expect(new URL(LIVE_ORIGIN).hostname).toMatch(new RegExp(`^${config.name}\\.[^.]+\\.workers\\.dev$`));
+		expect(config.routes ?? []).toEqual([]);
+		expect(config.workers_dev).toBe(true);
 		expect(config.preview_urls).toBe(false);
 	});
 
@@ -305,7 +306,7 @@ describe('the deployed Worker configuration', () => {
 		}
 
 		it('go to this deployment by default', async () => {
-			expect(await baseURLWith(undefined)).toBe(`https://${config.routes[0].pattern}`);
+			expect(await baseURLWith(undefined)).toBe(config.vars.APP_ORIGIN);
 		});
 
 		it('go where they are told', async () => {
@@ -313,9 +314,9 @@ describe('the deployed Worker configuration', () => {
 		});
 	});
 
-	it('refuses to guess a deployment when the configuration has no route', () => {
-		expect(originFromWranglerConfig('"routes": [{ "pattern": "notes.example.com", "custom_domain": true }]')).toBe('https://notes.example.com');
-		expect(() => originFromWranglerConfig('"routes": []')).toThrow('custom-domain route');
+	it('refuses to guess a deployment when the configuration names none', () => {
+		expect(originFromWranglerConfig('"APP_ORIGIN": "https://notes.example.com"')).toBe('https://notes.example.com');
+		expect(() => originFromWranglerConfig('"vars": {}')).toThrow('no APP_ORIGIN');
 	});
 
 	it('has no storage and keeps no logs', () => {

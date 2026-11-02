@@ -4,8 +4,8 @@ gitnote signs in through a GitHub App and a gitlab.com OAuth application. Both
 are registered by hand, once, by whoever runs the deployment. Until then the
 sign-in buttons stay off and pasting a token still works.
 
-The values below are for the live deployment at `gitnote.miti99.dev`. If you
-run your own, use your own domain in the URLs, and see
+The values below are for the live deployment at `gitnote.tiennm99.workers.dev`. If you
+run your own, use your own address in the URLs, and see
 [Self-hosting](../README.md#self-hosting) for the one place in the code that names it.
 
 ## GitHub App
@@ -18,13 +18,13 @@ that owns it.
 | --- | --- |
 | GitHub App name | `gitnote` (names are global; pick another if it is taken) |
 | Homepage URL | `https://github.com/tiennm99dev/gitnote` |
-| Callback URL 1 | `https://gitnote.miti99.dev/auth/callback` |
+| Callback URL 1 | `https://gitnote.tiennm99.workers.dev/auth/callback` |
 | Callback URL 2 | `http://localhost:5173/auth/callback` |
 | Callback URL 3 | `gitnote://oauth/callback` (the Android app) |
 | Expire user authorization tokens | **On** (8-hour tokens with a refresh token) |
 | Request user authorization (OAuth) during installation | Off |
 | Enable Device Flow | Off |
-| Setup URL | `https://gitnote.miti99.dev/repos`, with **Redirect on update** on |
+| Setup URL | `https://gitnote.tiennm99.workers.dev/repos`, with **Redirect on update** on |
 | Webhook > Active | **Off** |
 | Repository permissions > Contents | **Read and write** |
 | Repository permissions > Metadata | Read-only (GitHub sets this itself) |
@@ -52,7 +52,7 @@ application**.
 | Scopes | `read_user`, `read_api`, `write_repository` |
 
 ```text
-https://gitnote.miti99.dev/auth/callback
+https://gitnote.tiennm99.workers.dev/auth/callback
 http://localhost:5173/auth/callback
 gitnote://oauth/callback
 ```

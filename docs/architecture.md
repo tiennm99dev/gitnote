@@ -28,8 +28,8 @@ Browser or Android WebView
 ## Relay routes
 
 Only `/api/*` runs the Worker; every other path is a static asset, with unknown paths
-falling back to `index.html`. The `workers.dev` and preview hostnames are off, so the
-app's own domain is the only origin.
+falling back to `index.html`. Preview hostnames are off, so the `workers.dev` hostname
+is the only origin.
 
 | Route | Does |
 | --- | --- |

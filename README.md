@@ -8,7 +8,7 @@ relays git traffic the browser cannot send directly.
 
 Status: early development. You can connect an account, clone a repo, browse,
 edit and search its notes on the device, then commit, pull and push them. The
-web app is at <https://gitnote.miti99.dev>. No Android release has been published
+web app is at <https://gitnote.tiennm99.workers.dev>. No Android release has been published
 yet; the APK will come from
 [GitHub Releases](https://github.com/tiennm99dev/gitnote/releases).
 
@@ -121,8 +121,8 @@ live site, with no warning, until the next deploy that has them.
 
 ## Self-hosting
 
-1. Fork this repo and choose a domain on a Cloudflare zone you control.
-2. Replace the live domain with yours in `routes` in `relay/wrangler.jsonc`. The app's
+1. Fork this repo. The Worker serves from `workers.dev` on your Cloudflare account.
+2. Set `APP_ORIGIN` in `relay/wrangler.jsonc` to `https://gitnote.<your-subdomain>.workers.dev`. The app's
    `connect-src`, the Android build's relay and the tests all read it from there, so the
    live tests, and any token you give them, go to your deployment.
 3. Change the repository name in the `if:` conditions of
@@ -130,7 +130,7 @@ live site, with no warning, until the next deploy that has them.
 4. Pick your own `namespace_id` values under `ratelimits` in `relay/wrangler.jsonc` if
    the account already uses those numbers.
 5. Register your own GitHub App and gitlab.com application with
-   [docs/sign-in-apps.md](docs/sign-in-apps.md), using your domain in the URLs.
+   [docs/sign-in-apps.md](docs/sign-in-apps.md), using your address in the URLs.
 6. Set the names under [Deploying](#deploying) and push to `main`, or run
    `npm run deploy` with the `VITE_` values in the environment.
 
