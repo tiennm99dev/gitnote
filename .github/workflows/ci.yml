@@ -9,8 +9,10 @@ on:
 permissions:
   contents: read
 
+# The event keeps a run started by hand from cancelling a push's run, which Deploy
+# needs to finish: it publishes only what a push's run passed.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:

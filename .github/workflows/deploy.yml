@@ -2,7 +2,7 @@ name: Deploy
 
 # Publishes the commit CI just passed on `main`, then tests the live site. Starting
 # it by hand republishes `main`, for example after changing a sign-in ID below, which
-# is built into the app.
+# is built into the app. A commit `main` has moved past is never published.
 #
 # `workflow_run` runs with this repository's secrets whatever started CI, and a fork's
 # pull request from a branch named `main` also matches the branch filter, so the event
@@ -23,7 +23,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  deploy:
+  # Re-running an older CI run ends in the same success as a new one, and publishing
+  # it would roll the live site back while every test passes against the old code.
+  # This runs inside the concurrency group, so a queued run compares with the main of
+  # its own turn. Failing to read main stops the run rather than publishing.
+  check-tip:
     if: >-
       github.repository == 'tiennm99dev/gitnote' && (
         (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') ||
@@ -31,6 +35,32 @@ jobs:
          github.event.workflow_run.event == 'push' &&
          github.event.workflow_run.head_repository.full_name == github.repository)
       )
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      is-tip: ${{ steps.compare.outputs.is-tip }}
+    steps:
+      - name: Compare this commit with the tip of main
+        id: compare
+        run: |
+          tip=$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)
+          if [ -z "$tip" ]; then
+            echo '::error::GitHub returned no commit for main.'
+            exit 1
+          fi
+          if [ "$tip" = "$COMMIT" ]; then
+            echo 'is-tip=true' >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Not publishing $COMMIT, because main has moved on to $tip."
+            echo 'is-tip=false' >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          COMMIT: ${{ github.event.workflow_run.head_sha || github.sha }}
+          GH_TOKEN: ${{ github.token }}
+
+  deploy:
+    needs: check-tip
+    if: needs.check-tip.outputs.is-tip == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:

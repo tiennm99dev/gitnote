@@ -1,11 +1,11 @@
 import { execFile } from 'node:child_process';
-import { readFile } from 'node:fs/promises';
+import { chmod, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { promisify } from 'node:util';
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { unstable_readConfig } from 'wrangler';
 import { parse } from 'yaml';
-import liveConfig from '../playwright.live.config.js';
 import { LIVE_ORIGIN, originFromWranglerConfig } from './live-origin.js';
 
 const ROOT = path.resolve(import.meta.dirname, '../..');
@@ -13,6 +13,7 @@ const ROOT = path.resolve(import.meta.dirname, '../..');
 /**
  * @typedef {object} Step
  * @property {string} [name]
+ * @property {string} [id]
  * @property {string} [uses]
  * @property {string} [run]
  * @property {Record<string, string>} [env]
@@ -24,6 +25,7 @@ const ROOT = path.resolve(import.meta.dirname, '../..');
  * @property {Record<string, string>} [permissions]
  * @property {Record<string, string>} [env]
  * @property {string | string[]} [needs]
+ * @property {Record<string, string>} [outputs]
  * @property {Step[]} steps
  */
 
@@ -97,16 +99,121 @@ describe('the deploy workflow', () => {
 	 */
 	const stepsWith = (secret) => allSteps.filter((step) => JSON.stringify(step).includes(`secrets.${secret}`));
 
-	it('runs only after CI on main or by hand, never for a pull request', () => {
+	it('starts from CI on main or by hand', () => {
 		expect(Object.keys(deploy.on).sort()).toEqual(['workflow_dispatch', 'workflow_run']);
 		expect(deploy.on.workflow_run).toMatchObject({ workflows: ['CI'], types: ['completed'], branches: ['main'] });
-		// The branch filter alone also matches a fork's pull request from its `main`.
-		for (const check of ["workflow_run.conclusion == 'success'", "workflow_run.event == 'push'", 'head_repository.full_name == github.repository']) {
-			expect(deploy.jobs.deploy.if).toContain(check);
+	});
+
+	describe('its gate', () => {
+		const condition = String(deploy.jobs['check-tip'].if);
+		// A fork names itself here, so the cases must not pin one repository's name.
+		const repository = String(/github\.repository == '([^']+)'/.exec(condition)?.[1]);
+		const fork = 'someone/gitnote';
+		const passedPush = { conclusion: 'success', event: 'push', head_repository: { full_name: repository } };
+
+		/**
+		 * Runs the condition itself. It uses only `==`, `&&`, `||`, brackets, strings and
+		 * context names, which mean the same in JavaScript; anything else throws here. A
+		 * missing property is an empty value in both, one level below `workflow_run`.
+		 * @param {Record<string, unknown>} github
+		 * @returns {boolean} whether GitHub would start the job
+		 */
+		const gate = (github) => new Function('github', `return ${condition.replaceAll('==', '===')};`)({ repository, ref: 'refs/heads/main', event_name: 'workflow_run', event: { workflow_run: {} }, ...github });
+
+		it.each([
+			['a push CI passed', { event: { workflow_run: passedPush } }, true],
+			['a push whose CI failed', { event: { workflow_run: { ...passedPush, conclusion: 'failure' } } }, false],
+			['a push whose CI was cancelled', { event: { workflow_run: { ...passedPush, conclusion: 'cancelled' } } }, false],
+			['CI started by hand', { event: { workflow_run: { ...passedPush, event: 'workflow_dispatch' } } }, false],
+			// The branch filter alone also matches a fork's pull request from its `main`.
+			['a pull request from a fork', { event: { workflow_run: { ...passedPush, event: 'pull_request', head_repository: { full_name: fork } } } }, false],
+			['a pull request from this repository', { event: { workflow_run: { ...passedPush, event: 'pull_request' } } }, false],
+			['a passed push from another repository', { event: { workflow_run: { ...passedPush, head_repository: { full_name: fork } } } }, false],
+			['a passed push in a copy of this repository', { repository: fork, event: { workflow_run: passedPush } }, false],
+			['a start by hand on main', { event_name: 'workflow_dispatch' }, true],
+			['a start by hand on another branch', { event_name: 'workflow_dispatch', ref: 'refs/heads/other' }, false],
+			['a start by hand in a copy of this repository', { event_name: 'workflow_dispatch', repository: fork }, false]
+		])('for %s', (_name, github, expected) => {
+			expect(gate(github)).toBe(expected);
+		});
+	});
+
+	describe('a commit main has moved past', () => {
+		const sha = 'a'.repeat(40);
+		const newer = 'b'.repeat(40);
+		const compare = deploy.jobs['check-tip'].steps[0];
+		/** @type {string | undefined} */
+		let dir;
+
+		afterEach(async () => {
+			if (dir) await rm(dir, { recursive: true });
+			dir = undefined;
+		});
+
+		/**
+		 * Runs the step's own script the way GitHub does, with GitHub's API answering
+		 * through a `gh` on the path.
+		 * @param {string} ghScript
+		 * @returns {Promise<{ code: number, output: string, stdout: string }>} its exit code, what it wrote to GITHUB_OUTPUT and to stdout
+		 */
+		async function runCompare(ghScript) {
+			dir = await mkdtemp(path.join(os.tmpdir(), 'gitnote-check-tip-'));
+			const gh = path.join(dir, 'gh');
+			const outputFile = path.join(dir, 'output');
+			await writeFile(gh, `#!/bin/sh\n${ghScript}\n`);
+			await chmod(gh, 0o755);
+			await writeFile(outputFile, '');
+			const env = { PATH: `${dir}:${process.env.PATH}`, COMMIT: sha, GITHUB_OUTPUT: outputFile, GITHUB_REPOSITORY: 'owner/repo' };
+			const result = await promisify(execFile)('bash', ['-e', '-c', String(compare.run)], { env }).then(
+				({ stdout }) => ({ code: 0, stdout }),
+				(error) => ({ code: Number(error.code), stdout: String(error.stdout) })
+			);
+			return { ...result, output: (await readFile(outputFile, 'utf8')).trim() };
 		}
-		// A fork names itself here, so this must not pin one repository's name.
-		expect(deploy.jobs.deploy.if).toMatch(/github\.repository == '[^'/]+\/[^'/]+'/);
-		expect(deploy.jobs['live-e2e'].needs).toBe('deploy');
+
+		it('publishes the tip', async () => {
+			const { code, output } = await runCompare(`echo ${sha}`);
+			expect(code).toBe(0);
+			expect(output).toBe('is-tip=true');
+		});
+
+		it('skips an older commit and says why', async () => {
+			const { code, output, stdout } = await runCompare(`echo ${newer}`);
+			expect(code).toBe(0);
+			expect(output).toBe('is-tip=false');
+			expect(stdout).toContain(`::notice::Not publishing ${sha}, because main has moved on to ${newer}`);
+		});
+
+		it('publishes nothing when it cannot read main', async () => {
+			const failed = await runCompare('exit 1');
+			expect(failed.code).not.toBe(0);
+			expect(failed.output).toBe('');
+			await rm(String(dir), { recursive: true });
+			const empty = await runCompare('exit 0');
+			expect(empty.code).not.toBe(0);
+			expect(empty.output).toBe('');
+		});
+
+		it('asks about main and compares the commit this run would publish', () => {
+			expect(compare.run).toContain('repos/$GITHUB_REPOSITORY/git/ref/heads/main');
+			expect(compare.env?.COMMIT).toBe(deploy.jobs.deploy.steps[0].with?.ref);
+		});
+
+		it('takes both the deploy and the live tests with it', () => {
+			expect(deploy.jobs['check-tip'].outputs?.['is-tip']).toBe('${{ steps.compare.outputs.is-tip }}');
+			expect(compare.id).toBe('compare');
+			expect(deploy.jobs.deploy.needs).toBe('check-tip');
+			expect(deploy.jobs.deploy.if).toBe("needs.check-tip.outputs.is-tip == 'true'");
+			// A job is skipped along with one it needs, unless its own `if` overrides that.
+			expect(deploy.jobs['live-e2e'].needs).toBe('deploy');
+			expect(deploy.jobs['live-e2e'].if).toBeUndefined();
+		});
+	});
+
+	it('keeps a CI run started by hand from cancelling the run of a push', async () => {
+		const ci = /** @type {{ concurrency: { group: string, 'cancel-in-progress': boolean } }} */ (parse(await readFile(path.join(ROOT, '.github/workflows/ci.yml'), 'utf8')));
+		expect(ci.concurrency.group).toBe('ci-${{ github.event_name }}-${{ github.ref }}');
+		expect(ci.concurrency['cancel-in-progress']).toBe(true);
 	});
 
 	it('publishes the commit CI passed, not whatever main holds by then', () => {
@@ -180,8 +287,30 @@ describe('the deployed Worker configuration', () => {
 		expect(matches).toBe('');
 	});
 
-	it('sends the live tests to this deployment unless told otherwise', () => {
-		expect(liveConfig.use?.baseURL).toBe(process.env.GITNOTE_LIVE_URL || LIVE_ORIGIN);
+	describe('the live tests', () => {
+		afterEach(() => {
+			vi.unstubAllEnvs();
+			vi.resetModules();
+		});
+
+		/**
+		 * @param {string | undefined} url
+		 * @returns {Promise<string | undefined>} the address the config sends them to
+		 */
+		async function baseURLWith(url) {
+			vi.stubEnv('GITNOTE_LIVE_URL', url);
+			vi.resetModules();
+			const { default: config } = await import('../playwright.live.config.js');
+			return config.use?.baseURL;
+		}
+
+		it('go to this deployment by default', async () => {
+			expect(await baseURLWith(undefined)).toBe(`https://${config.routes[0].pattern}`);
+		});
+
+		it('go where they are told', async () => {
+			expect(await baseURLWith('https://notes.example.com')).toBe('https://notes.example.com');
+		});
 	});
 
 	it('refuses to guess a deployment when the configuration has no route', () => {
