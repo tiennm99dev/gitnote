@@ -1,6 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Auto Backup on Android 11 and older. Tokens are encrypted with a Keystore key
-     that a new device does not get, so a restored copy could never be read. -->
+     that a new device does not get, so a restored copy could never be read. Clones and drafts live in WebView storage;
+     a restored device is signed out and re-clones, so a backup would only copy private
+     repo content to the cloud. -->
 <full-backup-content>
     <exclude domain="sharedpref" path="WSSecureStorageSharedPreferences.xml" />
+    <exclude domain="root" path="app_webview/" />
 </full-backup-content>

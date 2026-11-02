@@ -18,8 +18,6 @@ Candidates, not commitments. Move an item to a plan once it is picked.
   `gitnote://oauth/callback`.
 - **Capacitor 9 migration.**
 - **iOS.**
-- **Keep notes out of Android Auto Backup.** Only the token file is excluded, so clones
-  and drafts in WebView storage can reach Google backups, private repos included.
 
 ## Offline
 

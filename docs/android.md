@@ -21,7 +21,8 @@ so they run on a PC with Android Studio or in GitHub Actions.
 - **Tokens** are in `@aparajita/capacitor-secure-storage`, encrypted with an Android
   Keystore key. Its file is left out of backups by `backup_rules.xml` and
   `data_extraction_rules.xml`, because a new device does not get the key. Notes and
-  clones in the WebView's storage are not excluded, so Android backups can hold them.
+  clones in the WebView's storage (`app_webview/`) are left out too, so private repo
+  content never reaches a backup; a new device signs in and clones again.
   A record whose key is lost for good reads as signed out. Any other Keystore failure
   shows as a storage error and leaves the record in place.
 - **Content Security Policy.** The build uses `CAP_BUILD=1`, which sets `script-src`
