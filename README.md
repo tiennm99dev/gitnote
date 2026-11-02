@@ -67,10 +67,9 @@ deployment means trusting whoever runs it and Cloudflare; run your own if you wo
 rather not (see [Self-hosting](#self-hosting)).
 
 Your token goes only to the provider's API and, through the relay, its git host. Your
-notes stay in your repo and on your device, with one exception on Android: the app
-allows Android backups and leaves only the token file out, so clones and drafts, private
-repos included, can reach your Google account's backup or a device transfer. Turn off
-the device's backup if you do not want that.
+notes stay in your repo and on your device. Android backups and device transfers leave
+out the token and the clones, so a new device signs in and clones again; push first,
+because unpushed commits stay on the old device.
 
 ## Supported providers
 

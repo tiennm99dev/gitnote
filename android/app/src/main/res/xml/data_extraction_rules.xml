@@ -1,11 +1,15 @@
 <?xml version="1.0" encoding="utf-8"?>
 <!-- Backups on Android 12 and newer. Tokens are encrypted with a Keystore key that
-     a new device does not get, so a restored copy could never be read. -->
+     a new device does not get, so a restored copy could never be read. Clones and drafts live in WebView storage;
+     a restored device is signed out and re-clones, so a backup would only copy private
+     repo content off the device. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="sharedpref" path="WSSecureStorageSharedPreferences.xml" />
+        <exclude domain="root" path="app_webview/" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="sharedpref" path="WSSecureStorageSharedPreferences.xml" />
+        <exclude domain="root" path="app_webview/" />
     </device-transfer>
 </data-extraction-rules>
