@@ -3,7 +3,7 @@
 > **Archived.** gitnote was a web and Android app for markdown notes kept in
 > your own git repo. Existing tools already do this well, so the project
 > stopped and its code was removed. The last commit with the code is
-> [`7fbe43d`](https://github.com/tiennm99dev/gitnote/tree/7fbe43d).
+> [`87694c4`](https://github.com/tiennm99dev/gitnote/tree/87694c4).
 
 Use [Obsidian](https://obsidian.md) with git instead: your notes stay plain
 markdown files in a repo you own, with full history.
