@@ -1,8 +1,0 @@
-{
-  "extends": "$app/tsconfig",
-  "compilerOptions": {
-    "strict": true,
-    "types": ["$app/types", "node"]
-  },
-  "include": ["src", "e2e", "scripts", "test", "vite.config.js", "playwright.config.js", "playwright.live.config.js"]
-}
